@@ -3,14 +3,7 @@
 用于公益站多账号每日签到。  
 
 Affs:
-- [AnyRouter](https://anyrouter.top/register?aff=wJrb)
-- [AgentRouter](https://agentrouter.org/register?aff=wDU2)
-- [WONG](https://wzw.pp.ua/register?aff=N6Q9)
-- [薄荷 API](https://x666.me/register?aff=dgzt)
-- [Huan API](https://ai.huan666.de/register?aff=qEnU)
-- [我爱996](https://529961.com/register?aff=HV76)
-- [莹のAPI](https://api.wpgzs.top/register?aff=56zr)
-- [KFC API](https://kfc-api.sxxe.net/register?aff=xPnf)
+- [AnyRouter](https://anyrouter.top/register?aff=Ar33)
 
 其它使用 `newapi.ai` 功能相似, 可自定义 `provider` 支持。
 
