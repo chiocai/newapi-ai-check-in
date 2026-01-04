@@ -539,11 +539,33 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                 # 循环抽奖直到次数用完（只负责抽奖，CDK 从 my-codes 页面统一获取）
                 spin_count = 0
                 prize_count = 0
+                max_retries = 3  # 最大重试次数
+
                 while remaining > 0:
-                    # 查找开始抽奖按钮
-                    spin_btn = await page.query_selector('button:has-text("开始抽奖")')
+                    # 查找开始抽奖按钮（每次都重新查找，因为页面可能刷新）
+                    spin_btn = None
+                    for retry in range(max_retries):
+                        spin_btn = await page.query_selector('button:has-text("开始抽奖")')
+                        if spin_btn:
+                            break
+                        # 如果没找到，可能是弹窗覆盖，尝试关闭弹窗
+                        close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK"), button:has-text("知道了")')
+                        if close_btn:
+                            print(f"ℹ️ {account_name}: Closing dialog before retry...")
+                            await close_btn.click()
+                            await page.wait_for_timeout(1000)
+                        else:
+                            # 可能需要刷新页面
+                            if retry == max_retries - 1:
+                                print(f"ℹ️ {account_name}: Refreshing luckydraw page...")
+                                await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
+                                await page.wait_for_timeout(3000)
+                            else:
+                                await page.wait_for_timeout(2000)
+
                     if not spin_btn:
-                        print(f"⚠️ {account_name}: Spin button not found")
+                        print(f"⚠️ {account_name}: Spin button not found after {max_retries} retries")
+                        await take_screenshot(page, "b4u_spin_btn_not_found", account_name)
                         break
 
                     # 检查按钮是否可点击
