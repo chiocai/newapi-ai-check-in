@@ -10,6 +10,7 @@ from typing import Callable, Dict, Generator, List, Literal
 
 from utils.signature import aiai_li_sign_in_url
 from utils.get_cdk import (
+    get_b4u_cdk,
     get_runawaytime_checkin_cdk,
     get_runawaytime_wheel_cdk,
     get_x666_cdk,
@@ -412,6 +413,24 @@ class AppConfig:
                 github_client_id=None,
                 github_auth_path=None,
                 linuxdo_client_id="4OtAotK6cp4047lgPD4kPXNhWRbRdTw3",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "b4u": ProviderConfig(
+                name="b4u",
+                origin="https://b4u.qzz.io",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 tw.b4u.qzz.io/luckydraw 完成
+                user_info_path="/api/user/self",
+                topup_path="/api/user/topup",
+                get_cdk=get_b4u_cdk,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id=None,  # LinuxDo OAuth 用于福利站，不用于主站
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
                 bypass_method=None,
