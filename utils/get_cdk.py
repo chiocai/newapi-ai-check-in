@@ -486,19 +486,53 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                 # 4. 执行抽奖流程
                 print(f"ℹ️ {account_name}: Starting lottery process")
 
-                # 检查今日剩余次数
+                # 截图当前页面状态
+                await take_screenshot(page, "b4u_luckydraw_page", account_name)
+
+                # 检查今日剩余次数 - 尝试多种匹配方式
                 remaining = 0
                 try:
-                    remaining_text = await page.evaluate("""() => {
+                    remaining_info = await page.evaluate("""() => {
                         const text = document.body.innerText;
-                        const match = text.match(/今日剩余次数[：:]\s*(\d+)/);
-                        return match ? match[1] : '0';
+                        // 尝试多种匹配模式
+                        const patterns = [
+                            /今日剩余次数[：:]\s*(\d+)/,
+                            /剩余次数[：:]\s*(\d+)/,
+                            /剩余\s*(\d+)\s*次/,
+                            /还有\s*(\d+)\s*次/,
+                            /(\d+)\s*次机会/,
+                        ];
+                        for (const p of patterns) {
+                            const match = text.match(p);
+                            if (match) {
+                                return { found: true, value: match[1], pattern: p.toString() };
+                            }
+                        }
+                        return { found: false, value: '0', pageText: text.substring(0, 500) };
                     }""")
-                    remaining = int(remaining_text) if remaining_text else 0
-                    print(f"ℹ️ {account_name}: Today's remaining spins: {remaining}")
+
+                    if remaining_info.get('found'):
+                        remaining = int(remaining_info.get('value', '0'))
+                        print(f"ℹ️ {account_name}: Today's remaining spins: {remaining} (matched: {remaining_info.get('pattern')})")
+                    else:
+                        # 如果没匹配到，检查是否有抽奖按钮来判断
+                        spin_btn = await page.query_selector('button:has-text("开始抽奖")')
+                        if spin_btn:
+                            is_disabled = await spin_btn.get_attribute("disabled")
+                            if not is_disabled:
+                                remaining = 5  # 假设有5次机会
+                                print(f"ℹ️ {account_name}: Could not find remaining count, but spin button is active, assuming {remaining} spins")
+                            else:
+                                print(f"ℹ️ {account_name}: Spin button is disabled, no spins remaining")
+                        else:
+                            print(f"⚠️ {account_name}: Could not find remaining spins info, page text: {remaining_info.get('pageText', '')[:200]}")
                 except Exception as e:
                     print(f"⚠️ {account_name}: Could not get remaining spins: {e}")
-                    remaining = 1  # 假设至少有1次
+                    # 检查是否有可用的抽奖按钮
+                    spin_btn = await page.query_selector('button:has-text("开始抽奖")')
+                    if spin_btn:
+                        remaining = 5  # 假设有5次
+                        print(f"ℹ️ {account_name}: Error getting count but spin button exists, assuming {remaining} spins")
 
                 if remaining <= 0:
                     print(f"ℹ️ {account_name}: No spins remaining today, checking my-codes page...")
@@ -643,15 +677,19 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
                 # 从页面提取今天的 CDK（无论是否已兑换，由主站API判断）
                 # 根据页面结构：表格列为 ['兑换码', '面额', '来源', '获取时间', '操作']
+                # 使用北京时间 (UTC+8) 判断"今天"
                 today_cdks = await page.evaluate("""() => {
                     const cdks = [];
                     const rows = document.querySelectorAll('tbody tr');
 
-                    // 获取今天的日期字符串 (格式: YYYY-MM-DD)
-                    const today = new Date();
-                    const todayStr = today.getFullYear() + '-' +
-                                     String(today.getMonth() + 1).padStart(2, '0') + '-' +
-                                     String(today.getDate()).padStart(2, '0');
+                    // 获取北京时间的今天日期字符串 (格式: YYYY-MM-DD)
+                    const now = new Date();
+                    const beijingTime = new Date(now.getTime() + (8 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000));
+                    const todayStr = beijingTime.getFullYear() + '-' +
+                                     String(beijingTime.getMonth() + 1).padStart(2, '0') + '-' +
+                                     String(beijingTime.getDate()).padStart(2, '0');
+
+                    console.log('Beijing time today:', todayStr);
 
                     for (const row of rows) {
                         const cells = row.querySelectorAll('td');
@@ -666,14 +704,17 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                         }
                     }
 
-                    return cdks;
+                    return { cdks, todayStr };
                 }""")
 
-                print(f"ℹ️ {account_name}: Found {len(today_cdks)} CDK(s) from today on my-codes page")
+                beijing_today = today_cdks.get('todayStr', 'unknown')
+                today_cdk_list = today_cdks.get('cdks', [])
+                print(f"ℹ️ {account_name}: Beijing time today: {beijing_today}")
+                print(f"ℹ️ {account_name}: Found {len(today_cdk_list)} CDK(s) from today on my-codes page")
 
-                if today_cdks:
+                if today_cdk_list:
                     # 过滤掉已经在 cdks 中的（本次抽奖获得的）
-                    new_cdks = [c for c in today_cdks if c not in cdks]
+                    new_cdks = [c for c in today_cdk_list if c not in cdks]
                     if new_cdks:
                         print(f"✅ {account_name}: Found {len(new_cdks)} new CDK(s) from my-codes page")
                         cdks.extend(new_cdks)
