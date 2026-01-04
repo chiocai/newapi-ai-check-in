@@ -316,8 +316,6 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
     print(f"ℹ️ {account_name}: Starting Camoufox browser to get b4u CDK")
 
-    cdks: list[str] = []
-
     try:
         async with AsyncCamoufox(
             headless=True,
@@ -538,8 +536,9 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                     print(f"ℹ️ {account_name}: No spins remaining today, checking my-codes page...")
                     # 不直接返回，继续检查 my-codes 页面
 
-                # 循环抽奖直到次数用完
+                # 循环抽奖直到次数用完（只负责抽奖，CDK 从 my-codes 页面统一获取）
                 spin_count = 0
+                prize_count = 0
                 while remaining > 0:
                     # 查找开始抽奖按钮
                     spin_btn = await page.query_selector('button:has-text("开始抽奖")')
@@ -554,105 +553,54 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                         break
 
                     # 点击抽奖
-                    print(f"ℹ️ {account_name}: Clicking spin button (spin #{spin_count + 1})")
+                    spin_count += 1
+                    print(f"ℹ️ {account_name}: Clicking spin button (spin #{spin_count})")
                     await spin_btn.click()
                     await page.wait_for_timeout(6000)  # 等待转盘动画完成
 
-                    # 尝试从页面获取 CDK
-                    cdk = await page.evaluate("""() => {
-                        // 方法1: 查找弹窗中的 CDK
-                        const dialogs = document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="dialog"]');
-                        for (const dialog of dialogs) {
-                            // 查找 code 或 pre 元素
-                            const codeEl = dialog.querySelector('code, pre, [class*="code"]');
-                            if (codeEl) {
-                                const text = codeEl.textContent.trim();
-                                if (text && text.length >= 8 && text.length <= 50 && /^[A-Za-z0-9-_]+$/.test(text)) {
-                                    return text;
-                                }
-                            }
-                            // 在整个弹窗文本中查找 CDK 格式
-                            const text = dialog.innerText;
-                            const match = text.match(/([A-Za-z0-9]{16,32})/);
-                            if (match) {
-                                return match[1];
-                            }
+                    # 检查抽奖结果（只判断是否中奖，不获取 CDK）
+                    result = await page.evaluate("""() => {
+                        const text = document.body.innerText;
+                        // 检查是否有 CDK 格式的文本（中奖）
+                        const cdkMatch = text.match(/([a-f0-9]{32})/i);
+                        if (cdkMatch) {
+                            return { won: true, cdk: cdkMatch[1] };
                         }
-
-                        // 方法2: 查找页面上突出显示的 CDK
-                        const codeElements = document.querySelectorAll('code, [class*="cdk"], [class*="code"], [class*="key"]');
-                        for (const el of codeElements) {
-                            const text = el.textContent.trim();
-                            if (text && text.length >= 8 && text.length <= 50 && /^[A-Za-z0-9-_]+$/.test(text)) {
-                                return text;
-                            }
+                        // 检查是否显示未中奖信息
+                        if (text.includes('谢谢参与') || text.includes('未中奖') || text.includes('再接再厉')) {
+                            return { won: false, reason: 'no_prize' };
                         }
-
-                        // 方法3: 查找复制按钮附近的文本
-                        const copyBtns = document.querySelectorAll('button');
-                        for (const btn of copyBtns) {
-                            if (btn.textContent.includes('复制') || btn.textContent.toLowerCase().includes('copy')) {
-                                const parent = btn.closest('div');
-                                if (parent) {
-                                    const text = parent.innerText;
-                                    const match = text.match(/([A-Za-z0-9]{16,32})/);
-                                    if (match) {
-                                        return match[1];
-                                    }
-                                }
-                            }
-                        }
-
-                        return null;
+                        return { won: false, reason: 'unknown' };
                     }""")
 
-                    if cdk:
-                        spin_count += 1
-                        remaining -= 1
-                        print(f"✅ {account_name}: Spin #{spin_count} successful! CDK: {cdk}")
-                        cdks.append(cdk)
-
-                        # 关闭结果弹窗（如果有）
-                        try:
-                            close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK")')
-                            if close_btn:
-                                await close_btn.click()
-                                await page.wait_for_timeout(1000)
-                        except Exception:
-                            pass
+                    if result.get('won'):
+                        prize_count += 1
+                        print(f"✅ {account_name}: Spin #{spin_count} won! CDK: {result.get('cdk', 'unknown')}")
                     else:
-                        # 检查是否显示"谢谢参与"等无奖励信息
-                        no_prize = await page.evaluate("""() => {
-                            const text = document.body.innerText;
-                            return text.includes('谢谢参与') || text.includes('未中奖') || text.includes('再接再厉');
-                        }""")
-
-                        if no_prize:
-                            spin_count += 1
-                            remaining -= 1
+                        reason = result.get('reason', 'unknown')
+                        if reason == 'no_prize':
                             print(f"ℹ️ {account_name}: Spin #{spin_count} - No prize this time")
-
-                            # 关闭结果弹窗
-                            try:
-                                close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK")')
-                                if close_btn:
-                                    await close_btn.click()
-                                    await page.wait_for_timeout(1000)
-                            except Exception:
-                                pass
                         else:
-                            print(f"⚠️ {account_name}: Spin completed but could not determine result")
-                            await take_screenshot(page, "b4u_spin_unknown_result", account_name)
-                            break
+                            print(f"⚠️ {account_name}: Spin #{spin_count} - Unknown result")
+                            await take_screenshot(page, f"b4u_spin_{spin_count}_unknown", account_name)
 
+                    # 关闭结果弹窗
+                    try:
+                        close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK")')
+                        if close_btn:
+                            await close_btn.click()
+                            await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
+                    remaining -= 1
                     # 短暂等待后继续下一次
                     await page.wait_for_timeout(2000)
 
-                if cdks:
-                    print(f"✅ {account_name}: Total {len(cdks)} CDK(s) obtained from b4u lottery")
+                print(f"ℹ️ {account_name}: Lottery completed - {spin_count} spins, {prize_count} prizes")
 
-                # 访问"我的兑换码"页面获取未兑换的 CDK
-                print(f"ℹ️ {account_name}: Checking my-codes page for unredeemed CDKs")
+                # 访问"我的兑换码"页面获取今日所有 CDK（统一从这里获取，而不是从转盘结果）
+                print(f"ℹ️ {account_name}: Checking my-codes page for today's CDKs")
                 await page.goto("https://tw.b4u.qzz.io/my-codes", wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
 
@@ -713,33 +661,23 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                 print(f"ℹ️ {account_name}: Found {len(today_cdk_list)} CDK(s) from today on my-codes page")
 
                 if today_cdk_list:
-                    # 过滤掉已经在 cdks 中的（本次抽奖获得的）
-                    new_cdks = [c for c in today_cdk_list if c not in cdks]
-                    if new_cdks:
-                        print(f"✅ {account_name}: Found {len(new_cdks)} new CDK(s) from my-codes page")
-                        cdks.extend(new_cdks)
-                    else:
-                        print(f"ℹ️ {account_name}: All today's CDKs already collected from lottery")
+                    print(f"✅ {account_name}: Total {len(today_cdk_list)} CDK(s) to redeem")
+                    return today_cdk_list
                 else:
                     print(f"ℹ️ {account_name}: No CDKs from today found on my-codes page")
-
-                if cdks:
-                    print(f"✅ {account_name}: Total {len(cdks)} CDK(s) to redeem")
-                    return cdks
-
-                return None
+                    return None
 
             except Exception as e:
                 print(f"❌ {account_name}: Error in b4u CDK process: {e}")
                 await take_screenshot(page, "b4u_error", account_name)
-                return cdks if cdks else None
+                return None
             finally:
                 await page.close()
                 await context.close()
 
     except Exception as e:
         print(f"❌ {account_name}: Error starting Camoufox for b4u: {e}")
-        return cdks if cdks else None
+        return None
 
 
 def get_x666_cdk(account_config: "AccountConfig") -> str | None:
