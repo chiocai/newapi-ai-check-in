@@ -455,7 +455,7 @@ class AppConfig:
                 linuxdo_client_id="doAqU5TVU6L7sXudST9MQ102aaJObESS",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="camoufox",
             ),
             "kfcapi": ProviderConfig(
                 name="kfcapi",
@@ -499,10 +499,10 @@ class AppConfig:
                 login_path="/login",
                 status_path="/api/status",
                 auth_state_path="/api/oauth/state",
-                sign_in_path=None,  # 签到通过 qd.x666.me 完成
+                sign_in_path=None,  # 签到通过 qd.x666.me 完成，奖励直接到账
                 user_info_path="/api/user/self",
-                topup_path="/api/user/topup",
-                get_cdk=get_x666_cdk,
+                topup_path="/api/user/topup",  # 保留，用于触发签到转盘流程
+                get_cdk=get_x666_cdk,  # 执行签到转盘，返回 None 不触发 topup
                 api_user_key="new-api-user",
                 github_client_id=None,
                 github_auth_path=None,

@@ -971,11 +971,11 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
                 status_data = response_resolve(status_resp, "get_checkin_status", account_name)
                 if status_data and status_data.get("success"):
                     if not status_data.get("can_spin"):
-                        # 今日已签到
+                        # 今日已签到，奖励已直接到账，返回 None 不触发 topup
                         today_record = status_data.get("today_record", {})
                         quota = today_record.get("quota_amount", 0) if today_record else 0
                         print(f"✅ {account_name}: Already checked in today, quota: {quota}")
-                        return "checkin_success"
+                        return None
                 elif status_data:
                     error_msg = status_data.get("message", "Unknown error")
                     # Token 无效
@@ -996,13 +996,13 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
                     new_balance = spin_data.get("new_balance", 0)
                     message = spin_data.get("message", f"获得 {label}")
                     print(f"✅ {account_name}: Checkin successful! {message}, new balance: {new_balance}")
-                    return "checkin_success"
+                    return None  # 奖励已直接到账，返回 None 不触发 topup
                 elif spin_data:
                     error_msg = spin_data.get("message", "Unknown error")
                     # 检查是否是已签到
                     if "已签到" in error_msg or "already" in error_msg.lower():
                         print(f"✅ {account_name}: Already checked in today")
-                        return "checkin_success"
+                        return None  # 奖励已直接到账，返回 None 不触发 topup
                     print(f"❌ {account_name}: Checkin failed: {error_msg}")
                     return None
 
