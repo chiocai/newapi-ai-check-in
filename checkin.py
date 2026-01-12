@@ -934,7 +934,23 @@ class CheckIn:
                     print(f"❌ {self.account_name}: Topup failed, stopping check-in process")
                     return False, {"error": error_msg}
 
-            user_info = await self.get_user_info(client, headers)
+            # 获取用户信息
+            # 如果需要绕过 WAF，使用浏览器获取 user info
+            if self.provider_config.needs_waf_cookies():
+                print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
+                # 将 cookies dict 转换为 Camoufox 格式的 list
+                auth_cookies_list = []
+                parsed_domain = urlparse(self.provider_config.origin).netloc
+                for name, value in cookies.items():
+                    auth_cookies_list.append({
+                        "name": name,
+                        "value": value,
+                        "domain": parsed_domain,
+                        "path": "/",
+                    })
+                user_info = await self.get_user_info_with_browser(auth_cookies_list)
+            else:
+                user_info = await self.get_user_info(client, headers)
             if user_info and user_info.get("success"):
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
