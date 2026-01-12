@@ -901,6 +901,25 @@ class CheckIn:
             else:
                 print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
 
+            # 如果账号配置启用了 New-API 通用签到功能
+            if self.account_config.checkin:
+                print(f"ℹ️ {self.account_name}: New-API checkin enabled, executing...")
+                from utils.new_api_checkin import new_api_checkin
+
+                checkin_result = new_api_checkin(
+                    account_name=self.account_name,
+                    origin=self.provider_config.origin,
+                    api_user=api_user,
+                    headers=headers,
+                    cookies=cookies,
+                    proxy=self.http_proxy_config,
+                    api_user_key=self.provider_config.api_user_key,
+                )
+                if not checkin_result.get("success"):
+                    error_msg = checkin_result.get("error", "New-API checkin failed")
+                    print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
+                    # 签到失败不阻止后续流程，只记录错误
+
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
                 print(f"ℹ️ {self.account_name}: Provider requires manual topup, executing...")

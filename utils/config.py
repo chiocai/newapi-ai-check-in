@@ -186,6 +186,7 @@ class AccountConfig:
     linux_do: dict | None = None
     github: dict | None = None
     proxy: dict | None = None
+    checkin: bool = False  # 是否启用 New-API 通用签到功能
     extra: dict = field(default_factory=dict)  # 存储额外的配置字段
 
     @classmethod
@@ -199,9 +200,10 @@ class AccountConfig:
         linux_do = data.get("linux.do")
         github = data.get("github")
         proxy = data.get("proxy")
+        checkin = data.get("checkin", False)
 
         # 提取已知字段
-        known_keys = {"provider", "name", "cookies", "api_user", "linux.do", "github", "proxy"}
+        known_keys = {"provider", "name", "cookies", "api_user", "linux.do", "github", "proxy", "checkin"}
         # 收集额外的配置字段
         extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -213,6 +215,7 @@ class AccountConfig:
             linux_do=linux_do,
             github=github,
             proxy=proxy,
+            checkin=checkin,
             extra=extra,
         )
 
@@ -396,6 +399,96 @@ class AppConfig:
                 github_client_id=None,
                 github_auth_path=None,
                 linuxdo_client_id="AHjK9O3FfbCXKpF6VXGBC60K21yJ2fYk",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "hotaruapi": ProviderConfig(
+                name="hotaruapi",
+                origin="https://api.hotaruapi.top",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="qVGkHnU8fLzJVEMgHCuNUCYifUQwePWn",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "codex661118": ProviderConfig(
+                name="codex661118",
+                origin="https://codex.661118.xyz",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="CeGKoyvGjd9JuUYOz57qbOqcM3ur3Y69",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "gyapi": ProviderConfig(
+                name="gyapi",
+                origin="https://gyapi.zxiaoruan.cn",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="doAqU5TVU6L7sXudST9MQ102aaJObESS",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "kfcapi": ProviderConfig(
+                name="kfcapi",
+                origin="https://kfc-api.sxxe.net",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="UZgHjwXCE3HTrsNMjjEi0d8wpcj7d4Of",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "huan666": ProviderConfig(
+                name="huan666",
+                origin="https://ai.huan666.de",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="FNvJFnlfpfDM2mKDp8HTElASdjEwUriS",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
                 bypass_method=None,

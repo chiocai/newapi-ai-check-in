@@ -176,7 +176,18 @@ class LinuxDoSignIn:
                     if allow_btn_ele:
                         print(f"ℹ️ {self.account_name}: Clicking authorization button...")
                         await allow_btn_ele.click()
-                        await page.wait_for_url(f"**{self.provider_config.origin}/oauth/**", timeout=30000)
+                        # 等待页面跳转到 provider 域名（支持 HTTP 和 HTTPS，不限制路径）
+                        from urllib.parse import urlparse
+                        parsed = urlparse(self.provider_config.origin)
+                        try:
+                            await page.wait_for_url(f"**{parsed.netloc}/**", timeout=30000)
+                        except Exception:
+                            # 如果超时，检查当前页面是否已经在 provider 域名
+                            current_url = page.url
+                            if parsed.netloc in current_url:
+                                print(f"ℹ️ {self.account_name}: Already on provider domain: {current_url}")
+                            else:
+                                raise
 
                         # 从 localStorage 获取 user 对象并提取 id
                         api_user = None
