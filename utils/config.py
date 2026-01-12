@@ -11,6 +11,7 @@ from typing import Callable, Dict, Generator, List, Literal
 from utils.signature import aiai_li_sign_in_url
 from utils.get_cdk import (
     get_b4u_cdk,
+    get_fuli_wheel_cdk,
     get_runawaytime_checkin_cdk,
     get_runawaytime_wheel_cdk,
     get_x666_cdk,
@@ -432,6 +433,24 @@ class AppConfig:
                 github_auth_path=None,
                 linuxdo_client_id=None,  # LinuxDo OAuth 用于福利站，不用于主站
                 linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "fuli_wheel": ProviderConfig(
+                name="fuli_wheel",
+                origin="https://fuli.hxi.me",
+                login_path="/login",
+                status_path="/api/wheel/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 抽奖通过 fuli.hxi.me/wheel 完成
+                user_info_path="/api/user/self",
+                topup_path=None,  # 奖励直接到账，无需充值
+                get_cdk=get_fuli_wheel_cdk,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="ivdqICR2gsrro1WBpGB5gPSWYmVjL5OE",
+                linuxdo_auth_path="/auth/callback",
                 aliyun_captcha=False,
                 bypass_method=None,
             ),

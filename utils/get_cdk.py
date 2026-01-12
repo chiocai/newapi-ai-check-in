@@ -703,122 +703,564 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
 
 def get_x666_cdk(account_config: "AccountConfig") -> str | None:
-    """获取 x666 抽奖 CDK
+    """执行 x666 签到大转盘
 
-    通过 qd.x666.me 抽奖获取 CDK
+    通过 qd.x666.me 执行签到大转盘，不返回 CDK（签到奖励直接到账）
+
+    流程：
+    1. 尝试使用配置中的 access_token
+    2. 如果 token 无效或不存在，通过浏览器 LinuxDo OAuth 登录获取新 token
+    3. 调用签到 API 执行大转盘
 
     Args:
-        account_config: 账号配置对象，需要包含 access_token 在 extra 中
+        account_config: 账号配置对象，需要包含 linux_do 认证信息
 
     Returns:
-        str | None: CDK 字符串，如果获取失败则返回 None
+        str | None: 签到成功返回 "checkin_success"，失败返回 None
     """
+    import asyncio
+
+    # 使用 asyncio 运行异步函数
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 如果事件循环已在运行，创建新任务
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _get_x666_checkin_async(account_config))
+                return future.result()
+        else:
+            return loop.run_until_complete(_get_x666_checkin_async(account_config))
+    except RuntimeError:
+        # 没有事件循环，创建新的
+        return asyncio.run(_get_x666_checkin_async(account_config))
+
+
+async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None:
+    """异步执行 x666 签到大转盘
+
+    注意：qd.x666.me 和 up.x666.me 共享同一个 OAuth 应用，
+    OAuth 回调地址是 up.x666.me，所以需要在 up.x666.me 获取 token，
+    然后用这个 token 调用 qd.x666.me 的签到 API。
+
+    登录流程参考 sign_in_with_linuxdo.py：
+    1. 先直接访问 linux.do/login 登录
+    2. 登录成功后访问 up.x666.me 触发 OAuth
+    3. 从 localStorage 获取 token
+    """
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+
     account_name = account_config.get_display_name()
-    access_token = account_config.get("access_token")
+    linux_do = account_config.linux_do
     proxy = account_config.proxy or account_config.get("global_proxy")
-    
-    if not access_token:
-        print(f"❌ {account_name}: access_token not found in account config")
+    access_token = account_config.get("access_token")
+
+    # 检查是否有 linux_do 配置
+    if not linux_do:
+        print(f"❌ {account_name}: linux.do credentials not found for x666 checkin")
         return None
-    
+
+    username = linux_do.get("username")
+    password = linux_do.get("password")
+
+    if not username or not password:
+        print(f"❌ {account_name}: linux.do username or password not found")
+        return None
+
     http_proxy = proxy_resolve(proxy)
-    
+
+    # 如果有 access_token，先尝试使用它
+    if access_token:
+        print(f"ℹ️ {account_name}: Trying existing access_token for x666 checkin")
+        result = await _execute_x666_checkin_with_token(account_name, access_token, http_proxy)
+        if result:
+            return result
+        print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
+
+    # 通过浏览器登录获取新 token
+    print(f"ℹ️ {account_name}: Starting browser login for x666 checkin")
+
+    # 生成缓存文件路径
+    storage_state_dir = "storage-states"
+    os.makedirs(storage_state_dir, exist_ok=True)
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+    cache_file_path = f"{storage_state_dir}/x666_linuxdo_{username_hash}_storage_state.json"
+
+    try:
+        async with AsyncCamoufox(
+            headless=False,  # 使用非无头模式，更好地处理 Cloudflare 验证
+            humanize=True,
+            locale="en-US",
+            geoip=True if proxy else False,
+            proxy=proxy,
+        ) as browser:
+            # 加载缓存的 storage state
+            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            if storage_state:
+                print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
+            else:
+                print(f"ℹ️ {account_name}: No cache file found, starting fresh")
+
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+
+            try:
+                is_logged_in = False
+
+                # 如果有缓存，先尝试直接访问 up.x666.me 检查是否已登录
+                if os.path.exists(cache_file_path):
+                    print(f"ℹ️ {account_name}: Checking login status on up.x666.me")
+                    await page.goto("https://up.x666.me", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+
+                    # 检查是否已登录（从 localStorage 获取 token）
+                    token = await page.evaluate("() => localStorage.getItem('userToken')")
+                    if token:
+                        print(f"ℹ️ {account_name}: Found cached token, verifying...")
+                        result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                        if result:
+                            print(f"✅ {account_name}: Token from cache is valid")
+                            await context.storage_state(path=cache_file_path)
+                            return result
+                        print(f"ℹ️ {account_name}: Cached token expired, need to re-login")
+
+                # 参考 sign_in_with_linuxdo.py：先直接访问 linux.do/login 登录
+                if not is_logged_in:
+                    print(f"ℹ️ {account_name}: Starting to sign in linux.do")
+                    await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(3000)
+
+                    # 填写登录凭据
+                    print(f"ℹ️ {account_name}: Filling credentials")
+                    await page.fill("#login-account-name", username)
+                    await page.wait_for_timeout(2000)
+                    await page.fill("#login-account-password", password)
+                    await page.wait_for_timeout(2000)
+                    await page.click("#login-button")
+                    await page.wait_for_timeout(10000)
+
+                    # 检查登录结果
+                    current_url = page.url
+                    print(f"ℹ️ {account_name}: URL after login: {current_url}")
+
+                    # 检查是否遇到 Cloudflare 验证
+                    if "linux.do/challenge" in current_url:
+                        print(f"⚠️ {account_name}: Cloudflare challenge detected, waiting for Camoufox to bypass...")
+                        try:
+                            await page.wait_for_url("https://linux.do/", timeout=60000)
+                            print(f"✅ {account_name}: Cloudflare challenge bypassed")
+                        except Exception:
+                            print(f"⚠️ {account_name}: Cloudflare challenge timeout")
+
+                    # 保存登录状态
+                    await context.storage_state(path=cache_file_path)
+                    print(f"✅ {account_name}: Storage state saved to cache file")
+
+                # 登录成功后，访问 up.x666.me 触发 OAuth 获取 token
+                print(f"ℹ️ {account_name}: Navigating to up.x666.me to get token")
+                await page.goto("https://up.x666.me", wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+
+                # 检查是否需要点击登录按钮
+                current_url = page.url
+                print(f"ℹ️ {account_name}: Current URL: {current_url}")
+
+                # 检查是否已有 token
+                token = await page.evaluate("() => localStorage.getItem('userToken')")
+                if token:
+                    print(f"✅ {account_name}: Got token from up.x666.me")
+                    await context.storage_state(path=cache_file_path)
+                    result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                    return result
+
+                # 如果没有 token，点击登录按钮触发 OAuth
+                login_btn = await page.query_selector('button:has-text("登录")')
+                if login_btn:
+                    print(f"ℹ️ {account_name}: Clicking login button on up.x666.me")
+                    await login_btn.click()
+                    await page.wait_for_timeout(5000)
+
+                # 检查是否在 OAuth 授权页面
+                current_url = page.url
+                print(f"ℹ️ {account_name}: URL after login click: {current_url}")
+
+                if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
+                    print(f"ℹ️ {account_name}: At OAuth authorization page, waiting for approve button...")
+                    try:
+                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
+                        allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                        if allow_btn:
+                            print(f"ℹ️ {account_name}: Clicking authorize button...")
+                            await allow_btn.click()
+                            await page.wait_for_timeout(5000)
+                    except Exception as e:
+                        print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+                        await take_screenshot(page, "x666_oauth_approve_failed", account_name)
+
+                # 等待回调完成
+                await page.wait_for_timeout(3000)
+                current_url = page.url
+                print(f"ℹ️ {account_name}: Final URL: {current_url}")
+
+                # 检查 URL 是否包含 token 参数
+                if "token=" in current_url:
+                    await page.wait_for_timeout(2000)
+
+                # 从 localStorage 获取 token
+                token = await page.evaluate("() => localStorage.getItem('userToken')")
+                if token:
+                    print(f"✅ {account_name}: Successfully got token via browser login")
+                    await context.storage_state(path=cache_file_path)
+                    result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                    return result
+
+                print(f"❌ {account_name}: Failed to get token after login")
+                await take_screenshot(page, "x666_login_failed", account_name)
+                return None
+
+            except Exception as e:
+                print(f"❌ {account_name}: Error in browser login: {e}")
+                await take_screenshot(page, "x666_error", account_name)
+                return None
+            finally:
+                await page.close()
+                await context.close()
+
+    except Exception as e:
+        print(f"❌ {account_name}: Error starting browser: {e}")
+        return None
+
+
+async def _verify_token_in_browser(page, token: str) -> bool:
+    """在浏览器中验证 token 是否有效"""
+    try:
+        result = await page.evaluate(f"""async () => {{
+            const response = await fetch('/api/user/info', {{
+                headers: {{ 'Authorization': 'Bearer {token}' }}
+            }});
+            const data = await response.json();
+            return data.success === true;
+        }}""")
+        return result
+    except Exception:
+        return False
+
+
+async def _execute_x666_checkin_with_token(account_name: str, token: str, http_proxy: str | None) -> str | None:
+    """使用 token 执行 x666 签到"""
+    print(f"ℹ️ {account_name}: Executing x666 checkin with token")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Origin": "https://qd.x666.me",
+        "Referer": "https://qd.x666.me/",
+    }
+
+    try:
+        client = httpx.Client(http2=True, timeout=30.0, proxy=http_proxy)
+        try:
+            # 先检查签到状态
+            status_resp = client.get("https://qd.x666.me/api/checkin/status", headers=headers)
+
+            if status_resp.status_code == 200:
+                status_data = response_resolve(status_resp, "get_checkin_status", account_name)
+                if status_data and status_data.get("success"):
+                    if not status_data.get("can_spin"):
+                        # 今日已签到
+                        today_record = status_data.get("today_record", {})
+                        quota = today_record.get("quota_amount", 0) if today_record else 0
+                        print(f"✅ {account_name}: Already checked in today, quota: {quota}")
+                        return "checkin_success"
+                elif status_data:
+                    error_msg = status_data.get("message", "Unknown error")
+                    # Token 无效
+                    if "token" in error_msg.lower() or "unauthorized" in error_msg.lower():
+                        print(f"⚠️ {account_name}: Token invalid: {error_msg}")
+                        return None
+                    print(f"❌ {account_name}: Failed to get checkin status: {error_msg}")
+                    return None
+
+            # 执行签到
+            spin_resp = client.post("https://qd.x666.me/api/checkin/spin", headers=headers)
+
+            if spin_resp.status_code == 200:
+                spin_data = response_resolve(spin_resp, "execute_checkin_spin", account_name)
+                if spin_data and spin_data.get("success"):
+                    quota = spin_data.get("quota", 0)
+                    label = spin_data.get("label", "")
+                    new_balance = spin_data.get("new_balance", 0)
+                    message = spin_data.get("message", f"获得 {label}")
+                    print(f"✅ {account_name}: Checkin successful! {message}, new balance: {new_balance}")
+                    return "checkin_success"
+                elif spin_data:
+                    error_msg = spin_data.get("message", "Unknown error")
+                    # 检查是否是已签到
+                    if "已签到" in error_msg or "already" in error_msg.lower():
+                        print(f"✅ {account_name}: Already checked in today")
+                        return "checkin_success"
+                    print(f"❌ {account_name}: Checkin failed: {error_msg}")
+                    return None
+
+            print(f"❌ {account_name}: Checkin request failed with status {spin_resp.status_code}")
+            return None
+
+        finally:
+            client.close()
+
+    except Exception as e:
+        print(f"❌ {account_name}: Error executing checkin: {e}")
+        return None
+
+
+def get_fuli_wheel_cdk(account_config: "AccountConfig") -> str | None:
+    """执行 fuli.hxi.me 大转盘抽奖
+
+    通过 fuli.hxi.me/wheel 执行大转盘抽奖，奖励直接到账（不返回 CDK）
+    每天有 2 次抽奖机会
+
+    流程：
+    1. 通过浏览器 LinuxDo OAuth 登录获取 session cookie
+    2. 调用抽奖 API 执行大转盘（最多 2 次）
+
+    Args:
+        account_config: 账号配置对象，需要包含 linux_do 认证信息
+
+    Returns:
+        str | None: 抽奖成功返回 "wheel_success"，失败返回 None
+    """
+    import asyncio
+
+    # 使用 asyncio 运行异步函数
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 如果事件循环已在运行，创建新任务
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _get_fuli_wheel_async(account_config))
+                return future.result()
+        else:
+            return loop.run_until_complete(_get_fuli_wheel_async(account_config))
+    except RuntimeError:
+        # 没有事件循环，创建新的
+        return asyncio.run(_get_fuli_wheel_async(account_config))
+
+
+async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
+    """异步执行 fuli.hxi.me 大转盘抽奖
+
+    登录流程：
+    1. 先直接访问 linux.do/login 登录
+    2. 登录成功后访问 fuli.hxi.me/wheel 触发 OAuth
+    3. 获取 session cookie 后调用抽奖 API
+    """
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+
+    account_name = account_config.get_display_name()
+    linux_do = account_config.linux_do
+    proxy = account_config.proxy or account_config.get("global_proxy")
+
+    # 检查是否有 linux_do 配置
+    if not linux_do:
+        print(f"❌ {account_name}: linux.do credentials not found for fuli wheel")
+        return None
+
+    username = linux_do.get("username")
+    password = linux_do.get("password")
+
+    if not username or not password:
+        print(f"❌ {account_name}: linux.do username or password not found")
+        return None
+
+    # 生成缓存文件路径
+    storage_state_dir = "storage-states"
+    os.makedirs(storage_state_dir, exist_ok=True)
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+    cache_file_path = f"{storage_state_dir}/fuli_wheel_linuxdo_{username_hash}_storage_state.json"
+
+    print(f"ℹ️ {account_name}: Starting fuli.hxi.me wheel lottery")
+
+    try:
+        async with AsyncCamoufox(
+            headless=True,  # 无头模式
+            humanize=True,
+            locale="zh-CN",
+            geoip=True if proxy else False,
+            proxy=proxy,
+        ) as browser:
+            # 加载缓存的 storage state
+            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            if storage_state:
+                print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
+            else:
+                print(f"ℹ️ {account_name}: No cache file found, starting fresh")
+
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+
+            try:
+                # 1. 先登录 linux.do
+                print(f"ℹ️ {account_name}: Navigating to linux.do")
+                await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+
+                current_url = page.url
+                if "linux.do/login" in current_url:
+                    print(f"ℹ️ {account_name}: Logging in to linux.do")
+                    await page.fill("#login-account-name", username)
+                    await page.wait_for_timeout(1000)
+                    await page.fill("#login-account-password", password)
+                    await page.wait_for_timeout(1000)
+                    await page.click("#login-button")
+                    await page.wait_for_timeout(10000)
+
+                    current_url = page.url
+                    if "linux.do/login" in current_url:
+                        print(f"❌ {account_name}: Failed to login to linux.do")
+                        await take_screenshot(page, "fuli_wheel_login_failed", account_name)
+                        return None
+
+                    print(f"✅ {account_name}: Logged in to linux.do")
+                    await context.storage_state(path=cache_file_path)
+                else:
+                    print(f"✅ {account_name}: Already logged in to linux.do (via cache)")
+
+                # 2. 访问福利站大转盘页面
+                print(f"ℹ️ {account_name}: Navigating to fuli.hxi.me/wheel")
+                await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+
+                # 3. 检查是否需要登录福利站
+                login_btn = await page.query_selector('button:has-text("登录"), a:has-text("登录")')
+                if login_btn:
+                    print(f"ℹ️ {account_name}: Clicking login button on fuli.hxi.me")
+                    await login_btn.click()
+                    await page.wait_for_timeout(5000)
+
+                    # 检查是否在 OAuth 授权页面
+                    current_url = page.url
+                    if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
+                        print(f"ℹ️ {account_name}: At OAuth authorization page")
+                        try:
+                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=10000)
+                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                            if allow_btn:
+                                print(f"ℹ️ {account_name}: Clicking authorize button")
+                                await allow_btn.click()
+                                await page.wait_for_timeout(5000)
+                        except Exception as e:
+                            print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+
+                    # 保存登录状态
+                    await context.storage_state(path=cache_file_path)
+                    print(f"✅ {account_name}: Logged in to fuli.hxi.me")
+
+                # 4. 确保在转盘页面
+                if "wheel" not in page.url:
+                    await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(3000)
+
+                # 5. 获取 cookies 用于 API 调用
+                cookies = await context.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies if "fuli.hxi.me" in c.get("domain", "")}
+
+                if "session" not in cookie_dict:
+                    print(f"❌ {account_name}: Session cookie not found")
+                    await take_screenshot(page, "fuli_wheel_no_session", account_name)
+                    return None
+
+                # 6. 调用抽奖 API
+                return await _execute_fuli_wheel_spins(account_name, cookie_dict, proxy)
+
+            except Exception as e:
+                print(f"❌ {account_name}: Error in fuli wheel process: {e}")
+                await take_screenshot(page, "fuli_wheel_error", account_name)
+                return None
+            finally:
+                await page.close()
+                await context.close()
+
+    except Exception as e:
+        print(f"❌ {account_name}: Error starting browser: {e}")
+        return None
+
+
+async def _execute_fuli_wheel_spins(account_name: str, cookies: dict, proxy: dict | None) -> str | None:
+    """使用 cookies 执行 fuli.hxi.me 大转盘抽奖"""
+    http_proxy = proxy_resolve(proxy)
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "origin": "https://fuli.hxi.me",
+        "referer": "https://fuli.hxi.me/wheel",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    }
+
+    # 构建 cookie 字符串
+    cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+    headers["cookie"] = cookie_str
+
     try:
         client = httpx.Client(http2=False, timeout=30.0, proxy=http_proxy)
         try:
-            # 构建基础请求头
-            headers = {
-                "accept": "*/*",
-                "accept-language": "en,en-US;q=0.9,zh;q=0.8",
-                "cache-control": "no-cache",
-                "pragma": "no-cache",
-                "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"macOS"',
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            }
-            
-            client.cookies.set("i18next", "en")
-            
-            # 先获取用户信息，检查是否可以抽奖
-            info_headers = headers.copy()
-            info_headers.update({
-                "authorization": f"Bearer {access_token}",
-                "content-length": "0",
-                "content-type": "application/json",
-                "origin": "https://qd.x666.me",
-                "referer": "https://qd.x666.me/",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            })
-            
-            info_response = client.post(
-                "https://qd.x666.me/api/user/info",
-                headers=info_headers,
-                timeout=30
-            )
-            
-            if info_response.status_code == 200:
-                info_data = response_resolve(info_response, "get_user_info", account_name)
-                if info_data and info_data.get("success"):
-                    data = info_data.get("data", {})
-                    can_spin = data.get("can_spin", False)
-                    
-                    if not can_spin:
-                        # 今天已经抽过，返回已有的 CDK
-                        today_record = data.get("today_record")
-                        if today_record:
-                            existing_cdk = today_record.get("cdk", "")
-                            if existing_cdk:
-                                print(f"✅ {account_name}: Already spun today, existing CDK: {existing_cdk}")
-                                return existing_cdk
-                        print(f"ℹ️ {account_name}: Already spun today, no CDK available")
-                        return None
-            
+            # 先检查剩余次数
+            status_resp = client.get("https://fuli.hxi.me/api/wheel/status", headers=headers)
+            remaining = 2  # 默认 2 次
+
+            if status_resp.status_code == 200:
+                status_data = response_resolve(status_resp, "get_wheel_status", account_name)
+                if status_data:
+                    remaining = status_data.get("remaining", 2)
+                    print(f"ℹ️ {account_name}: Wheel spins remaining: {remaining}")
+
+            if remaining <= 0:
+                print(f"ℹ️ {account_name}: No wheel spins remaining today")
+                return "wheel_success"  # 已经抽完，视为成功
+
             # 执行抽奖
-            spin_headers = headers.copy()
-            spin_headers.update({
-                "authorization": f"Bearer {access_token}",
-                "content-length": "0",
-                "content-type": "application/json",
-                "origin": "https://qd.x666.me",
-                "referer": "https://qd.x666.me/",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            })
-            
-            response = client.post(
-                "https://qd.x666.me/api/lottery/spin",
-                headers=spin_headers,
-                timeout=30
-            )
-            
-            if response.status_code in [200, 400]:
-                json_data = response_resolve(response, "execute_spin", account_name)
-                if json_data is None:
-                    return None
-                
-                if json_data.get("success"):
-                    data = json_data.get("data", {})
-                    cdk = data.get("cdk", "")
-                    if cdk:
-                        label = data.get("label", "Unknown")
-                        print(f"✅ {account_name}: Spin successful! Prize: {label}, CDK: {cdk}")
-                        return cdk
-                
-                message = json_data.get("message", json_data.get("msg", ""))
-                if "already" in message.lower() or "已经" in message or "已抽" in message:
-                    print(f"✅ {account_name}: Already spun today")
-                    return None
-                
-                print(f"❌ {account_name}: Spin failed - {message}")
-            
+            total_quota = 0
+            spin_count = 0
+
+            while remaining > 0:
+                spin_count += 1
+                print(f"ℹ️ {account_name}: Spinning wheel #{spin_count}...")
+
+                response = client.post("https://fuli.hxi.me/api/wheel", headers=headers)
+
+                if response.status_code == 200:
+                    data = response_resolve(response, "execute_wheel_spin", account_name)
+                    if data and data.get("success"):
+                        prize = data.get("prize", "")
+                        quota = data.get("quota", 0)
+                        remaining = data.get("remaining", remaining - 1)
+                        total_quota += quota
+                        print(f"✅ {account_name}: Spin #{spin_count} won {prize}! Quota: {quota}, remaining: {remaining}")
+                    else:
+                        error_msg = data.get("message", "Unknown error") if data else "No response"
+                        print(f"❌ {account_name}: Spin #{spin_count} failed: {error_msg}")
+                        break
+                else:
+                    print(f"❌ {account_name}: Spin #{spin_count} request failed with status {response.status_code}")
+                    break
+
+            if spin_count > 0:
+                print(f"✅ {account_name}: Wheel lottery completed! Total quota earned: {total_quota}")
+                return "wheel_success"
+
             return None
+
         finally:
             client.close()
+
     except Exception as e:
-        print(f"❌ {account_name}: Error getting x666 CDK - {e}")
+        print(f"❌ {account_name}: Error executing wheel spins: {e}")
         return None
