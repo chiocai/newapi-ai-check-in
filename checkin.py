@@ -1142,10 +1142,15 @@ class CheckIn:
                     return False, {"error": "Failed to get Linux.do client ID"}
 
             # 获取 OAuth 认证状态
-            auth_state_result = await self.get_auth_state(
-                client=client,
-                headers=headers,
-            )
+            # 如果需要绕过 WAF，使用浏览器获取 auth state
+            if self.provider_config.needs_waf_cookies():
+                print(f"ℹ️ {self.account_name}: Using browser to get auth state (WAF bypass)")
+                auth_state_result = await self.get_auth_state_with_browser()
+            else:
+                auth_state_result = await self.get_auth_state(
+                    client=client,
+                    headers=headers,
+                )
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
             else:

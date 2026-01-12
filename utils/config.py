@@ -419,7 +419,7 @@ class AppConfig:
                 linuxdo_client_id="qVGkHnU8fLzJVEMgHCuNUCYifUQwePWn",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",
             ),
             "codex661118": ProviderConfig(
                 name="codex661118",
@@ -455,7 +455,7 @@ class AppConfig:
                 linuxdo_client_id="doAqU5TVU6L7sXudST9MQ102aaJObESS",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method="camoufox",
+                bypass_method="waf_cookies",
             ),
             "kfcapi": ProviderConfig(
                 name="kfcapi",
