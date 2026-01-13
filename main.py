@@ -92,21 +92,19 @@ async def main():
             failed_methods = []
 
             this_account_balances = {}
-            # 构建详细的结果报告
-            account_result = f"📣 {account_name} Summary:\n"
+            # 构建简化的中文结果报告
+            account_result = f"📌 {account_name}\n"
             for auth_method, success, user_info in results:
-                status = "✅ SUCCESS" if success else "❌ FAILED"
-                account_result += f"  {status} with {auth_method} authentication\n"
-
                 if success and user_info and user_info.get("success"):
                     account_success = True
                     success_count += 1
                     successful_methods.append(auth_method)
-                    account_result += f"    💰 {user_info['display']}\n"
                     # 记录余额信息
                     current_quota = user_info["quota"]
                     current_used = user_info["used_quota"]
                     current_bonus = user_info["bonus_quota"]
+                    account_result += f"  ✅ 签到成功\n"
+                    account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
                     this_account_balances[f"{auth_method}"] = {
                         "quota": current_quota,
                         "used": current_used,
@@ -114,8 +112,9 @@ async def main():
                     }
                 else:
                     failed_methods.append(auth_method)
-                    error_msg = user_info.get("error", "Unknown error") if user_info else "Unknown error"
-                    account_result += f"    🔺 {str(error_msg)}\n"
+                    error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
+                    account_result += f"  ❌ 签到失败\n"
+                    account_result += f"  ⚠️ {str(error_msg)}\n"
 
             if account_success:
                 current_balances[account_key] = this_account_balances
@@ -129,14 +128,6 @@ async def main():
             if failed_methods and successful_methods:
                 need_notify = True
                 print(f"🔔 {account_name} has some failed authentication methods, will send notification")
-
-            # 添加统计信息
-            success_count_methods = len(successful_methods)
-            failed_count_methods = len(failed_methods)
-
-            account_result += f"\n📊 Statistics: {success_count_methods}/{len(results)} methods successful"
-            if failed_count_methods > 0:
-                account_result += f" ({failed_count_methods} failed)"
 
             notification_content.append(account_result)
 
@@ -166,26 +157,25 @@ async def main():
 
     if need_notify and notification_content:
         # 构建通知内容
+        failed_count = total_count - success_count
         summary = [
             "-------------------------------",
-            "📢 Check-in result statistics:",
-            f"🔵 Success: {success_count}/{total_count}",
-            f"🔴 Failed: {total_count - success_count}/{total_count}",
+            f"📊 统计: 成功 {success_count}/{total_count}, 失败 {failed_count}/{total_count}",
         ]
 
         if success_count == total_count:
-            summary.append("✅ All accounts check-in successful!")
+            summary.append("✅ 全部签到成功")
         elif success_count > 0:
-            summary.append("⚠️ Some accounts check-in successful")
+            summary.append("⚠️ 部分签到成功")
         else:
-            summary.append("❌ All accounts check-in failed")
+            summary.append("❌ 全部签到失败")
 
-        time_info = f'🕓 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        time_info = f'⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
         notify_content = "\n\n".join([time_info, "\n".join(notification_content), "\n".join(summary)])
 
         print(notify_content)
-        notify.push_message("Check-in Alert", notify_content, msg_type="text")
+        notify.push_message("签到通知", notify_content, msg_type="text")
         print("🔔 Notification sent due to failures or balance changes")
     else:
         print("ℹ️ All accounts successful and no balance changes detected, notification skipped")
