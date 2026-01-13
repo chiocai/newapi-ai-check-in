@@ -573,8 +573,12 @@ class CheckIn:
                 "error": f"Failed to get auth state, {e}",
             }
 
-    async def get_user_info_with_browser(self, auth_cookies: list[dict]) -> dict:
-        """使用 Camoufox 获取用户信息
+    async def get_user_info_with_browser(self, auth_cookies: list[dict], do_checkin: bool = False) -> dict:
+        """使用 Camoufox 获取用户信息（可选执行签到）
+
+        Args:
+            auth_cookies: 认证 cookies 列表
+            do_checkin: 是否在获取用户信息前执行签到
 
         Returns:
             包含 success、quota、used_quota 或 error 的字典
@@ -596,7 +600,10 @@ class CheckIn:
             ) as browser:
                 page = await browser.new_page()
 
-                browser.add_cookies(auth_cookies)
+                # 添加 cookies 到浏览器上下文
+                if auth_cookies:
+                    print(f"ℹ️ {self.account_name}: Adding {len(auth_cookies)} cookies to browser")
+                    await browser.add_cookies(auth_cookies)
 
                 try:
                     # 1. 打开登录页面
@@ -613,6 +620,37 @@ class CheckIn:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
                         if captcha_check:
                             await page.wait_for_timeout(3000)
+
+                    # 如果需要执行签到
+                    if do_checkin:
+                        print(f"🌐 {self.account_name}: Executing checkin via browser")
+                        checkin_response = await page.evaluate(
+                            f"""async () => {{
+                                try {{
+                                    const response = await fetch(
+                                        '{self.provider_config.origin}/api/user/checkin',
+                                        {{
+                                            method: 'POST',
+                                            headers: {{
+                                                'Content-Type': 'application/json',
+                                                'X-Requested-With': 'XMLHttpRequest'
+                                            }}
+                                        }}
+                                    );
+                                    const data = await response.json();
+                                    return data;
+                                }} catch(e) {{
+                                    return {{ success: false, message: e.message }};
+                                }}
+                            }}"""
+                        )
+                        if checkin_response:
+                            if checkin_response.get("success"):
+                                print(f"✅ {self.account_name}: Checkin successful - {checkin_response.get('message', '')}")
+                            elif "已签到" in checkin_response.get("message", ""):
+                                print(f"ℹ️ {self.account_name}: Already checked in - {checkin_response.get('message', '')}")
+                            else:
+                                print(f"⚠️ {self.account_name}: Checkin response - {checkin_response.get('message', '')}")
 
                     # 获取用户信息
                     response = await page.evaluate(
@@ -902,23 +940,29 @@ class CheckIn:
                 print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
 
             # 如果账号配置启用了 New-API 通用签到功能
+            # 对于 WAF 模式，签到将在浏览器中执行，这里跳过
+            do_browser_checkin = False
             if self.account_config.checkin:
-                print(f"ℹ️ {self.account_name}: New-API checkin enabled, executing...")
-                from utils.new_api_checkin import new_api_checkin
+                if self.provider_config.needs_waf_cookies():
+                    print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
+                    do_browser_checkin = True
+                else:
+                    print(f"ℹ️ {self.account_name}: New-API checkin enabled, executing...")
+                    from utils.new_api_checkin import new_api_checkin
 
-                checkin_result = new_api_checkin(
-                    account_name=self.account_name,
-                    origin=self.provider_config.origin,
-                    api_user=api_user,
-                    headers=headers,
-                    cookies=cookies,
-                    proxy=self.http_proxy_config,
-                    api_user_key=self.provider_config.api_user_key,
-                )
-                if not checkin_result.get("success"):
-                    error_msg = checkin_result.get("error", "New-API checkin failed")
-                    print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
-                    # 签到失败不阻止后续流程，只记录错误
+                    checkin_result = new_api_checkin(
+                        account_name=self.account_name,
+                        origin=self.provider_config.origin,
+                        api_user=api_user,
+                        headers=headers,
+                        cookies=cookies,
+                        proxy=self.http_proxy_config,
+                        api_user_key=self.provider_config.api_user_key,
+                    )
+                    if not checkin_result.get("success"):
+                        error_msg = checkin_result.get("error", "New-API checkin failed")
+                        print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
+                        # 签到失败不阻止后续流程，只记录错误
 
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
@@ -935,7 +979,7 @@ class CheckIn:
                     return False, {"error": error_msg}
 
             # 获取用户信息
-            # 如果需要绕过 WAF，使用浏览器获取 user info
+            # 如果需要绕过 WAF，使用浏览器获取 user info（同时执行签到）
             if self.provider_config.needs_waf_cookies():
                 print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
                 # 将 cookies dict 转换为 Camoufox 格式的 list
@@ -948,7 +992,7 @@ class CheckIn:
                         "domain": parsed_domain,
                         "path": "/",
                     })
-                user_info = await self.get_user_info_with_browser(auth_cookies_list)
+                user_info = await self.get_user_info_with_browser(auth_cookies_list, do_checkin=do_browser_checkin)
             else:
                 user_info = await self.get_user_info(client, headers)
             if user_info and user_info.get("success"):
