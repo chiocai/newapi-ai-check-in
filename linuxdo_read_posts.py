@@ -349,7 +349,7 @@ class LinuxDoReadPosts:
         base_topic_id = int(base_topic_id_str) if base_topic_id_str else DEFAULT_BASE_TOPIC_ID
 
         async with AsyncCamoufox(
-            headless=False,
+            headless=True,
             humanize=True,
             locale="en-US",
         ) as browser:

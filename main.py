@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from utils.config import AppConfig
 from utils.notify import notify
 from utils.balance_hash import load_balance_hash, save_balance_hash
+from utils.linuxdo_session import LinuxDoSessionManager
 from checkin import CheckIn
 
 load_dotenv(override=True)
@@ -51,8 +52,31 @@ async def main():
     if not app_config.accounts:
         print("❌ Unable to load account configuration, program exits")
         return 1
-    
+
     print(f"⚙️ Found {len(app_config.accounts)} account(s)")
+
+    # 预登录所有 Linux.do 账号（会话共享优化）
+    linuxdo_usernames = set()
+    for account_config in app_config.accounts:
+        if account_config.linux_do:
+            username = account_config.linux_do.get("username")
+            if username:
+                linuxdo_usernames.add(username)
+
+    if linuxdo_usernames:
+        print(f"\n🔐 Pre-logging in {len(linuxdo_usernames)} unique Linux.do account(s)...")
+        for username in linuxdo_usernames:
+            # 找到第一个使用该用户名的账号配置，获取密码和代理
+            for account_config in app_config.accounts:
+                if account_config.linux_do and account_config.linux_do.get("username") == username:
+                    password = account_config.linux_do.get("password")
+                    proxy = account_config.proxy or app_config.global_proxy
+                    try:
+                        await LinuxDoSessionManager.get_session(username, password, proxy)
+                    except Exception as e:
+                        print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {e}")
+                    break
+        print(f"✅ Linux.do pre-login completed, {LinuxDoSessionManager.get_session_count()} session(s) cached\n")
 
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
@@ -81,7 +105,21 @@ async def main():
                 continue
 
             print(f"🌀 Processing {account_name} using provider '{account_config.provider}'")
-            checkin = CheckIn(account_name, account_config, provider_config, global_proxy=app_config.global_proxy)
+
+            # 获取共享的 Linux.do 会话（如果有）
+            linuxdo_session = None
+            if account_config.linux_do:
+                username = account_config.linux_do.get("username")
+                if username:
+                    linuxdo_session = LinuxDoSessionManager.get_cached_session(username)
+
+            checkin = CheckIn(
+                account_name,
+                account_config,
+                provider_config,
+                global_proxy=app_config.global_proxy,
+                linuxdo_session=linuxdo_session,
+            )
             results = await checkin.execute()
 
             total_count += len(results)
@@ -99,17 +137,27 @@ async def main():
                     account_success = True
                     success_count += 1
                     successful_methods.append(auth_method)
-                    # 记录余额信息
-                    current_quota = user_info["quota"]
-                    current_used = user_info["used_quota"]
-                    current_bonus = user_info["bonus_quota"]
-                    account_result += f"  ✅ 签到成功\n"
-                    account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
-                    this_account_balances[f"{auth_method}"] = {
-                        "quota": current_quota,
-                        "used": current_used,
-                        "bonus": current_bonus,
-                    }
+                    # 记录余额信息（某些 provider 如 fuli_wheel 可能没有余额信息）
+                    if "quota" in user_info:
+                        current_quota = user_info["quota"]
+                        current_used = user_info["used_quota"]
+                        current_bonus = user_info["bonus_quota"]
+                        account_result += f"  ✅ 签到成功\n"
+                        account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
+                        this_account_balances[f"{auth_method}"] = {
+                            "quota": current_quota,
+                            "used": current_used,
+                            "bonus": current_bonus,
+                        }
+                    elif "cdk_results" in user_info:
+                        # fuli_wheel 等通过 get_cdk 完成签到的 provider
+                        account_result += f"  ✅ 签到成功\n"
+                        account_result += f"  🎁 抽奖完成: {len(user_info['cdk_results'])} 个结果\n"
+                    elif "message" in user_info:
+                        account_result += f"  ✅ 签到成功\n"
+                        account_result += f"  ℹ️ {user_info['message']}\n"
+                    else:
+                        account_result += f"  ✅ 签到成功\n"
                 else:
                     failed_methods.append(auth_method)
                     error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"

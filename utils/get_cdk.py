@@ -15,6 +15,7 @@ from utils.http_utils import proxy_resolve, response_resolve
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig
+    from utils.linuxdo_session import LinuxDoSession
 
 
 def get_runawaytime_checkin_cdk(account_config: "AccountConfig") -> str | None:
@@ -292,6 +293,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
     import os
     from camoufox.async_api import AsyncCamoufox
     from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
@@ -308,11 +310,20 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
 
-    # 生成缓存文件路径
+    # 尝试获取共享的 Linux.do 会话
+    shared_session = LinuxDoSessionManager.get_cached_session(username)
+
+    # 确定 storage_state 来源：优先使用共享会话
     storage_state_dir = "storage-states"
     os.makedirs(storage_state_dir, exist_ok=True)
-    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    cache_file_path = f"{storage_state_dir}/b4u_linuxdo_{username_hash}_storage_state.json"
+
+    if shared_session:
+        cache_file_path = shared_session.get_storage_state_path()
+        print(f"ℹ️ {account_name}: Using shared Linux.do session for b4u")
+    else:
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        cache_file_path = f"{storage_state_dir}/b4u_linuxdo_{username_hash}_storage_state.json"
+        print(f"ℹ️ {account_name}: No shared session, using standalone cache for b4u")
 
     print(f"ℹ️ {account_name}: Starting Camoufox browser to get b4u CDK")
 
@@ -752,6 +763,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     import os
     from camoufox.async_api import AsyncCamoufox
     from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
@@ -783,15 +795,24 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     # 通过浏览器登录获取新 token
     print(f"ℹ️ {account_name}: Starting browser login for x666 checkin")
 
-    # 生成缓存文件路径
+    # 尝试获取共享的 Linux.do 会话
+    shared_session = LinuxDoSessionManager.get_cached_session(username)
+
+    # 确定 storage_state 来源：优先使用共享会话
     storage_state_dir = "storage-states"
     os.makedirs(storage_state_dir, exist_ok=True)
-    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    cache_file_path = f"{storage_state_dir}/x666_linuxdo_{username_hash}_storage_state.json"
+
+    if shared_session:
+        cache_file_path = shared_session.get_storage_state_path()
+        print(f"ℹ️ {account_name}: Using shared Linux.do session for x666")
+    else:
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        cache_file_path = f"{storage_state_dir}/x666_linuxdo_{username_hash}_storage_state.json"
+        print(f"ℹ️ {account_name}: No shared session, using standalone cache for x666")
 
     try:
         async with AsyncCamoufox(
-            headless=False,  # 使用非无头模式，更好地处理 Cloudflare 验证
+            headless=True,  # 使用无头模式
             humanize=True,
             locale="en-US",
             geoip=True if proxy else False,
@@ -1063,6 +1084,7 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
     import os
     from camoufox.async_api import AsyncCamoufox
     from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
@@ -1080,11 +1102,20 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
 
-    # 生成缓存文件路径
+    # 尝试获取共享的 Linux.do 会话
+    shared_session = LinuxDoSessionManager.get_cached_session(username)
+
+    # 确定 storage_state 来源：优先使用共享会话
     storage_state_dir = "storage-states"
     os.makedirs(storage_state_dir, exist_ok=True)
-    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    cache_file_path = f"{storage_state_dir}/fuli_wheel_linuxdo_{username_hash}_storage_state.json"
+
+    if shared_session:
+        cache_file_path = shared_session.get_storage_state_path()
+        print(f"ℹ️ {account_name}: Using shared Linux.do session for fuli wheel")
+    else:
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        cache_file_path = f"{storage_state_dir}/fuli_wheel_linuxdo_{username_hash}_storage_state.json"
+        print(f"ℹ️ {account_name}: No shared session, using standalone cache for fuli wheel")
 
     print(f"ℹ️ {account_name}: Starting fuli.hxi.me wheel lottery")
 

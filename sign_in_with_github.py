@@ -62,7 +62,7 @@ class GitHubSignIn:
         async with AsyncCamoufox(
             # persistent_context=True,
             # user_data_dir=tmp_dir,
-            headless=False,
+            headless=True,
             humanize=True,
             locale="en-US",
         ) as browser:

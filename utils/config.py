@@ -534,16 +534,16 @@ class AppConfig:
                 origin="https://fuli.hxi.me",
                 login_path="/login",
                 status_path="/api/wheel/status",
-                auth_state_path="/api/oauth/state",
+                auth_state_path=None,  # SPA 应用，无标准 OAuth API
                 sign_in_path=None,  # 抽奖通过 fuli.hxi.me/wheel 完成
-                user_info_path="/api/user/self",
+                user_info_path=None,  # SPA 应用，无标准用户信息 API
                 topup_path=None,  # 奖励直接到账，无需充值
-                get_cdk=get_fuli_wheel_cdk,
+                get_cdk=get_fuli_wheel_cdk,  # 通过 get_cdk 完成整个抽奖流程
                 api_user_key="new-api-user",
                 github_client_id=None,
                 github_auth_path=None,
-                linuxdo_client_id="ivdqICR2gsrro1WBpGB5gPSWYmVjL5OE",
-                linuxdo_auth_path="/auth/callback",
+                linuxdo_client_id=None,  # 不使用标准 OAuth，由 get_cdk 处理登录
+                linuxdo_auth_path=None,
                 aliyun_captcha=False,
                 bypass_method=None,
             ),

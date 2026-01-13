@@ -5,10 +5,14 @@
 
 import json
 import os
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs
 from camoufox.async_api import AsyncCamoufox
 from utils.browser_utils import filter_cookies, take_screenshot, save_page_content_to_file
 from utils.config import ProviderConfig
+
+if TYPE_CHECKING:
+    from utils.linuxdo_session import LinuxDoSession
 
 
 class LinuxDoSignIn:
@@ -20,6 +24,7 @@ class LinuxDoSignIn:
         provider_config: ProviderConfig,
         username: str,
         password: str,
+        shared_session: "LinuxDoSession | None" = None,
     ):
         """初始化
 
@@ -28,11 +33,13 @@ class LinuxDoSignIn:
             provider_config: 提供商配置
             username: Linux.do 用户名
             password: Linux.do 密码
+            shared_session: 共享的 Linux.do 会话（可选）
         """
         self.account_name = account_name
         self.provider_config = provider_config
         self.username = username
         self.password = password
+        self.shared_session = shared_session
 
     async def signin(
         self,
@@ -57,20 +64,29 @@ class LinuxDoSignIn:
             f"ℹ️ {self.account_name}: Using client_id: {client_id}, auth_state: {auth_state}, cache_file: {cache_file_path}"
         )
 
+        # 确定 storage_state 来源：优先使用共享会话
+        storage_state = None
+        if self.shared_session:
+            shared_state_path = self.shared_session.get_storage_state_path()
+            if os.path.exists(shared_state_path):
+                storage_state = shared_state_path
+                print(f"ℹ️ {self.account_name}: Using shared session storage state")
+
+        if not storage_state and cache_file_path and os.path.exists(cache_file_path):
+            storage_state = cache_file_path
+            print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
+
+        if not storage_state:
+            print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
+
         # 使用 Camoufox 启动浏览器
         async with AsyncCamoufox(
             # persistent_context=True,
             # user_data_dir=tmp_dir,
-            headless=False,
+            headless=True,
             humanize=True,
             locale="en-US",
         ) as browser:
-            # 只有在缓存文件存在时才加载 storage_state
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
-            if storage_state:
-                print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
-            else:
-                print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
 
             context = await browser.new_context(storage_state=storage_state)
 
@@ -97,6 +113,25 @@ class LinuxDoSignIn:
                         # 直接访问授权页面检查是否已登录
                         response = await page.goto(oauth_url, wait_until="domcontentloaded")
                         print(f"ℹ️ {self.account_name}: redirected to app page {response.url if response else 'N/A'}")
+
+                        # 检查是否遇到 Cloudflare 挑战页面
+                        page_title = await page.title()
+                        if "Just a moment" in page_title or "challenge" in page.url.lower():
+                            print(
+                                f"⚠️ {self.account_name}: Cloudflare challenge detected on OAuth page, "
+                                "waiting for challenge to complete..."
+                            )
+                            try:
+                                # 等待 Cloudflare 挑战完成（页面标题变化或授权按钮出现）
+                                await page.wait_for_function(
+                                    "document.title !== 'Just a moment...'",
+                                    timeout=60000
+                                )
+                                await page.wait_for_timeout(3000)  # 额外等待页面稳定
+                                print(f"✅ {self.account_name}: Cloudflare challenge completed")
+                            except Exception as cf_err:
+                                print(f"⚠️ {self.account_name}: Cloudflare challenge timeout: {cf_err}")
+
                         await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
 
                         # 登录后可能直接跳转回应用页面

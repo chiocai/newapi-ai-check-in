@@ -12,10 +12,14 @@ from urllib.parse import urlparse
 
 import httpx
 from camoufox.async_api import AsyncCamoufox
+from typing import TYPE_CHECKING
 from utils.config import AccountConfig, ProviderConfig
 from utils.browser_utils import parse_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
+
+if TYPE_CHECKING:
+    from utils.linuxdo_session import LinuxDoSession
 
 
 class CheckIn:
@@ -28,17 +32,20 @@ class CheckIn:
         provider_config: ProviderConfig,
         global_proxy: dict | None = None,
         storage_state_dir: str = "storage-states",
+        linuxdo_session: "LinuxDoSession | None" = None,
     ):
         """初始化签到管理器
 
         Args:
                 account_info: account 用户配置
                 proxy_config: 全局代理配置(可选)
+                linuxdo_session: 共享的 Linux.do 会话（可选）
         """
         self.account_name = account_name
         self.safe_account_name = "".join(c if c.isalnum() else "_" for c in account_name)
         self.account_config = account_config
         self.provider_config = provider_config
+        self.linuxdo_session = linuxdo_session
 
         # 代理优先级: 账号配置 > 全局配置
         self.camoufox_proxy_config = account_config.proxy if account_config.proxy else global_proxy
@@ -61,7 +68,7 @@ class CheckIn:
             async with AsyncCamoufox(
                 persistent_context=True,
                 user_data_dir=tmp_dir,
-                headless=False,
+                headless=True,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -124,7 +131,7 @@ class CheckIn:
             async with AsyncCamoufox(
                 persistent_context=True,
                 user_data_dir=tmp_dir,
-                headless=False,
+                headless=True,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -294,7 +301,7 @@ class CheckIn:
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
                 persistent_context=True,
-                headless=False,
+                headless=True,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -430,7 +437,7 @@ class CheckIn:
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
                 persistent_context=True,
-                headless=False,
+                headless=True,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -439,15 +446,21 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. Open the login page first
+                    # 1. Open the login page first (使用 domcontentloaded 避免等待过长)
                     print(f"ℹ️ {self.account_name}: Opening login page")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+                    await page.goto(self.provider_config.get_login_url(), wait_until="domcontentloaded")
+
+                    # 等待页面稳定，避免执行上下文被销毁
+                    await page.wait_for_timeout(3000)
 
                     # Wait for page to be fully loaded
                     try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+                        await page.wait_for_function('document.readyState === "complete"', timeout=10000)
                     except Exception:
                         await page.wait_for_timeout(3000)
+
+                    # 再次等待确保页面稳定（避免重定向导致上下文销毁）
+                    await page.wait_for_timeout(2000)
 
                     if self.provider_config.aliyun_captcha:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
@@ -573,11 +586,14 @@ class CheckIn:
                 "error": f"Failed to get auth state, {e}",
             }
 
-    async def get_user_info_with_browser(self, auth_cookies: list[dict], do_checkin: bool = False) -> dict:
+    async def get_user_info_with_browser(
+        self, auth_cookies: list[dict], api_user: str | int, do_checkin: bool = False
+    ) -> dict:
         """使用 Camoufox 获取用户信息（可选执行签到）
 
         Args:
             auth_cookies: 认证 cookies 列表
+            api_user: API 用户 ID
             do_checkin: 是否在获取用户信息前执行签到
 
         Returns:
@@ -592,7 +608,7 @@ class CheckIn:
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
                 persistent_context=True,
-                headless=False,
+                headless=True,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -606,15 +622,33 @@ class CheckIn:
                     await browser.add_cookies(auth_cookies)
 
                 try:
-                    # 1. 打开登录页面
+                    # 1. 打开主页（使用 networkidle 等待网络请求完成，包括重定向）
                     print(f"ℹ️ {self.account_name}: Opening main page")
-                    await page.goto(self.provider_config.origin, wait_until="networkidle")
+                    await page.goto(self.provider_config.origin, wait_until="networkidle", timeout=60000)
+
+                    # 等待页面稳定，避免执行上下文被销毁
+                    await page.wait_for_timeout(3000)
+
+                    # 等待 URL 稳定（检测重定向是否完成）
+                    last_url = page.url
+                    for _ in range(5):
+                        await page.wait_for_timeout(1000)
+                        current_url = page.url
+                        if current_url == last_url:
+                            break
+                        last_url = current_url
+                        print(f"ℹ️ {self.account_name}: URL changed to {current_url}, waiting...")
+
+                    print(f"ℹ️ {self.account_name}: Page stabilized at {page.url}")
 
                     # 等待页面完全加载
                     try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+                        await page.wait_for_function('document.readyState === "complete"', timeout=10000)
                     except Exception:
                         await page.wait_for_timeout(3000)
+
+                    # 再次等待确保页面稳定
+                    await page.wait_for_timeout(2000)
 
                     if self.provider_config.aliyun_captcha:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
@@ -633,7 +667,8 @@ class CheckIn:
                                             method: 'POST',
                                             headers: {{
                                                 'Content-Type': 'application/json',
-                                                'X-Requested-With': 'XMLHttpRequest'
+                                                'X-Requested-With': 'XMLHttpRequest',
+                                                '{self.provider_config.api_user_key}': '{api_user}'
                                             }}
                                         }}
                                     );
@@ -656,7 +691,12 @@ class CheckIn:
                     response = await page.evaluate(
                         f"""async () => {{
                            const response = await fetch(
-                               '{self.provider_config.get_user_info_url()}'
+                               '{self.provider_config.get_user_info_url()}',
+                               {{
+                                   headers: {{
+                                       '{self.provider_config.api_user_key}': '{api_user}'
+                                   }}
+                               }}
                            );
                            const data = await response.json();
                            return data;
@@ -979,8 +1019,13 @@ class CheckIn:
                     return False, {"error": error_msg}
 
             # 获取用户信息
-            # 如果需要绕过 WAF，使用浏览器获取 user info（同时执行签到）
-            if self.provider_config.needs_waf_cookies():
+            # anyrouter 特殊处理：虽然需要 WAF cookies，但直接使用 HTTP 请求获取用户信息
+            # 其他需要绕过 WAF 的站点使用浏览器获取 user info（同时执行签到）
+            if self.provider_config.name == "anyrouter":
+                # anyrouter 直接使用 HTTP 请求，不使用浏览器
+                print(f"ℹ️ {self.account_name}: Using HTTP request to get user info (anyrouter)")
+                user_info = await self.get_user_info(client, headers)
+            elif self.provider_config.needs_waf_cookies():
                 print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
                 # 将 cookies dict 转换为 Camoufox 格式的 list
                 auth_cookies_list = []
@@ -992,7 +1037,7 @@ class CheckIn:
                         "domain": parsed_domain,
                         "path": "/",
                     })
-                user_info = await self.get_user_info_with_browser(auth_cookies_list, do_checkin=do_browser_checkin)
+                user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=do_browser_checkin)
             else:
                 user_info = await self.get_user_info(client, headers)
             if user_info and user_info.get("success"):
@@ -1229,6 +1274,7 @@ class CheckIn:
                 provider_config=self.provider_config,
                 username=username,
                 password=password,
+                shared_session=self.linuxdo_session,
             )
 
             success, result_data = await linuxdo.signin(
@@ -1379,8 +1425,27 @@ class CheckIn:
                 if not username or not password:
                     print(f"❌ {self.account_name}: Incomplete Linux.do account information")
                     results.append(("linux.do", False, {"error": "Incomplete Linux.do account information"}))
+                # 特殊处理：没有 linuxdo_client_id 但有 get_cdk 的 provider（如 fuli_wheel）
+                # 这类 provider 的签到完全通过 get_cdk 函数完成，不需要标准 OAuth 流程
+                elif not self.provider_config.linuxdo_client_id and self.provider_config.get_cdk:
+                    print(f"ℹ️ {self.account_name}: Provider uses get_cdk for check-in (no OAuth)")
+                    try:
+                        # 直接调用 get_cdk 完成签到
+                        cdk_results = []
+                        for cdk_list in self.provider_config.iter_get_cdk(self.account_config):
+                            cdk_results.extend(cdk_list)
+
+                        if cdk_results:
+                            print(f"✅ {self.account_name}: get_cdk completed with {len(cdk_results)} result(s)")
+                            results.append(("linux.do", True, {"success": True, "cdk_results": cdk_results}))
+                        else:
+                            print(f"ℹ️ {self.account_name}: get_cdk completed (no CDK returned, may be normal)")
+                            results.append(("linux.do", True, {"success": True, "message": "get_cdk completed"}))
+                    except Exception as cdk_err:
+                        print(f"❌ {self.account_name}: get_cdk failed: {cdk_err}")
+                        results.append(("linux.do", False, {"error": f"get_cdk failed: {cdk_err}"}))
                 else:
-                    # 使用 Linux.do 账号执行签到
+                    # 使用 Linux.do 账号执行签到（标准 OAuth 流程）
                     success, user_info = await self.check_in_with_linuxdo(
                         username,
                         password,

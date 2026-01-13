@@ -33,19 +33,19 @@ def parse_cookies(cookies_data) -> dict:
     return {}
 
 
-def filter_cookies(cookies: list[dict], origin: str) -> dict:
+def filter_cookies(cookies: list[dict], origin: str, verbose: bool = False) -> dict:
     """根据 origin 过滤 cookies，只保留匹配域名的 cookies
 
     Args:
         cookies: Camoufox cookies 列表，每个元素是包含 name, value, domain 等的字典
         origin: Provider 的 origin URL (例如: https://api.example.com)
+        verbose: 是否打印详细的过滤日志（默认 False，只打印匹配的 cookies）
 
     Returns:
         过滤后的 cookies 字典 {name: value}
     """
     # 提取 provider origin 的域名
     provider_domain = urlparse(origin).netloc
-    print(f"🔍 Provider domain: {provider_domain}")
 
     # 过滤 cookies，只保留与 provider domain 匹配的
     user_cookies = {}
@@ -71,15 +71,16 @@ def filter_cookies(cookies: list[dict], origin: str) -> dict:
                 or normalized_cookie_domain.endswith("." + normalized_provider_domain)
             ):
                 user_cookies[cookie_name] = cookie_value
-                print(f"  🔵 Matched cookie: {cookie_name} (domain: {cookie_domain})")
+                if verbose:
+                    print(f"  🔵 Matched cookie: {cookie_name} (domain: {cookie_domain})")
             else:
                 filtered_count += 1
-                print(f"  🔴 Filtered cookie: {cookie_name} (domain: {cookie_domain})")
+                if verbose:
+                    print(f"  🔴 Filtered cookie: {cookie_name} (domain: {cookie_domain})")
 
     print(
-        f"🔍 Cookie filtering result: "
-        f"{len(user_cookies)} matched, {filtered_count} filtered, "
-        f"{total_count} total"
+        f"🔍 Cookie filtering: {len(user_cookies)} matched from {total_count} total "
+        f"(provider: {provider_domain})"
     )
 
     return user_cookies
