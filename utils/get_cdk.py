@@ -7,6 +7,7 @@ CDK 获取模块
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import httpx
@@ -16,6 +17,18 @@ from utils.http_utils import proxy_resolve, response_resolve
 if TYPE_CHECKING:
     from utils.config import AccountConfig
     from utils.linuxdo_session import LinuxDoSession
+
+# 超时配置（毫秒）
+TIMEOUT_PAGE_LOAD = 60000  # 页面加载超时
+TIMEOUT_ELEMENT_WAIT = 45000  # 元素等待超时
+TIMEOUT_CLOUDFLARE = 90000  # Cloudflare 验证超时
+TIMEOUT_FILL = 30000  # 填写表单超时
+TIMEOUT_CLICK = 30000  # 点击超时
+TIMEOUT_NAVIGATION = 45000  # 导航超时
+
+# 重试配置
+MAX_RETRIES = 3  # 最大重试次数
+RETRY_DELAY = 3  # 重试间隔（秒）
 
 
 def get_runawaytime_checkin_cdk(account_config: "AccountConfig") -> str | None:
@@ -279,7 +292,7 @@ def get_b4u_cdk(account_config: "AccountConfig") -> list[str] | None:
 
 
 async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | None:
-    """异步获取 b4u 大转盘抽奖 CDK
+    """异步获取 b4u 大转盘抽奖 CDK（带重试机制）
 
     使用 Camoufox 浏览器自动化完成整个流程
     登录流程（参考 x666 成功模式）：
@@ -287,12 +300,6 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
     2. 登录成功后访问 b4u 触发 OAuth
     3. 执行抽奖获取 CDK
     """
-    import hashlib
-    import os
-    from camoufox.async_api import AsyncCamoufox
-    from utils.browser_utils import take_screenshot
-    from utils.linuxdo_session import LinuxDoSessionManager
-
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
 
@@ -306,6 +313,39 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
     if not username or not password:
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
+
+    # 带重试机制的浏览器登录
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if attempt > 1:
+                print(f"ℹ️ {account_name}: Retry attempt {attempt}/{MAX_RETRIES} for b4u")
+                await asyncio.sleep(RETRY_DELAY)
+
+            result = await _b4u_browser_impl(account_config, username, password)
+            if result:
+                return result
+            else:
+                last_error = "Browser operation returned no result"
+                print(f"⚠️ {account_name}: Attempt {attempt} failed: {last_error}")
+
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ {account_name}: Attempt {attempt} exception: {e}")
+
+    print(f"❌ {account_name}: All {MAX_RETRIES} attempts failed for b4u. Last error: {last_error}")
+    return None
+
+
+async def _b4u_browser_impl(account_config: "AccountConfig", username: str, password: str) -> list[str] | None:
+    """b4u 浏览器操作实现"""
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
+
+    account_name = account_config.get_display_name()
 
     # 尝试获取共享的 Linux.do 会话
     shared_session = LinuxDoSessionManager.get_cached_session(username)
@@ -345,7 +385,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
                 # 1. 先尝试直接访问 b4u 抽奖页面检查是否已登录
                 print(f"ℹ️ {account_name}: Checking login status on b4u")
-                await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
+                await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(5000)
 
                 current_url = page.url
@@ -363,18 +403,21 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                 # 2. 如果未登录，先登录 linux.do
                 if not is_logged_in:
                     print(f"ℹ️ {account_name}: Not logged in, starting linux.do login first")
-                    await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                    await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(3000)
 
                     current_url = page.url
                     if "linux.do/login" in current_url:
                         print(f"ℹ️ {account_name}: Filling linux.do credentials")
                         try:
-                            await page.fill("#login-account-name", username)
+                            # 等待登录表单加载
+                            await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
+
+                            await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
                             await page.wait_for_timeout(1000)
-                            await page.fill("#login-account-password", password)
+                            await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
                             await page.wait_for_timeout(1000)
-                            await page.click("#login-button")
+                            await page.click("#login-button", timeout=TIMEOUT_CLICK)
                             await page.wait_for_timeout(10000)
                         except Exception as e:
                             print(f"❌ {account_name}: Failed to fill login form: {e}")
@@ -396,7 +439,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
                     # 3. 访问 b4u 登录页面触发 OAuth
                     print(f"ℹ️ {account_name}: Navigating to b4u login page")
-                    await page.goto("https://tw.b4u.qzz.io/login", wait_until="domcontentloaded")
+                    await page.goto("https://tw.b4u.qzz.io/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(3000)
 
                     # 点击 LinuxDo 登录按钮
@@ -413,7 +456,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                         if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
                             print(f"ℹ️ {account_name}: At OAuth authorization page")
                             try:
-                                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=10000)
+                                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
                                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
                                 if allow_btn:
                                     print(f"ℹ️ {account_name}: Clicking authorize button")
@@ -430,7 +473,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                     current_url = page.url
                     if "luckydraw" not in current_url:
                         print(f"ℹ️ {account_name}: Navigating to luckydraw page")
-                        await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
+                        await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                         await page.wait_for_timeout(3000)
 
                 # 4. 执行抽奖流程
@@ -585,7 +628,7 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
                 # 访问"我的兑换码"页面获取今日所有 CDK（统一从这里获取，而不是从转盘结果）
                 print(f"ℹ️ {account_name}: Checking my-codes page for today's CDKs")
-                await page.goto("https://tw.b4u.qzz.io/my-codes", wait_until="domcontentloaded")
+                await page.goto("https://tw.b4u.qzz.io/my-codes", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(3000)
 
                 # 截图以便调试
@@ -703,7 +746,7 @@ def get_x666_cdk(account_config: "AccountConfig") -> str | None:
 
 
 async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None:
-    """异步执行 x666 签到大转盘
+    """异步执行 x666 签到大转盘（带重试机制）
 
     注意：qd.x666.me 和 up.x666.me 共享同一个 OAuth 应用，
     OAuth 回调地址是 up.x666.me，所以需要在 up.x666.me 获取 token，
@@ -714,12 +757,6 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     2. 登录成功后访问 up.x666.me 触发 OAuth
     3. 从 localStorage 获取 token
     """
-    import hashlib
-    import os
-    from camoufox.async_api import AsyncCamoufox
-    from utils.browser_utils import take_screenshot
-    from utils.linuxdo_session import LinuxDoSessionManager
-
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
     access_token = account_config.get("access_token")
@@ -744,7 +781,38 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
             return result
         print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
 
-    # 通过浏览器登录获取新 token
+    # 通过浏览器登录获取新 token（带重试机制）
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if attempt > 1:
+                print(f"ℹ️ {account_name}: Retry attempt {attempt}/{MAX_RETRIES} for x666 browser login")
+                await asyncio.sleep(RETRY_DELAY)
+
+            result = await _x666_browser_login_impl(account_config, username, password)
+            if result:
+                return result
+            else:
+                last_error = "Browser login returned no result"
+                print(f"⚠️ {account_name}: Attempt {attempt} failed: {last_error}")
+
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ {account_name}: Attempt {attempt} exception: {e}")
+
+    print(f"❌ {account_name}: All {MAX_RETRIES} attempts failed for x666. Last error: {last_error}")
+    return None
+
+
+async def _x666_browser_login_impl(account_config: "AccountConfig", username: str, password: str) -> dict | None:
+    """x666 浏览器登录实现"""
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
+
+    account_name = account_config.get_display_name()
     print(f"ℹ️ {account_name}: Starting browser login for x666 checkin")
 
     # 尝试获取共享的 Linux.do 会话
@@ -784,7 +852,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                 # 如果有缓存，先尝试直接访问 up.x666.me 检查是否已登录
                 if os.path.exists(cache_file_path):
                     print(f"ℹ️ {account_name}: Checking login status on up.x666.me")
-                    await page.goto("https://up.x666.me", wait_until="domcontentloaded")
+                    await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(5000)
 
                     # 检查是否已登录（从 localStorage 获取 token）
@@ -801,16 +869,23 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                 # 参考 sign_in_with_linuxdo.py：先直接访问 linux.do/login 登录
                 if not is_logged_in:
                     print(f"ℹ️ {account_name}: Starting to sign in linux.do")
-                    await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                    await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(3000)
+
+                    # 等待登录表单加载
+                    try:
+                        await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
+                    except Exception:
+                        print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
+                        await page.wait_for_timeout(5000)
 
                     # 填写登录凭据
                     print(f"ℹ️ {account_name}: Filling credentials")
-                    await page.fill("#login-account-name", username)
+                    await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
                     await page.wait_for_timeout(2000)
-                    await page.fill("#login-account-password", password)
+                    await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
                     await page.wait_for_timeout(2000)
-                    await page.click("#login-button")
+                    await page.click("#login-button", timeout=TIMEOUT_CLICK)
                     await page.wait_for_timeout(10000)
 
                     # 检查登录结果
@@ -821,7 +896,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                     if "linux.do/challenge" in current_url:
                         print(f"⚠️ {account_name}: Cloudflare challenge detected, waiting for Camoufox to bypass...")
                         try:
-                            await page.wait_for_url("https://linux.do/", timeout=60000)
+                            await page.wait_for_url("https://linux.do/", timeout=TIMEOUT_CLOUDFLARE)
                             print(f"✅ {account_name}: Cloudflare challenge bypassed")
                         except Exception:
                             print(f"⚠️ {account_name}: Cloudflare challenge timeout")
@@ -832,7 +907,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
 
                 # 登录成功后，访问 up.x666.me 触发 OAuth 获取 token
                 print(f"ℹ️ {account_name}: Navigating to up.x666.me to get token")
-                await page.goto("https://up.x666.me", wait_until="domcontentloaded")
+                await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(5000)
 
                 # 检查是否需要点击登录按钮
@@ -861,7 +936,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                 if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
                     print(f"ℹ️ {account_name}: At OAuth authorization page, waiting for approve button...")
                     try:
-                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
+                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
                         allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
                         if allow_btn:
                             print(f"ℹ️ {account_name}: Clicking authorize button...")
@@ -1028,19 +1103,13 @@ def get_fuli_wheel_cdk(account_config: "AccountConfig") -> str | None:
 
 
 async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
-    """异步执行 fuli.hxi.me 大转盘抽奖
+    """异步执行 fuli.hxi.me 大转盘抽奖（带重试机制）
 
     登录流程：
     1. 先直接访问 linux.do/login 登录
     2. 登录成功后访问 fuli.hxi.me/wheel 触发 OAuth
     3. 获取 session cookie 后调用抽奖 API
     """
-    import hashlib
-    import os
-    from camoufox.async_api import AsyncCamoufox
-    from utils.browser_utils import take_screenshot
-    from utils.linuxdo_session import LinuxDoSessionManager
-
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
 
@@ -1056,6 +1125,40 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
 
+    # 带重试机制的浏览器登录
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if attempt > 1:
+                print(f"ℹ️ {account_name}: Retry attempt {attempt}/{MAX_RETRIES} for fuli wheel")
+                await asyncio.sleep(RETRY_DELAY)
+
+            result = await _fuli_wheel_browser_impl(account_config, username, password)
+            if result:
+                return result
+            else:
+                last_error = "Browser operation returned no result"
+                print(f"⚠️ {account_name}: Attempt {attempt} failed: {last_error}")
+
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ {account_name}: Attempt {attempt} exception: {e}")
+
+    print(f"❌ {account_name}: All {MAX_RETRIES} attempts failed for fuli wheel. Last error: {last_error}")
+    return None
+
+
+async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: str, password: str) -> dict | None:
+    """fuli.hxi.me 大转盘浏览器操作实现"""
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
+
+    account_name = account_config.get_display_name()
+    print(f"ℹ️ {account_name}: Starting fuli.hxi.me wheel lottery")
+
     # 尝试获取共享的 Linux.do 会话
     shared_session = LinuxDoSessionManager.get_cached_session(username)
 
@@ -1070,8 +1173,6 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
         username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
         cache_file_path = f"{storage_state_dir}/fuli_wheel_linuxdo_{username_hash}_storage_state.json"
         print(f"ℹ️ {account_name}: No shared session, using standalone cache for fuli wheel")
-
-    print(f"ℹ️ {account_name}: Starting fuli.hxi.me wheel lottery")
 
     try:
         async with AsyncCamoufox(
@@ -1092,17 +1193,24 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
             try:
                 # 1. 先登录 linux.do
                 print(f"ℹ️ {account_name}: Navigating to linux.do")
-                await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(3000)
 
                 current_url = page.url
                 if "linux.do/login" in current_url:
                     print(f"ℹ️ {account_name}: Logging in to linux.do")
-                    await page.fill("#login-account-name", username)
+                    # 等待登录表单加载
+                    try:
+                        await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
+                    except Exception:
+                        print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
+                        await page.wait_for_timeout(5000)
+
+                    await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
                     await page.wait_for_timeout(1000)
-                    await page.fill("#login-account-password", password)
+                    await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
                     await page.wait_for_timeout(1000)
-                    await page.click("#login-button")
+                    await page.click("#login-button", timeout=TIMEOUT_CLICK)
                     await page.wait_for_timeout(10000)
 
                     current_url = page.url
@@ -1118,7 +1226,7 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
 
                 # 2. 访问福利站大转盘页面
                 print(f"ℹ️ {account_name}: Navigating to fuli.hxi.me/wheel")
-                await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded")
+                await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(5000)
 
                 # 3. 检查是否需要登录福利站
@@ -1133,7 +1241,7 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
                     if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
                         print(f"ℹ️ {account_name}: At OAuth authorization page")
                         try:
-                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=10000)
+                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
                             allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
                             if allow_btn:
                                 print(f"ℹ️ {account_name}: Clicking authorize button")
@@ -1148,7 +1256,7 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
 
                 # 4. 确保在转盘页面
                 if "wheel" not in page.url:
-                    await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded")
+                    await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(3000)
 
                 # 5. 获取 cookies 用于 API 调用
