@@ -282,12 +282,10 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
     """异步获取 b4u 大转盘抽奖 CDK
 
     使用 Camoufox 浏览器自动化完成整个流程
-    福利站使用 Next-Auth，OAuth 流程：
-    1. GET /api/auth/csrf → 获取 CSRF token
-    2. POST /api/auth/signin/linuxdo → 触发 LinuxDo OAuth
-    3. 跳转到 connect.linux.do/oauth2/authorize 授权
-    4. 回调 /api/auth/callback/linuxdo?code=xxx
-    5. POST /luckydraw → 执行抽奖
+    登录流程（参考 x666 成功模式）：
+    1. 先直接访问 linux.do/login 登录
+    2. 登录成功后访问 b4u 触发 OAuth
+    3. 执行抽奖获取 CDK
     """
     import hashlib
     import os
@@ -297,7 +295,6 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
-    proxy = account_config.proxy or account_config.get("global_proxy")
 
     if not linux_do:
         print(f"❌ {account_name}: linux.do credentials not found in account config for b4u")
@@ -332,8 +329,6 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
             headless=True,
             humanize=True,
             locale="zh-CN",
-            geoip=True if proxy else False,
-            proxy=proxy,
         ) as browser:
             # 只有在缓存文件存在时才加载 storage_state
             storage_state = cache_file_path if os.path.exists(cache_file_path) else None
@@ -346,19 +341,15 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
             page = await context.new_page()
 
             try:
-                # 1. 访问福利站大转盘页面
-                print(f"ℹ️ {account_name}: Navigating to b4u luckydraw page")
-                await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
-                await page.wait_for_timeout(5000)  # 等待 Cloudflare 验证
-
-                # 2. 检查是否需要登录
-                current_url = page.url
                 is_logged_in = False
 
-                # 如果被重定向到登录页，说明未登录
-                if "/login" in current_url:
-                    print(f"ℹ️ {account_name}: Redirected to login page, need to authenticate")
-                else:
+                # 1. 先尝试直接访问 b4u 抽奖页面检查是否已登录
+                print(f"ℹ️ {account_name}: Checking login status on b4u")
+                await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+
+                current_url = page.url
+                if "/login" not in current_url:
                     # 检查页面是否有抽奖按钮
                     try:
                         spin_btn = await page.query_selector('button:has-text("开始抽奖")')
@@ -366,92 +357,18 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                             is_logged_in = True
                             print(f"✅ {account_name}: Already logged in to b4u via cache")
                     except Exception:
+                        # 页面可能正在导航，忽略错误
                         pass
 
-                # 3. 如果未登录，执行 LinuxDo OAuth 登录
+                # 2. 如果未登录，先登录 linux.do
                 if not is_logged_in:
-                    print(f"ℹ️ {account_name}: Not logged in, starting LinuxDo OAuth flow")
+                    print(f"ℹ️ {account_name}: Not logged in, starting linux.do login first")
+                    await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(3000)
 
-                    # 确保在登录页面
-                    if "/login" not in page.url:
-                        await page.goto("https://tw.b4u.qzz.io/login", wait_until="domcontentloaded")
-                        await page.wait_for_timeout(3000)
-
-                    # 查找并点击 LinuxDo 登录按钮 - 尝试多种选择器
-                    login_btn = None
-                    selectors = [
-                        'button:has-text("使用 Linux.do 登录")',  # tw.b4u.qzz.io 的按钮文本
-                        'button:has-text("Linux.do")',
-                        'button:has-text("LinuxDo")',
-                        'button:has-text("LINUX DO")',
-                        'a:has-text("LinuxDo")',
-                        'a:has-text("LINUX DO")',
-                        '[data-provider="linuxdo"]',
-                    ]
-
-                    for selector in selectors:
-                        try:
-                            login_btn = await page.query_selector(selector)
-                            if login_btn:
-                                btn_text = await login_btn.inner_text()
-                                print(f"ℹ️ {account_name}: Found login button with selector '{selector}': {btn_text}")
-                                break
-                        except Exception:
-                            continue
-
-                    # 截图当前登录页面状态（用于调试）
-                    await take_screenshot(page, "b4u_login_page", account_name)
-
-                    # 获取页面上所有可点击元素信息
-                    clickables_info = await page.evaluate("""() => {
-                        const elements = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
-                        return Array.from(elements).map(el => ({
-                            tag: el.tagName,
-                            text: (el.innerText || el.value || '').trim().substring(0, 50),
-                            href: el.href || '',
-                            class: el.className,
-                            id: el.id
-                        })).filter(e => e.text || e.href);
-                    }""")
-                    print(f"ℹ️ {account_name}: Clickable elements on login page: {clickables_info}")
-
-                    # 查找 LinuxDo OAuth 链接（可能是 a 标签而不是 button）
-                    linuxdo_link = None
-                    link_selectors = [
-                        'a[href*="linuxdo"]',
-                        'a[href*="linux.do"]',
-                        'a[href*="signin/linuxdo"]',
-                        'a[href*="auth/signin"]',
-                    ]
-
-                    for selector in link_selectors:
-                        try:
-                            linuxdo_link = await page.query_selector(selector)
-                            if linuxdo_link:
-                                href = await linuxdo_link.get_attribute("href")
-                                print(f"ℹ️ {account_name}: Found LinuxDo link with selector '{selector}': {href}")
-                                break
-                        except Exception:
-                            continue
-
-                    if linuxdo_link:
-                        print(f"ℹ️ {account_name}: Clicking LinuxDo link...")
-                        await linuxdo_link.click()
-                        await page.wait_for_timeout(5000)
-                    elif login_btn:
-                        print(f"ℹ️ {account_name}: Clicking LinuxDo login button...")
-                        await login_btn.click()
-                        await page.wait_for_timeout(5000)
-                    else:
-                        print(f"⚠️ {account_name}: No suitable login button/link found")
-
-                    # 检查是否跳转到 linux.do 登录页面
                     current_url = page.url
-                    print(f"ℹ️ {account_name}: Current URL after login click: {current_url}")
-
-                    # 处理 linux.do 登录
                     if "linux.do/login" in current_url:
-                        print(f"ℹ️ {account_name}: At linux.do login page, filling credentials")
+                        print(f"ℹ️ {account_name}: Filling linux.do credentials")
                         try:
                             await page.fill("#login-account-name", username)
                             await page.wait_for_timeout(1000)
@@ -461,34 +378,58 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                             await page.wait_for_timeout(10000)
                         except Exception as e:
                             print(f"❌ {account_name}: Failed to fill login form: {e}")
-                            await take_screenshot(page, "b4u_login_failed", account_name)
+                            await take_screenshot(page, "b4u_linuxdo_login_failed", account_name)
                             return None
 
-                    # 检查是否需要授权
-                    current_url = page.url
-                    if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
-                        print(f"ℹ️ {account_name}: At OAuth authorization page")
-                        try:
-                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
-                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
-                            if allow_btn:
-                                print(f"ℹ️ {account_name}: Clicking authorize button")
-                                await allow_btn.click()
-                                await page.wait_for_timeout(5000)
-                        except Exception as e:
-                            print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+                        current_url = page.url
+                        if "linux.do/login" in current_url:
+                            print(f"❌ {account_name}: Failed to login to linux.do")
+                            await take_screenshot(page, "b4u_linuxdo_login_failed", account_name)
+                            return None
 
-                    # 等待回调完成
+                        print(f"✅ {account_name}: Logged in to linux.do")
+                    else:
+                        print(f"✅ {account_name}: Already logged in to linux.do (via cache)")
+
+                    # 保存 linux.do 登录状态
+                    await context.storage_state(path=cache_file_path)
+
+                    # 3. 访问 b4u 登录页面触发 OAuth
+                    print(f"ℹ️ {account_name}: Navigating to b4u login page")
+                    await page.goto("https://tw.b4u.qzz.io/login", wait_until="domcontentloaded")
                     await page.wait_for_timeout(3000)
 
-                    # 保存会话状态
+                    # 点击 LinuxDo 登录按钮
+                    login_btn = await page.query_selector('button:has-text("使用 Linux.do 登录")')
+                    if login_btn:
+                        print(f"ℹ️ {account_name}: Clicking LinuxDo login button")
+                        await login_btn.click()
+                        await page.wait_for_timeout(8000)
+
+                        # 检查是否需要 OAuth 授权
+                        current_url = page.url
+                        print(f"ℹ️ {account_name}: URL after login click: {current_url}")
+
+                        if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
+                            print(f"ℹ️ {account_name}: At OAuth authorization page")
+                            try:
+                                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=10000)
+                                allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                                if allow_btn:
+                                    print(f"ℹ️ {account_name}: Clicking authorize button")
+                                    await allow_btn.click()
+                                    await page.wait_for_timeout(5000)
+                            except Exception as e:
+                                print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+
+                    # 保存登录状态
                     await context.storage_state(path=cache_file_path)
-                    print(f"✅ {account_name}: Storage state saved to cache file")
+                    print(f"✅ {account_name}: Storage state saved")
 
                     # 确保回到抽奖页面
                     current_url = page.url
                     if "luckydraw" not in current_url:
-                        print(f"ℹ️ {account_name}: Navigating back to luckydraw page")
+                        print(f"ℹ️ {account_name}: Navigating to luckydraw page")
                         await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded")
                         await page.wait_for_timeout(3000)
 
@@ -617,18 +558,28 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                             print(f"⚠️ {account_name}: Spin #{spin_count} - Unknown result")
                             await take_screenshot(page, f"b4u_spin_{spin_count}_unknown", account_name)
 
-                    # 关闭结果弹窗
+                    # 关闭结果弹窗（包括 sonner toast 通知）
                     try:
-                        close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK")')
+                        # 先尝试用 JavaScript 关闭所有 toast 通知
+                        await page.evaluate("""() => {
+                            // 移除所有 sonner toast
+                            document.querySelectorAll('[data-sonner-toast]').forEach(el => el.remove());
+                            // 移除 toast 容器
+                            document.querySelectorAll('section[aria-label="Notifications"]').forEach(el => el.remove());
+                        }""")
+                        await page.wait_for_timeout(500)
+
+                        # 再尝试点击关闭按钮
+                        close_btn = await page.query_selector('button:has-text("确定"), button:has-text("关闭"), button:has-text("OK"), button:has-text("知道了")')
                         if close_btn:
                             await close_btn.click()
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(500)
                     except Exception:
                         pass
 
                     remaining -= 1
                     # 短暂等待后继续下一次
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(1500)
 
                 print(f"ℹ️ {account_name}: Lottery completed - {spin_count} spins, {prize_count} prizes")
 
@@ -656,11 +607,12 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                 print(f"ℹ️ {account_name}: Page structure - Headers: {page_info.get('headers', [])}")
                 print(f"ℹ️ {account_name}: Sample rows: {page_info.get('sampleRows', [])}")
 
-                # 从页面提取今天的 CDK（无论是否已兑换，由主站API判断）
+                # 从页面提取今天的 CDK 和面额信息
                 # 根据页面结构：表格列为 ['兑换码', '面额', '来源', '获取时间', '操作']
                 # 使用北京时间 (UTC+8) 判断"今天"
                 today_cdks = await page.evaluate("""() => {
                     const cdks = [];
+                    let totalQuota = 0;
                     const rows = document.querySelectorAll('tbody tr');
 
                     // 获取北京时间的今天日期字符串 (格式: YYYY-MM-DD)
@@ -676,29 +628,32 @@ async def _get_b4u_cdk_async(account_config: "AccountConfig") -> list[str] | Non
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 4) {
                             const cdk = cells[0].innerText.trim();
+                            const quota = parseInt(cells[1].innerText.trim()) || 0;  // 面额列
                             const time = cells[3].innerText.trim();  // 获取时间列
 
                             // 检查是否是有效的 CDK 格式且是今天的
                             if (cdk && /^[a-f0-9]{32}$/i.test(cdk) && time.startsWith(todayStr)) {
                                 cdks.push(cdk);
+                                totalQuota += quota;
                             }
                         }
                     }
 
-                    return { cdks, todayStr };
+                    return { cdks, todayStr, totalQuota };
                 }""")
 
                 beijing_today = today_cdks.get('todayStr', 'unknown')
                 today_cdk_list = today_cdks.get('cdks', [])
+                total_quota = today_cdks.get('totalQuota', 0)
                 print(f"ℹ️ {account_name}: Beijing time today: {beijing_today}")
-                print(f"ℹ️ {account_name}: Found {len(today_cdk_list)} CDK(s) from today on my-codes page")
+                print(f"ℹ️ {account_name}: Found {len(today_cdk_list)} CDK(s) from today, total quota: {total_quota}")
 
                 if today_cdk_list:
-                    print(f"✅ {account_name}: Total {len(today_cdk_list)} CDK(s) to redeem")
-                    return today_cdk_list
+                    print(f"✅ {account_name}: Total {len(today_cdk_list)} CDK(s) to redeem, total quota: {total_quota}")
+                    return {"type": "cdk_list", "cdks": today_cdk_list, "total_quota": total_quota, "spin_count": len(today_cdk_list)}
                 else:
                     print(f"ℹ️ {account_name}: No CDKs from today found on my-codes page")
-                    return None
+                    return {"type": "cdk_list", "cdks": [], "total_quota": 0, "spin_count": spin_count}
 
             except Exception as e:
                 print(f"❌ {account_name}: Error in b4u CDK process: {e}")
@@ -767,7 +722,6 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
-    proxy = account_config.proxy or account_config.get("global_proxy")
     access_token = account_config.get("access_token")
 
     # 检查是否有 linux_do 配置
@@ -782,12 +736,10 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
 
-    http_proxy = proxy_resolve(proxy)
-
     # 如果有 access_token，先尝试使用它
     if access_token:
         print(f"ℹ️ {account_name}: Trying existing access_token for x666 checkin")
-        result = await _execute_x666_checkin_with_token(account_name, access_token, http_proxy)
+        result = await _execute_x666_checkin_with_token(account_name, access_token, None)
         if result:
             return result
         print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
@@ -812,11 +764,9 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
 
     try:
         async with AsyncCamoufox(
-            headless=True,  # 使用无头模式
+            headless=True,
             humanize=True,
             locale="en-US",
-            geoip=True if proxy else False,
-            proxy=proxy,
         ) as browser:
             # 加载缓存的 storage state
             storage_state = cache_file_path if os.path.exists(cache_file_path) else None
@@ -841,7 +791,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                     token = await page.evaluate("() => localStorage.getItem('userToken')")
                     if token:
                         print(f"ℹ️ {account_name}: Found cached token, verifying...")
-                        result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                        result = await _execute_x666_checkin_with_token(account_name, token, None)
                         if result:
                             print(f"✅ {account_name}: Token from cache is valid")
                             await context.storage_state(path=cache_file_path)
@@ -894,7 +844,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                 if token:
                     print(f"✅ {account_name}: Got token from up.x666.me")
                     await context.storage_state(path=cache_file_path)
-                    result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                    result = await _execute_x666_checkin_with_token(account_name, token, None)
                     return result
 
                 # 如果没有 token，点击登录按钮触发 OAuth
@@ -935,7 +885,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
                 if token:
                     print(f"✅ {account_name}: Successfully got token via browser login")
                     await context.storage_state(path=cache_file_path)
-                    result = await _execute_x666_checkin_with_token(account_name, token, http_proxy)
+                    result = await _execute_x666_checkin_with_token(account_name, token, None)
                     return result
 
                 print(f"❌ {account_name}: Failed to get token after login")
@@ -970,8 +920,12 @@ async def _verify_token_in_browser(page, token: str) -> bool:
         return False
 
 
-async def _execute_x666_checkin_with_token(account_name: str, token: str, http_proxy: str | None) -> str | None:
-    """使用 token 执行 x666 签到"""
+async def _execute_x666_checkin_with_token(account_name: str, token: str, http_proxy: str | None = None) -> dict | None:
+    """使用 token 执行 x666 签到
+
+    Returns:
+        dict | None: 成功返回 {"type": "checkin_success", "quota": 获得额度, "balance": 新余额}
+    """
     print(f"ℹ️ {account_name}: Executing x666 checkin with token")
 
     headers = {
@@ -983,7 +937,7 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
     }
 
     try:
-        client = httpx.Client(http2=True, timeout=30.0, proxy=http_proxy)
+        client = httpx.Client(http2=True, timeout=30.0)
         try:
             # 先检查签到状态
             status_resp = client.get("https://qd.x666.me/api/checkin/status", headers=headers)
@@ -992,11 +946,12 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
                 status_data = response_resolve(status_resp, "get_checkin_status", account_name)
                 if status_data and status_data.get("success"):
                     if not status_data.get("can_spin"):
-                        # 今日已签到，奖励已直接到账，返回 None 不触发 topup
+                        # 今日已签到，奖励已直接到账
                         today_record = status_data.get("today_record", {})
                         quota = today_record.get("quota_amount", 0) if today_record else 0
-                        print(f"✅ {account_name}: Already checked in today, quota: {quota}")
-                        return None
+                        balance = status_data.get("balance", 0)
+                        print(f"✅ {account_name}: Already checked in today, quota: {quota}, balance: {balance}")
+                        return {"type": "checkin_success", "quota": quota, "balance": balance}
                 elif status_data:
                     error_msg = status_data.get("message", "Unknown error")
                     # Token 无效
@@ -1017,13 +972,13 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
                     new_balance = spin_data.get("new_balance", 0)
                     message = spin_data.get("message", f"获得 {label}")
                     print(f"✅ {account_name}: Checkin successful! {message}, new balance: {new_balance}")
-                    return None  # 奖励已直接到账，返回 None 不触发 topup
+                    return {"type": "checkin_success", "quota": quota, "balance": new_balance}
                 elif spin_data:
                     error_msg = spin_data.get("message", "Unknown error")
                     # 检查是否是已签到
                     if "已签到" in error_msg or "already" in error_msg.lower():
                         print(f"✅ {account_name}: Already checked in today")
-                        return None  # 奖励已直接到账，返回 None 不触发 topup
+                        return {"type": "checkin_success", "quota": 0, "balance": 0}
                     print(f"❌ {account_name}: Checkin failed: {error_msg}")
                     return None
 
@@ -1088,7 +1043,6 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
 
     account_name = account_config.get_display_name()
     linux_do = account_config.linux_do
-    proxy = account_config.proxy or account_config.get("global_proxy")
 
     # 检查是否有 linux_do 配置
     if not linux_do:
@@ -1121,11 +1075,9 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
 
     try:
         async with AsyncCamoufox(
-            headless=True,  # 无头模式
+            headless=True,
             humanize=True,
             locale="zh-CN",
-            geoip=True if proxy else False,
-            proxy=proxy,
         ) as browser:
             # 加载缓存的 storage state
             storage_state = cache_file_path if os.path.exists(cache_file_path) else None
@@ -1209,7 +1161,7 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
                     return None
 
                 # 6. 调用抽奖 API
-                return await _execute_fuli_wheel_spins(account_name, cookie_dict, proxy)
+                return await _execute_fuli_wheel_spins(account_name, cookie_dict)
 
             except Exception as e:
                 print(f"❌ {account_name}: Error in fuli wheel process: {e}")
@@ -1224,9 +1176,12 @@ async def _get_fuli_wheel_async(account_config: "AccountConfig") -> str | None:
         return None
 
 
-async def _execute_fuli_wheel_spins(account_name: str, cookies: dict, proxy: dict | None) -> str | None:
-    """使用 cookies 执行 fuli.hxi.me 大转盘抽奖"""
-    http_proxy = proxy_resolve(proxy)
+async def _execute_fuli_wheel_spins(account_name: str, cookies: dict) -> dict | None:
+    """使用 cookies 执行 fuli.hxi.me 大转盘抽奖
+
+    Returns:
+        dict | None: 成功返回 {"type": "wheel_success", "total_quota": 总额度, "spin_count": 抽奖次数}
+    """
 
     headers = {
         "accept": "*/*",
@@ -1241,7 +1196,7 @@ async def _execute_fuli_wheel_spins(account_name: str, cookies: dict, proxy: dic
     headers["cookie"] = cookie_str
 
     try:
-        client = httpx.Client(http2=False, timeout=30.0, proxy=http_proxy)
+        client = httpx.Client(http2=False, timeout=30.0)
         try:
             # 先检查剩余次数
             status_resp = client.get("https://fuli.hxi.me/api/wheel/status", headers=headers)
@@ -1255,7 +1210,7 @@ async def _execute_fuli_wheel_spins(account_name: str, cookies: dict, proxy: dic
 
             if remaining <= 0:
                 print(f"ℹ️ {account_name}: No wheel spins remaining today")
-                return "wheel_success"  # 已经抽完，视为成功
+                return {"type": "wheel_success", "total_quota": 0, "spin_count": 0}
 
             # 执行抽奖
             total_quota = 0
@@ -1285,7 +1240,7 @@ async def _execute_fuli_wheel_spins(account_name: str, cookies: dict, proxy: dic
 
             if spin_count > 0:
                 print(f"✅ {account_name}: Wheel lottery completed! Total quota earned: {total_quota}")
-                return "wheel_success"
+                return {"type": "wheel_success", "total_quota": total_quota, "spin_count": spin_count}
 
             return None
 

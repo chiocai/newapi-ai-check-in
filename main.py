@@ -150,9 +150,47 @@ async def main():
                             "bonus": current_bonus,
                         }
                     elif "cdk_results" in user_info:
-                        # fuli_wheel 等通过 get_cdk 完成签到的 provider
+                        # 处理 get_cdk 返回的结构化数据
+                        cdk_results = user_info['cdk_results']
                         account_result += f"  ✅ 签到成功\n"
-                        account_result += f"  🎁 抽奖完成: {len(user_info['cdk_results'])} 个结果\n"
+
+                        # 解析结构化数据
+                        for cdk_result in cdk_results:
+                            if isinstance(cdk_result, dict):
+                                result_type = cdk_result.get("type", "")
+                                if result_type == "checkin_success":
+                                    # x666 签到结果
+                                    quota = cdk_result.get("quota", 0)
+                                    balance = cdk_result.get("balance", 0)
+                                    account_result += f"  🎰 转盘获得: ${quota}\n"
+                                    if balance > 0:
+                                        account_result += f"  💰 当前余额: ${balance}\n"
+                                elif result_type == "wheel_success":
+                                    # hxi 福利站转盘结果
+                                    total_quota = cdk_result.get("total_quota", 0)
+                                    spin_count = cdk_result.get("spin_count", 0)
+                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
+                                elif result_type == "cdk_list":
+                                    # b4u CDK 列表结果
+                                    cdks = cdk_result.get("cdks", [])
+                                    total_quota = cdk_result.get("total_quota", 0)
+                                    spin_count = cdk_result.get("spin_count", 0)
+                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
+                                    if cdks:
+                                        account_result += f"  🎁 CDK: {len(cdks)} 个待兑换\n"
+                            elif isinstance(cdk_result, str):
+                                # 兼容旧格式（纯字符串）
+                                if cdk_result == "checkin_success":
+                                    account_result += f"  🎰 签到完成\n"
+                                elif cdk_result == "wheel_success":
+                                    account_result += f"  🎰 转盘完成\n"
+                                else:
+                                    # CDK 字符串
+                                    pass
+
+                        if not any(isinstance(r, dict) for r in cdk_results):
+                            # 全是字符串（旧格式），显示数量
+                            account_result += f"  🎁 抽奖完成: {len(cdk_results)} 个结果\n"
                     elif "message" in user_info:
                         account_result += f"  ✅ 签到成功\n"
                         account_result += f"  ℹ️ {user_info['message']}\n"
