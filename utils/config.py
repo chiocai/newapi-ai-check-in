@@ -5,8 +5,10 @@
 
 import json
 import os
+import asyncio
+import inspect
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generator, List, Literal
+from typing import AsyncGenerator, Callable, Dict, Generator, List, Literal
 
 from utils.signature import aiai_li_sign_in_url
 from utils.get_cdk import (
@@ -138,41 +140,59 @@ class ProviderConfig:
         """获取 LinuxDo 认证 URL"""
         return f"{self.origin}{self.linuxdo_auth_path}"
 
-    def iter_get_cdk(self, account_config: "AccountConfig") -> Generator[List[str], None, None]:
-        """迭代获取 CDK（生成器方式）
-        
-        每次调用一个 get_cdk 函数，将结果统一转换为 list[str] 后 yield 返回
-        适用于需要分步执行每个 get_cdk 函数的场景
-        
+    async def iter_get_cdk(self, account_config: "AccountConfig") -> AsyncGenerator[tuple, None]:
+        """迭代获取 CDK（异步生成器方式）
+
+        每次调用一个 get_cdk 函数，返回 (cdks, raw_result) 元组
+        - cdks: CDK 字符串列表，用于 topup
+        - raw_result: 原始返回值，用于通知展示
+
         Args:
             account_config: 账号配置对象
-        
+
         Yields:
-            List[str]: CDK 字符串列表（每次 yield 一个 get_cdk 函数的结果）
+            tuple: (cdks: List[str], raw_result: dict | str | list) 元组
         """
         if not self.get_cdk:
             return
-        
+
+        async def call_func(func):
+            """调用函数，支持同步和异步函数"""
+            if inspect.iscoroutinefunction(func):
+                return await func(account_config)
+            else:
+                return func(account_config)
+
         # 如果是单个函数
         if callable(self.get_cdk):
-            result = self.get_cdk(account_config)
+            result = await call_func(self.get_cdk)
             if result:
-                if isinstance(result, list):
-                    yield result
+                # 处理结构化返回值（如 b4u 返回的字典）
+                if isinstance(result, dict) and "cdks" in result:
+                    cdks = result.get("cdks", [])
+                    if cdks:
+                        yield (cdks, result)
+                elif isinstance(result, list):
+                    yield (result, result)
                 else:
-                    yield [result]
+                    yield ([result], result)
             return
-        
+
         # 如果是函数数组，依次调用每个函数
         if isinstance(self.get_cdk, list):
             for func in self.get_cdk:
                 if callable(func):
-                    result = func(account_config)
+                    result = await call_func(func)
                     if result:
-                        if isinstance(result, list):
-                            yield result
+                        # 处理结构化返回值（如 b4u 返回的字典）
+                        if isinstance(result, dict) and "cdks" in result:
+                            cdks = result.get("cdks", [])
+                            if cdks:
+                                yield (cdks, result)
+                        elif isinstance(result, list):
+                            yield (result, result)
                         else:
-                            yield [result]
+                            yield ([result], result)
 
 
 @dataclass
@@ -524,10 +544,10 @@ class AppConfig:
                 api_user_key="new-api-user",
                 github_client_id=None,
                 github_auth_path=None,
-                linuxdo_client_id=None,  # LinuxDo OAuth 用于福利站，不用于主站
+                linuxdo_client_id="Cf3PtT3ecj4kzJrMvOGM48FrHFKYXusb",  # b4u 主站的 LinuxDo OAuth client_id
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",  # b4u 主站需要浏览器绕过 Cloudflare
             ),
             "fuli_wheel": ProviderConfig(
                 name="fuli_wheel",

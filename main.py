@@ -19,6 +19,9 @@ load_dotenv(override=True)
 
 BALANCE_HASH_FILE = "balance_hash.txt"
 
+# 并行处理配置
+MAX_CONCURRENT_ACCOUNTS = 4  # 最大并发账号数
+
 
 def generate_balance_hash(balances: dict) -> str:
     """生成余额数据的hash"""
@@ -33,6 +36,154 @@ def generate_balance_hash(balances: dict) -> str:
 
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(balance_json.encode("utf-8")).hexdigest()[:16]
+
+
+async def process_single_account(
+    account_index: int,
+    account_config,
+    app_config,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """处理单个账号的签到（带并发控制）
+
+    Args:
+        account_index: 账号索引
+        account_config: 账号配置
+        app_config: 应用配置
+        semaphore: 并发控制信号量
+
+    Returns:
+        包含处理结果的字典
+    """
+    async with semaphore:
+        account_key = f"account_{account_index + 1}"
+        account_name = account_config.get_display_name(account_index)
+
+        result = {
+            "account_key": account_key,
+            "account_name": account_name,
+            "account_index": account_index,
+            "success": False,
+            "results": [],
+            "balances": {},
+            "notification": "",
+            "need_notify": False,
+            "error": None,
+        }
+
+        try:
+            provider_config = app_config.get_provider(account_config.provider)
+            if not provider_config:
+                print(f"❌ {account_name}: Provider '{account_config.provider}' configuration not found")
+                result["need_notify"] = True
+                result["notification"] = f"[FAIL] {account_name}: Provider '{account_config.provider}' configuration not found"
+                result["error"] = f"Provider '{account_config.provider}' not found"
+                return result
+
+            print(f"🌀 Processing {account_name} using provider '{account_config.provider}'\n")
+
+            # 获取共享的 Linux.do 会话（如果有）
+            linuxdo_session = None
+            if account_config.linux_do:
+                username = account_config.linux_do.get("username")
+                if username:
+                    linuxdo_session = LinuxDoSessionManager.get_cached_session(username)
+
+            checkin = CheckIn(
+                account_name,
+                account_config,
+                provider_config,
+                global_proxy=app_config.global_proxy,
+                linuxdo_session=linuxdo_session,
+            )
+            results = await checkin.execute()
+            result["results"] = results
+
+            # 处理多个认证方式的结果
+            account_success = False
+            successful_methods = []
+            failed_methods = []
+            this_account_balances = {}
+
+            # 构建简化的中文结果报告
+            account_result = f"📌 {account_name}\n"
+            for auth_method, success, user_info in results:
+                if success and user_info and user_info.get("success"):
+                    account_success = True
+                    successful_methods.append(auth_method)
+                    # 记录余额信息
+                    if "quota" in user_info:
+                        current_quota = user_info["quota"]
+                        current_used = user_info["used_quota"]
+                        current_bonus = user_info["bonus_quota"]
+                        account_result += f"  ✅ 签到成功\n"
+                        account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
+                        this_account_balances[f"{auth_method}"] = {
+                            "quota": current_quota,
+                            "used": current_used,
+                            "bonus": current_bonus,
+                        }
+                    elif "cdk_results" in user_info:
+                        cdk_results = user_info['cdk_results']
+                        account_result += f"  ✅ 签到成功\n"
+                        for cdk_result in cdk_results:
+                            if isinstance(cdk_result, dict):
+                                result_type = cdk_result.get("type", "")
+                                if result_type == "checkin_success":
+                                    quota = cdk_result.get("quota", 0)
+                                    balance = cdk_result.get("balance", 0)
+                                    account_result += f"  🎰 转盘获得: ${quota}\n"
+                                    if balance > 0:
+                                        account_result += f"  💰 当前余额: ${balance}\n"
+                                elif result_type == "wheel_success":
+                                    total_quota = cdk_result.get("total_quota", 0)
+                                    spin_count = cdk_result.get("spin_count", 0)
+                                    already_done = cdk_result.get("already_done", False)
+                                    if already_done:
+                                        account_result += f"  🎰 今日已抽 {spin_count} 次, 获得: ${total_quota}\n"
+                                    else:
+                                        account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
+                                elif result_type == "cdk_list":
+                                    cdks = cdk_result.get("cdks", [])
+                                    total_quota = cdk_result.get("total_quota", 0)
+                                    spin_count = cdk_result.get("spin_count", 0)
+                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
+                                    if cdks:
+                                        account_result += f"  🎁 CDK: {len(cdks)} 个待兑换\n"
+                        if not any(isinstance(r, dict) for r in cdk_results):
+                            account_result += f"  🎁 抽奖完成: {len(cdk_results)} 个结果\n"
+                    elif "message" in user_info:
+                        account_result += f"  ✅ 签到成功\n"
+                        account_result += f"  ℹ️ {user_info['message']}\n"
+                    else:
+                        account_result += f"  ✅ 签到成功\n"
+                else:
+                    failed_methods.append(auth_method)
+                    error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
+                    account_result += f"  ❌ 签到失败\n"
+                    account_result += f"  ⚠️ {str(error_msg)}\n"
+
+            result["success"] = account_success
+            result["balances"] = this_account_balances
+            result["notification"] = account_result
+
+            # 如果所有认证方式都失败，需要通知
+            if not account_success and results:
+                result["need_notify"] = True
+                print(f"🔔 {account_name} all authentication methods failed, will send notification")
+
+            # 如果有失败的认证方式，也通知
+            if failed_methods and successful_methods:
+                result["need_notify"] = True
+                print(f"🔔 {account_name} has some failed authentication methods, will send notification")
+
+        except Exception as e:
+            print(f"❌ {account_name} processing exception: {e}")
+            result["need_notify"] = True
+            result["notification"] = f"❌ {account_name} Exception: {str(e)[:100]}..."
+            result["error"] = str(e)
+
+        return result
 
 
 async def main():
@@ -81,146 +232,59 @@ async def main():
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
 
-    # 为每个账号执行签到
+    # 并行处理所有账号
+    print(f"\n🚀 Starting parallel processing with max {MAX_CONCURRENT_ACCOUNTS} concurrent accounts...")
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_ACCOUNTS)
+
+    # 创建所有账号的处理任务
+    tasks = [
+        process_single_account(i, account_config, app_config, semaphore)
+        for i, account_config in enumerate(app_config.accounts)
+    ]
+
+    # 并行执行所有任务
+    account_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 汇总结果
     success_count = 0
     total_count = 0
     notification_content = []
     current_balances = {}
-    need_notify = False  # 是否需要发送通知
+    need_notify = False
 
-    for i, account_config in enumerate(app_config.accounts):
-        account_key = f"account_{i + 1}"
-        account_name = account_config.get_display_name(i)
+    # 按账号索引排序结果，确保通知顺序一致
+    sorted_results = sorted(
+        [r for r in account_results if isinstance(r, dict)],
+        key=lambda x: x.get("account_index", 0)
+    )
+
+    for result in sorted_results:
         if len(notification_content) > 0:
             notification_content.append("\n-------------------------------")
 
-        try:
-            provider_config = app_config.get_provider(account_config.provider)
-            if not provider_config:
-                print(f"❌ {account_name}: Provider '{account_config.provider}' configuration not found")
-                need_notify = True
-                notification_content.append(
-                    f"[FAIL] {account_name}: Provider '{account_config.provider}' configuration not found"
-                )
-                continue
+        # 统计结果
+        for auth_result in result.get("results", []):
+            total_count += 1
+            if auth_result[1] and auth_result[2] and auth_result[2].get("success"):
+                success_count += 1
 
-            print(f"🌀 Processing {account_name} using provider '{account_config.provider}'")
+        # 收集余额信息
+        if result.get("success") and result.get("balances"):
+            current_balances[result["account_key"]] = result["balances"]
 
-            # 获取共享的 Linux.do 会话（如果有）
-            linuxdo_session = None
-            if account_config.linux_do:
-                username = account_config.linux_do.get("username")
-                if username:
-                    linuxdo_session = LinuxDoSessionManager.get_cached_session(username)
+        # 收集通知内容
+        if result.get("notification"):
+            notification_content.append(result["notification"])
 
-            checkin = CheckIn(
-                account_name,
-                account_config,
-                provider_config,
-                global_proxy=app_config.global_proxy,
-                linuxdo_session=linuxdo_session,
-            )
-            results = await checkin.execute()
+        # 检查是否需要通知
+        if result.get("need_notify"):
+            need_notify = True
 
-            total_count += len(results)
-
-            # 处理多个认证方式的结果
-            account_success = False
-            successful_methods = []
-            failed_methods = []
-
-            this_account_balances = {}
-            # 构建简化的中文结果报告
-            account_result = f"📌 {account_name}\n"
-            for auth_method, success, user_info in results:
-                if success and user_info and user_info.get("success"):
-                    account_success = True
-                    success_count += 1
-                    successful_methods.append(auth_method)
-                    # 记录余额信息（某些 provider 如 fuli_wheel 可能没有余额信息）
-                    if "quota" in user_info:
-                        current_quota = user_info["quota"]
-                        current_used = user_info["used_quota"]
-                        current_bonus = user_info["bonus_quota"]
-                        account_result += f"  ✅ 签到成功\n"
-                        account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
-                        this_account_balances[f"{auth_method}"] = {
-                            "quota": current_quota,
-                            "used": current_used,
-                            "bonus": current_bonus,
-                        }
-                    elif "cdk_results" in user_info:
-                        # 处理 get_cdk 返回的结构化数据
-                        cdk_results = user_info['cdk_results']
-                        account_result += f"  ✅ 签到成功\n"
-
-                        # 解析结构化数据
-                        for cdk_result in cdk_results:
-                            if isinstance(cdk_result, dict):
-                                result_type = cdk_result.get("type", "")
-                                if result_type == "checkin_success":
-                                    # x666 签到结果
-                                    quota = cdk_result.get("quota", 0)
-                                    balance = cdk_result.get("balance", 0)
-                                    account_result += f"  🎰 转盘获得: ${quota}\n"
-                                    if balance > 0:
-                                        account_result += f"  💰 当前余额: ${balance}\n"
-                                elif result_type == "wheel_success":
-                                    # hxi 福利站转盘结果
-                                    total_quota = cdk_result.get("total_quota", 0)
-                                    spin_count = cdk_result.get("spin_count", 0)
-                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
-                                elif result_type == "cdk_list":
-                                    # b4u CDK 列表结果
-                                    cdks = cdk_result.get("cdks", [])
-                                    total_quota = cdk_result.get("total_quota", 0)
-                                    spin_count = cdk_result.get("spin_count", 0)
-                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
-                                    if cdks:
-                                        account_result += f"  🎁 CDK: {len(cdks)} 个待兑换\n"
-                            elif isinstance(cdk_result, str):
-                                # 兼容旧格式（纯字符串）
-                                if cdk_result == "checkin_success":
-                                    account_result += f"  🎰 签到完成\n"
-                                elif cdk_result == "wheel_success":
-                                    account_result += f"  🎰 转盘完成\n"
-                                else:
-                                    # CDK 字符串
-                                    pass
-
-                        if not any(isinstance(r, dict) for r in cdk_results):
-                            # 全是字符串（旧格式），显示数量
-                            account_result += f"  🎁 抽奖完成: {len(cdk_results)} 个结果\n"
-                    elif "message" in user_info:
-                        account_result += f"  ✅ 签到成功\n"
-                        account_result += f"  ℹ️ {user_info['message']}\n"
-                    else:
-                        account_result += f"  ✅ 签到成功\n"
-                else:
-                    failed_methods.append(auth_method)
-                    error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
-                    account_result += f"  ❌ 签到失败\n"
-                    account_result += f"  ⚠️ {str(error_msg)}\n"
-
-            if account_success:
-                current_balances[account_key] = this_account_balances
-
-            # 如果所有认证方式都失败，需要通知
-            if not account_success and results:
-                need_notify = True
-                print(f"🔔 {account_name} all authentication methods failed, will send notification")
-
-            # 如果有失败的认证方式，也通知
-            if failed_methods and successful_methods:
-                need_notify = True
-                print(f"🔔 {account_name} has some failed authentication methods, will send notification")
-
-            notification_content.append(account_result)
-
-        except Exception as e:
-            print(f"❌ {account_name} processing exception: {e}")
-            need_notify = True  # 异常也需要通知
-            notification_content.append(f"❌ {account_name} Exception: {str(e)[:100]}...")
+    # 处理异常结果
+    for result in account_results:
+        if isinstance(result, Exception):
+            need_notify = True
+            notification_content.append(f"❌ Exception: {str(result)[:100]}...")
 
     # 检查余额变化
     current_balance_hash = generate_balance_hash(current_balances) if current_balances else None

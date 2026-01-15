@@ -31,25 +31,202 @@ MAX_RETRIES = 3  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
 
 
-def get_runawaytime_checkin_cdk(account_config: "AccountConfig") -> str | None:
-    """获取 runawaytime 签到 CDK
-    
-    通过 fuli.hxi.me 签到获取 CDK
-    
+async def _get_fuli_session_cookies(account_config: "AccountConfig") -> dict | None:
+    """通过浏览器登录 fuli.hxi.me 获取 session cookies
+
     Args:
-        account_config: 账号配置对象，需要包含 fuli_cookies 在 extra 中
-    
+        account_config: 账号配置对象，需要包含 linux_do 认证信息
+
+    Returns:
+        dict | None: cookies 字典，如果获取失败则返回 None
+    """
+    import hashlib
+    import os
+    from camoufox.async_api import AsyncCamoufox
+    from utils.browser_utils import take_screenshot
+    from utils.linuxdo_session import LinuxDoSessionManager
+
+    account_name = account_config.get_display_name()
+    linux_do = account_config.linux_do
+
+    if not linux_do:
+        return None
+
+    username = linux_do.get("username")
+    password = linux_do.get("password")
+
+    if not username or not password:
+        return None
+
+    # 尝试获取共享的 Linux.do 会话
+    shared_session = LinuxDoSessionManager.get_cached_session(username)
+
+    # 确定 storage_state 来源
+    storage_state_dir = "storage-states"
+    os.makedirs(storage_state_dir, exist_ok=True)
+
+    if shared_session:
+        cache_file_path = shared_session.get_storage_state_path()
+        print(f"ℹ️ {account_name}: Using shared Linux.do session for fuli.hxi.me")
+    else:
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        cache_file_path = f"{storage_state_dir}/fuli_linuxdo_{username_hash}_storage_state.json"
+        print(f"ℹ️ {account_name}: No shared session, using standalone cache for fuli.hxi.me")
+
+    try:
+        async with AsyncCamoufox(
+            headless=True,
+            humanize=True,
+            locale="zh-CN",
+        ) as browser:
+            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            if storage_state:
+                print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
+
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+
+            try:
+                # 1. 先登录 linux.do
+                print(f"ℹ️ {account_name}: Navigating to linux.do for fuli.hxi.me login")
+                await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                await page.wait_for_timeout(1500)
+
+                # 检查是否遇到 Cloudflare 人机验证
+                page_title = await page.title()
+                if "Just a moment" in page_title or "Verify" in page_title:
+                    print(f"⚠️ {account_name}: Cloudflare verification detected, waiting...")
+                    try:
+                        await page.wait_for_function(
+                            "!document.title.includes('Just a moment') && !document.title.includes('Verify')",
+                            timeout=TIMEOUT_CLOUDFLARE
+                        )
+                        await page.wait_for_timeout(2000)
+                        print(f"✅ {account_name}: Cloudflare verification completed")
+                    except Exception as cf_err:
+                        print(f"❌ {account_name}: Cloudflare verification timeout: {cf_err}")
+                        return None
+
+                current_url = page.url
+                if "linux.do/login" in current_url:
+                    print(f"ℹ️ {account_name}: Logging in to linux.do")
+                    try:
+                        await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
+                    except Exception:
+                        print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
+                        await page.wait_for_timeout(2000)
+
+                    await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
+                    await page.wait_for_timeout(500)
+                    await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
+                    await page.wait_for_timeout(500)
+                    await page.click("#login-button", timeout=TIMEOUT_CLICK)
+
+                    try:
+                        await page.wait_for_selector(".current-user", timeout=15000)
+                    except Exception:
+                        await page.wait_for_timeout(3000)
+
+                    current_url = page.url
+                    if "linux.do/login" in current_url:
+                        print(f"❌ {account_name}: Failed to login to linux.do")
+                        await take_screenshot(page, "fuli_linuxdo_login_failed", account_name)
+                        return None
+
+                    print(f"✅ {account_name}: Logged in to linux.do")
+                    await context.storage_state(path=cache_file_path)
+                else:
+                    print(f"✅ {account_name}: Already logged in to linux.do (via cache)")
+
+                # 2. 访问 fuli.hxi.me
+                print(f"ℹ️ {account_name}: Navigating to fuli.hxi.me")
+                await page.goto("https://fuli.hxi.me/", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                await page.wait_for_timeout(2000)
+
+                # 3. 检查是否需要登录
+                login_btn = await page.query_selector('button:has-text("登录"), a:has-text("登录")')
+                if login_btn:
+                    print(f"ℹ️ {account_name}: Clicking login button on fuli.hxi.me")
+                    await login_btn.click()
+                    try:
+                        await page.wait_for_url("**connect.linux.do**", timeout=10000)
+                    except Exception:
+                        await page.wait_for_timeout(2000)
+
+                    current_url = page.url
+                    if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
+                        print(f"ℹ️ {account_name}: At OAuth authorization page")
+                        try:
+                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
+                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                            if allow_btn:
+                                print(f"ℹ️ {account_name}: Clicking authorize button")
+                                await allow_btn.click()
+                                await page.wait_for_timeout(2000)
+                        except Exception as e:
+                            print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+
+                    await context.storage_state(path=cache_file_path)
+                    print(f"✅ {account_name}: Logged in to fuli.hxi.me")
+
+                # 4. 获取 cookies
+                cookies = await context.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies if "fuli.hxi.me" in c.get("domain", "")}
+
+                if "session" in cookie_dict:
+                    print(f"✅ {account_name}: Got fuli.hxi.me session cookies")
+                    return cookie_dict
+                else:
+                    print(f"❌ {account_name}: Session cookie not found in fuli.hxi.me")
+                    await take_screenshot(page, "fuli_no_session", account_name)
+                    return None
+
+            except Exception as e:
+                print(f"❌ {account_name}: Error getting fuli cookies: {e}")
+                await take_screenshot(page, "fuli_error", account_name)
+                return None
+            finally:
+                await page.close()
+                await context.close()
+
+    except Exception as e:
+        print(f"❌ {account_name}: Error starting browser for fuli: {e}")
+        return None
+
+
+async def get_runawaytime_checkin_cdk(account_config: "AccountConfig") -> str | None:
+    """获取 runawaytime 签到 CDK
+
+    通过 fuli.hxi.me 签到获取 CDK
+    支持两种方式：
+    1. 使用配置中的 fuli_cookies
+    2. 通过 linux.do 账号自动登录获取 cookies
+
+    Args:
+        account_config: 账号配置对象，需要包含 fuli_cookies 或 linux_do 认证信息
+
     Returns:
         str | None: CDK 字符串，如果获取失败则返回 None
     """
     account_name = account_config.get_display_name()
     fuli_cookies = account_config.get("fuli_cookies")
     proxy = account_config.proxy or account_config.get("global_proxy")
-    
+
+    # 如果没有 fuli_cookies，尝试通过浏览器登录获取
     if not fuli_cookies:
-        print(f"❌ {account_name}: fuli_cookies not found in account config")
-        return None
-    
+        linux_do = account_config.linux_do
+        if linux_do and linux_do.get("username") and linux_do.get("password"):
+            print(f"ℹ️ {account_name}: No fuli_cookies, trying browser login for fuli.hxi.me")
+            try:
+                fuli_cookies = await _get_fuli_session_cookies(account_config)
+            except Exception as e:
+                print(f"❌ {account_name}: Failed to get fuli cookies via browser: {e}")
+                return None
+
+        if not fuli_cookies:
+            print(f"❌ {account_name}: fuli_cookies not found and browser login failed")
+            return None
+
     http_proxy = proxy_resolve(proxy)
     
     try:
@@ -136,25 +313,39 @@ def get_runawaytime_checkin_cdk(account_config: "AccountConfig") -> str | None:
         return None
 
 
-def get_runawaytime_wheel_cdk(account_config: "AccountConfig") -> list[str] | None:
+async def get_runawaytime_wheel_cdk(account_config: "AccountConfig") -> list[str] | None:
     """获取 runawaytime 大转盘 CDK
-    
+
     通过 fuli.hxi.me 大转盘获取 CDK，支持多次转盘
-    
+    支持两种方式：
+    1. 使用配置中的 fuli_cookies
+    2. 通过 linux.do 账号自动登录获取 cookies
+
     Args:
-        account_config: 账号配置对象，需要包含 fuli_cookies 在 extra 中
-    
+        account_config: 账号配置对象，需要包含 fuli_cookies 或 linux_do 认证信息
+
     Returns:
         list[str] | None: CDK 字符串列表，如果获取失败则返回 None
     """
     account_name = account_config.get_display_name()
     fuli_cookies = account_config.get("fuli_cookies")
     proxy = account_config.proxy or account_config.get("global_proxy")
-    
+
+    # 如果没有 fuli_cookies，尝试通过浏览器登录获取
     if not fuli_cookies:
-        print(f"❌ {account_name}: fuli_cookies not found in account config")
-        return None
-    
+        linux_do = account_config.linux_do
+        if linux_do and linux_do.get("username") and linux_do.get("password"):
+            print(f"ℹ️ {account_name}: No fuli_cookies, trying browser login for fuli.hxi.me")
+            try:
+                fuli_cookies = await _get_fuli_session_cookies(account_config)
+            except Exception as e:
+                print(f"❌ {account_name}: Failed to get fuli cookies via browser: {e}")
+                return None
+
+        if not fuli_cookies:
+            print(f"❌ {account_name}: fuli_cookies not found and browser login failed")
+            return None
+
     http_proxy = proxy_resolve(proxy)
     cdks: list[str] = []
     
@@ -386,7 +577,7 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                 # 1. 先尝试直接访问 b4u 抽奖页面检查是否已登录
                 print(f"ℹ️ {account_name}: Checking login status on b4u")
                 await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(2000)
 
                 current_url = page.url
                 if "/login" not in current_url:
@@ -404,7 +595,7 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                 if not is_logged_in:
                     print(f"ℹ️ {account_name}: Not logged in, starting linux.do login first")
                     await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1500)
 
                     current_url = page.url
                     if "linux.do/login" in current_url:
@@ -414,11 +605,15 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                             await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
 
                             await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(500)
                             await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(500)
                             await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                            await page.wait_for_timeout(10000)
+                            # 等待登录完成：检测用户元素出现
+                            try:
+                                await page.wait_for_selector(".current-user", timeout=15000)
+                            except Exception:
+                                await page.wait_for_timeout(3000)
                         except Exception as e:
                             print(f"❌ {account_name}: Failed to fill login form: {e}")
                             await take_screenshot(page, "b4u_linuxdo_login_failed", account_name)
@@ -440,14 +635,18 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                     # 3. 访问 b4u 登录页面触发 OAuth
                     print(f"ℹ️ {account_name}: Navigating to b4u login page")
                     await page.goto("https://tw.b4u.qzz.io/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1500)
 
                     # 点击 LinuxDo 登录按钮
                     login_btn = await page.query_selector('button:has-text("使用 Linux.do 登录")')
                     if login_btn:
                         print(f"ℹ️ {account_name}: Clicking LinuxDo login button")
                         await login_btn.click()
-                        await page.wait_for_timeout(8000)
+                        # 等待 OAuth 页面加载或直接跳转
+                        try:
+                            await page.wait_for_url("**connect.linux.do**", timeout=10000)
+                        except Exception:
+                            await page.wait_for_timeout(3000)
 
                         # 检查是否需要 OAuth 授权
                         current_url = page.url
@@ -461,7 +660,7 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                                 if allow_btn:
                                     print(f"ℹ️ {account_name}: Clicking authorize button")
                                     await allow_btn.click()
-                                    await page.wait_for_timeout(5000)
+                                    await page.wait_for_timeout(2000)
                             except Exception as e:
                                 print(f"⚠️ {account_name}: OAuth approve failed: {e}")
 
@@ -474,7 +673,7 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                     if "luckydraw" not in current_url:
                         print(f"ℹ️ {account_name}: Navigating to luckydraw page")
                         await page.goto("https://tw.b4u.qzz.io/luckydraw", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(1500)
 
                 # 4. 执行抽奖流程
                 print(f"ℹ️ {account_name}: Starting lottery process")
@@ -569,8 +768,37 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                         print(f"ℹ️ {account_name}: Spin button is disabled")
                         break
 
-                    # 点击抽奖
+                    # 在点击抽奖前，先发送 Next.js Server Action 请求刷新页面状态
                     spin_count += 1
+                    print(f"ℹ️ {account_name}: Sending server action before spin #{spin_count}")
+                    try:
+                        server_action_result = await page.evaluate("""async () => {
+                            try {
+                                const response = await fetch('/luckydraw', {
+                                    method: 'POST',
+                                    credentials: 'include',
+                                    headers: {
+                                        'accept': 'text/x-component',
+                                        'content-type': 'text/plain;charset=UTF-8',
+                                        'next-action': 'f9d4d674b6dc56eed69256e6f809e1a6f65babf5',
+                                        'next-router-state-tree': '%5B%22%22%2C%7B%22children%22%3A%5B%22(dashboard)%22%2C%7B%22children%22%3A%5B%22luckydraw%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fluckydraw%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D'
+                                    },
+                                    body: '[]'
+                                });
+                                return { ok: response.ok, status: response.status };
+                            } catch (e) {
+                                return { ok: false, error: e.message };
+                            }
+                        }""")
+                        if server_action_result and server_action_result.get('ok'):
+                            print(f"✅ {account_name}: Server action completed (status: {server_action_result.get('status')})")
+                        else:
+                            print(f"⚠️ {account_name}: Server action response: {server_action_result}")
+                        await page.wait_for_timeout(500)  # 等待服务端处理
+                    except Exception as e:
+                        print(f"⚠️ {account_name}: Server action request failed: {e}")
+
+                    # 点击抽奖
                     print(f"ℹ️ {account_name}: Clicking spin button (spin #{spin_count})")
                     await spin_btn.click()
                     await page.wait_for_timeout(6000)  # 等待转盘动画完成
@@ -629,7 +857,7 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
                 # 访问"我的兑换码"页面获取今日所有 CDK（统一从这里获取，而不是从转盘结果）
                 print(f"ℹ️ {account_name}: Checking my-codes page for today's CDKs")
                 await page.goto("https://tw.b4u.qzz.io/my-codes", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(2000)
 
                 # 截图以便调试
                 await take_screenshot(page, "b4u_my_codes_page", account_name)
@@ -853,7 +1081,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 if os.path.exists(cache_file_path):
                     print(f"ℹ️ {account_name}: Checking login status on up.x666.me")
                     await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(5000)
+                    await page.wait_for_timeout(2000)
 
                     # 检查是否已登录（从 localStorage 获取 token）
                     token = await page.evaluate("() => localStorage.getItem('userToken')")
@@ -870,36 +1098,63 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 if not is_logged_in:
                     print(f"ℹ️ {account_name}: Starting to sign in linux.do")
                     await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1500)
 
-                    # 等待登录表单加载
-                    try:
-                        await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
-                    except Exception:
-                        print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
-                        await page.wait_for_timeout(5000)
-
-                    # 填写登录凭据
-                    print(f"ℹ️ {account_name}: Filling credentials")
-                    await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
-                    await page.wait_for_timeout(2000)
-                    await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
-                    await page.wait_for_timeout(2000)
-                    await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                    await page.wait_for_timeout(10000)
-
-                    # 检查登录结果
-                    current_url = page.url
-                    print(f"ℹ️ {account_name}: URL after login: {current_url}")
-
-                    # 检查是否遇到 Cloudflare 验证
-                    if "linux.do/challenge" in current_url:
-                        print(f"⚠️ {account_name}: Cloudflare challenge detected, waiting for Camoufox to bypass...")
+                    # 检查是否遇到 Cloudflare 人机验证页面
+                    page_title = await page.title()
+                    if "Just a moment" in page_title or "Verify" in page_title:
+                        print(f"⚠️ {account_name}: Cloudflare human verification detected, waiting for completion...")
                         try:
-                            await page.wait_for_url("https://linux.do/", timeout=TIMEOUT_CLOUDFLARE)
-                            print(f"✅ {account_name}: Cloudflare challenge bypassed")
+                            # 等待 Cloudflare 验证完成（页面标题变化）
+                            await page.wait_for_function(
+                                "!document.title.includes('Just a moment') && !document.title.includes('Verify')",
+                                timeout=TIMEOUT_CLOUDFLARE
+                            )
+                            await page.wait_for_timeout(2000)  # 额外等待页面稳定
+                            print(f"✅ {account_name}: Cloudflare verification completed")
+                        except Exception as cf_err:
+                            print(f"❌ {account_name}: Cloudflare verification timeout: {cf_err}")
+                            await take_screenshot(page, "x666_cloudflare_timeout", account_name)
+                            return None
+
+                    # 检查当前页面状态
+                    current_url = page.url
+                    # 如果已经登录（被重定向到首页），跳过登录流程
+                    if "linux.do/login" not in current_url and "linux.do" in current_url:
+                        print(f"✅ {account_name}: Already logged in to linux.do (redirected to {current_url})")
+                    else:
+                        # 等待登录表单加载
+                        try:
+                            await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
                         except Exception:
-                            print(f"⚠️ {account_name}: Cloudflare challenge timeout")
+                            print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
+                            await page.wait_for_timeout(2000)
+
+                        # 填写登录凭据
+                        print(f"ℹ️ {account_name}: Filling credentials")
+                        await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
+                        await page.wait_for_timeout(500)
+                        await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
+                        await page.wait_for_timeout(500)
+                        await page.click("#login-button", timeout=TIMEOUT_CLICK)
+                        # 等待登录完成
+                        try:
+                            await page.wait_for_selector(".current-user", timeout=15000)
+                        except Exception:
+                            await page.wait_for_timeout(3000)
+
+                        # 检查登录结果
+                        current_url = page.url
+                        print(f"ℹ️ {account_name}: URL after login: {current_url}")
+
+                        # 检查是否遇到 Cloudflare 验证
+                        if "linux.do/challenge" in current_url:
+                            print(f"⚠️ {account_name}: Cloudflare challenge detected, waiting for Camoufox to bypass...")
+                            try:
+                                await page.wait_for_url("https://linux.do/", timeout=TIMEOUT_CLOUDFLARE)
+                                print(f"✅ {account_name}: Cloudflare challenge bypassed")
+                            except Exception:
+                                print(f"⚠️ {account_name}: Cloudflare challenge timeout")
 
                     # 保存登录状态
                     await context.storage_state(path=cache_file_path)
@@ -908,7 +1163,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 # 登录成功后，访问 up.x666.me 触发 OAuth 获取 token
                 print(f"ℹ️ {account_name}: Navigating to up.x666.me to get token")
                 await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(2000)
 
                 # 检查是否需要点击登录按钮
                 current_url = page.url
@@ -927,7 +1182,11 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 if login_btn:
                     print(f"ℹ️ {account_name}: Clicking login button on up.x666.me")
                     await login_btn.click()
-                    await page.wait_for_timeout(5000)
+                    # 等待跳转到 OAuth 页面
+                    try:
+                        await page.wait_for_url("**connect.linux.do**", timeout=10000)
+                    except Exception:
+                        await page.wait_for_timeout(2000)
 
                 # 检查是否在 OAuth 授权页面
                 current_url = page.url
@@ -941,13 +1200,13 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                         if allow_btn:
                             print(f"ℹ️ {account_name}: Clicking authorize button...")
                             await allow_btn.click()
-                            await page.wait_for_timeout(5000)
+                            await page.wait_for_timeout(2000)
                     except Exception as e:
                         print(f"⚠️ {account_name}: OAuth approve failed: {e}")
                         await take_screenshot(page, "x666_oauth_approve_failed", account_name)
 
                 # 等待回调完成
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(1500)
                 current_url = page.url
                 print(f"ℹ️ {account_name}: Final URL: {current_url}")
 
@@ -1194,7 +1453,7 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
                 # 1. 先登录 linux.do
                 print(f"ℹ️ {account_name}: Navigating to linux.do")
                 await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(1500)
 
                 current_url = page.url
                 if "linux.do/login" in current_url:
@@ -1204,14 +1463,18 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
                         await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
                     except Exception:
                         print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
-                        await page.wait_for_timeout(5000)
+                        await page.wait_for_timeout(2000)
 
                     await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)
                     await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)
                     await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                    await page.wait_for_timeout(10000)
+                    # 等待登录完成
+                    try:
+                        await page.wait_for_selector(".current-user", timeout=15000)
+                    except Exception:
+                        await page.wait_for_timeout(3000)
 
                     current_url = page.url
                     if "linux.do/login" in current_url:
@@ -1227,14 +1490,18 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
                 # 2. 访问福利站大转盘页面
                 print(f"ℹ️ {account_name}: Navigating to fuli.hxi.me/wheel")
                 await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(2000)
 
                 # 3. 检查是否需要登录福利站
                 login_btn = await page.query_selector('button:has-text("登录"), a:has-text("登录")')
                 if login_btn:
                     print(f"ℹ️ {account_name}: Clicking login button on fuli.hxi.me")
                     await login_btn.click()
-                    await page.wait_for_timeout(5000)
+                    # 等待跳转到 OAuth 页面
+                    try:
+                        await page.wait_for_url("**connect.linux.do**", timeout=10000)
+                    except Exception:
+                        await page.wait_for_timeout(2000)
 
                     # 检查是否在 OAuth 授权页面
                     current_url = page.url
@@ -1246,7 +1513,7 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
                             if allow_btn:
                                 print(f"ℹ️ {account_name}: Clicking authorize button")
                                 await allow_btn.click()
-                                await page.wait_for_timeout(5000)
+                                await page.wait_for_timeout(2000)
                         except Exception as e:
                             print(f"⚠️ {account_name}: OAuth approve failed: {e}")
 
@@ -1257,7 +1524,7 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
                 # 4. 确保在转盘页面
                 if "wheel" not in page.url:
                     await page.goto("https://fuli.hxi.me/wheel", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1500)
 
                 # 5. 获取 cookies 用于 API 调用
                 cookies = await context.cookies()
@@ -1306,19 +1573,27 @@ async def _execute_fuli_wheel_spins(account_name: str, cookies: dict) -> dict | 
     try:
         client = httpx.Client(http2=False, timeout=30.0)
         try:
-            # 先检查剩余次数
+            # 先检查剩余次数和今天的抽奖信息
             status_resp = client.get("https://fuli.hxi.me/api/wheel/status", headers=headers)
             remaining = 2  # 默认 2 次
+            today_quota = 0  # 今天已获得的额度
+            today_spins = 0  # 今天已抽的次数
 
             if status_resp.status_code == 200:
                 status_data = response_resolve(status_resp, "get_wheel_status", account_name)
                 if status_data:
                     remaining = status_data.get("remaining", 2)
-                    print(f"ℹ️ {account_name}: Wheel spins remaining: {remaining}")
+                    # 尝试获取今天的抽奖信息（如果 API 返回的话）
+                    today_quota = status_data.get("today_quota", status_data.get("todayQuota", 0))
+                    today_spins = status_data.get("today_spins", status_data.get("todaySpins", 0))
+                    # 如果没有 today_spins，根据 remaining 推算（假设每天 2 次）
+                    if today_spins == 0 and remaining < 2:
+                        today_spins = 2 - remaining
+                    print(f"ℹ️ {account_name}: Wheel spins remaining: {remaining}, today spins: {today_spins}, today quota: {today_quota}")
 
             if remaining <= 0:
                 print(f"ℹ️ {account_name}: No wheel spins remaining today")
-                return {"type": "wheel_success", "total_quota": 0, "spin_count": 0}
+                return {"type": "wheel_success", "total_quota": today_quota, "spin_count": today_spins, "already_done": True}
 
             # 执行抽奖
             total_quota = 0

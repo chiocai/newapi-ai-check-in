@@ -24,11 +24,12 @@ def topup(
         headers: 请求头
         cookies: cookies 字典
         key: 充值密钥
-        proxy: 代理配置（可选）
+        proxy: 代理配置（可选，None 表示不使用代理）
 
     Returns:
         包含 success 和 message 或 error 的字典
     """
+    # proxy=None 时 httpx 会使用环境变量代理，这里直接传入
     client = httpx.Client(http2=True, timeout=30.0, proxy=proxy)
     try:
         # 设置 cookies

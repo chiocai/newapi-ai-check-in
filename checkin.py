@@ -21,6 +21,61 @@ from utils.topup import topup
 if TYPE_CHECKING:
     from utils.linuxdo_session import LinuxDoSession
 
+# Provider session 缓存有效期（秒）- 默认 23 小时
+PROVIDER_SESSION_CACHE_TTL = 23 * 60 * 60
+
+
+def _get_provider_session_cache_path(storage_dir: str, provider_name: str, username_hash: str) -> str:
+    """获取 provider session 缓存文件路径"""
+    return f"{storage_dir}/provider_{provider_name}_{username_hash}_session.json"
+
+
+def _load_provider_session_cache(cache_path: str) -> dict | None:
+    """加载 provider session 缓存
+
+    Returns:
+        dict | None: 缓存数据 {"cookies": dict, "api_user": str, "timestamp": float}，如果无效则返回 None
+    """
+    import time
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+
+        # 检查缓存是否过期
+        timestamp = cache_data.get("timestamp", 0)
+        if time.time() - timestamp > PROVIDER_SESSION_CACHE_TTL:
+            print(f"ℹ️ Provider session cache expired")
+            return None
+
+        # 验证必要字段
+        if "cookies" in cache_data and "api_user" in cache_data:
+            return cache_data
+
+        return None
+    except Exception as e:
+        print(f"⚠️ Failed to load provider session cache: {e}")
+        return None
+
+
+def _save_provider_session_cache(cache_path: str, cookies: dict, api_user: str | int) -> bool:
+    """保存 provider session 缓存"""
+    import time
+    try:
+        cache_data = {
+            "cookies": cookies,
+            "api_user": str(api_user),
+            "timestamp": time.time(),
+        }
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to save provider session cache: {e}")
+        return False
+
 
 class CheckIn:
     """newapi.ai 签到管理类"""
@@ -793,8 +848,12 @@ class CheckIn:
         client: httpx.Client,
         headers: dict,
         api_user: str | int,
-    ):
-        """执行签到请求"""
+    ) -> tuple[bool, str]:
+        """执行签到请求
+
+        Returns:
+            tuple[bool, str]: (成功标志, 错误消息或空字符串)
+        """
         print(f"🌐 {self.account_name}: Executing check-in")
 
         checkin_headers = headers.copy()
@@ -811,10 +870,10 @@ class CheckIn:
                 # 如果不是 JSON 响应（可能是 HTML），检查是否包含成功标识
                 if "success" in response.text.lower():
                     print(f"✅ {self.account_name}: Check-in successful!")
-                    return True
+                    return True, ""
                 else:
                     print(f"❌ {self.account_name}: Check-in failed - Invalid response format")
-                    return False
+                    return False, "Invalid response format"
 
             # 检查签到结果
             message = json_data.get("message", json_data.get("msg", ""))
@@ -826,14 +885,14 @@ class CheckIn:
                 or "已经签到" in message
             ):
                 print(f"✅ {self.account_name}: Check-in successful!")
-                return True
+                return True, ""
             else:
                 error_msg = json_data.get("msg", json_data.get("message", "Unknown error"))
                 print(f"❌ {self.account_name}: Check-in failed - {error_msg}")
-                return False
+                return False, error_msg
         else:
             print(f"❌ {self.account_name}: Check-in failed - HTTP {response.status_code}")
-            return False
+            return False, f"HTTP {response.status_code}"
 
     async def execute_topup(
         self,
@@ -885,12 +944,11 @@ class CheckIn:
 
         # 使用迭代器方式分步获取 CDK
         # 每次迭代调用一个 get_cdk 函数，返回该函数的 CDK 列表
-        cdk_iter = self.provider_config.iter_get_cdk(self.account_config)
         topup_count = 0
         should_stop = False
         remaining_cdks: list[str] = []  # 收集剩余的 CDK
 
-        for cdk_list in cdk_iter:
+        async for cdk_list, _ in self.provider_config.iter_get_cdk(self.account_config):
             print(f"ℹ️ {self.account_name}: Got {len(cdk_list)} CDK(s) from current getter")
             
             # 遍历当前 get_cdk 函数返回的 CDK 列表
@@ -973,9 +1031,9 @@ class CheckIn:
             }
 
             if self.provider_config.needs_manual_check_in():
-                success = self.execute_check_in(client, headers, api_user)
+                success, error_msg = self.execute_check_in(client, headers, api_user)
                 if not success:
-                    return False, {"error": "Check-in failed"}
+                    return False, {"error": error_msg or "Check-in failed"}
             else:
                 print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
 
@@ -1199,6 +1257,7 @@ class CheckIn:
         username: str,
         password: str,
         waf_cookies: dict,
+        login_only: bool = False,
     ) -> tuple[bool, dict]:
         """使用 Linux.do 账号执行签到操作
 
@@ -1206,10 +1265,51 @@ class CheckIn:
             username: Linux.do 用户名
             password: Linux.do 密码
             waf_cookies: WAF cookies
+            login_only: 如果为 True，只返回登录信息（cookies 和 api_user），不执行签到
         """
         print(
             f"ℹ️ {self.account_name}: Executing check-in with Linux.do account (using proxy: {'true' if self.http_proxy_config else 'false'})"
         )
+
+        # 生成缓存文件路径
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        provider_cache_path = _get_provider_session_cache_path(
+            self.storage_state_dir, self.provider_config.name, username_hash
+        )
+
+        # 尝试使用缓存的 provider session
+        cached_session = _load_provider_session_cache(provider_cache_path)
+        if cached_session:
+            cached_cookies = cached_session["cookies"]
+            cached_api_user = cached_session["api_user"]
+            print(f"✅ {self.account_name}: Found valid provider session cache, skipping OAuth flow")
+
+            # 合并 WAF cookies 和缓存的 cookies
+            merged_cookies = {**waf_cookies, **cached_cookies}
+
+            # 如果只需要登录信息，直接返回
+            if login_only:
+                return True, {"cookies": merged_cookies, "api_user": cached_api_user}
+
+            # 使用缓存的 cookies 执行签到
+            success, result = await self.check_in_with_cookies(merged_cookies, cached_api_user)
+
+            # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
+            if not success and "error" in result:
+                error_msg = result.get("error", "").lower()
+                # 检测需要重新认证的错误类型
+                retry_keywords = ["unauthorized", "401", "session", "invalid response format", "waf"]
+                if any(keyword in error_msg for keyword in retry_keywords):
+                    print(f"⚠️ {self.account_name}: Cached session may be expired or WAF challenge, clearing cache and re-authenticating")
+                    try:
+                        os.remove(provider_cache_path)
+                    except Exception:
+                        pass
+                    # 继续执行下面的 OAuth 流程
+                else:
+                    return success, result
+            else:
+                return success, result
 
         client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
         try:
@@ -1263,8 +1363,7 @@ class CheckIn:
                 print(f"❌ {self.account_name}: {error_msg}")
                 return False, {"error": "Failed to get Linux.do auth state"}
 
-            # 生成缓存文件路径
-            username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+            # 生成 Linux.do storage state 缓存文件路径
             cache_file_path = f"{self.storage_state_dir}/linuxdo_{username_hash}_storage_state.json"
 
             from sign_in_with_linuxdo import LinuxDoSignIn
@@ -1286,11 +1385,19 @@ class CheckIn:
 
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:
-                # 统一调用 check_in_with_cookies 执行签到
                 user_cookies = result_data["cookies"]
                 api_user = result_data["api_user"]
-
                 merged_cookies = {**waf_cookies, **user_cookies}
+
+                # 保存 provider session 缓存
+                _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
+                print(f"✅ {self.account_name}: Provider session cached for future use")
+
+                # 如果只需要登录信息，直接返回
+                if login_only:
+                    return True, {"cookies": merged_cookies, "api_user": api_user}
+
+                # 统一调用 check_in_with_cookies 执行签到
                 return await self.check_in_with_cookies(merged_cookies, api_user)
             elif success and "code" in result_data and "state" in result_data:
                 # 收到 OAuth code，通过 HTTP 调用回调接口获取 api_user
@@ -1324,6 +1431,15 @@ class CheckIn:
                                     f"ℹ️ {self.account_name}: Extracted {len(user_cookies)} user cookies: {list(user_cookies.keys())}"
                                 )
                                 merged_cookies = {**waf_cookies, **user_cookies}
+
+                                # 保存 provider session 缓存
+                                _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
+                                print(f"✅ {self.account_name}: Provider session cached for future use")
+
+                                # 如果只需要登录信息，直接返回
+                                if login_only:
+                                    return True, {"cookies": merged_cookies, "api_user": api_user}
+
                                 return await self.check_in_with_cookies(merged_cookies, api_user)
                             else:
                                 print(f"❌ {self.account_name}: No user ID in callback response")
@@ -1425,22 +1541,109 @@ class CheckIn:
                 if not username or not password:
                     print(f"❌ {self.account_name}: Incomplete Linux.do account information")
                     results.append(("linux.do", False, {"error": "Incomplete Linux.do account information"}))
-                # 特殊处理：没有 linuxdo_client_id 但有 get_cdk 的 provider（如 fuli_wheel）
-                # 这类 provider 的签到完全通过 get_cdk 函数完成，不需要标准 OAuth 流程
-                elif not self.provider_config.linuxdo_client_id and self.provider_config.get_cdk:
-                    print(f"ℹ️ {self.account_name}: Provider uses get_cdk for check-in (no OAuth)")
+                # 特殊处理：有 get_cdk 的 provider（如 b4u, fuli_wheel, x666）
+                # 这类 provider 的签到通过 get_cdk 函数完成
+                elif self.provider_config.get_cdk:
+                    print(f"ℹ️ {self.account_name}: Provider uses get_cdk for check-in")
                     try:
                         # 直接调用 get_cdk 完成签到
-                        cdk_results = []
-                        for cdk_list in self.provider_config.iter_get_cdk(self.account_config):
-                            cdk_results.extend(cdk_list)
+                        cdk_results = []  # CDK 字符串列表，用于 topup
+                        raw_results = []  # 原始返回值，用于通知展示
+                        async for cdks, raw_result in self.provider_config.iter_get_cdk(self.account_config):
+                            cdk_results.extend(cdks)
+                            raw_results.append(raw_result)
 
                         if cdk_results:
                             print(f"✅ {self.account_name}: get_cdk completed with {len(cdk_results)} result(s)")
-                            results.append(("linux.do", True, {"success": True, "cdk_results": cdk_results}))
+
+                            # 如果需要 topup（有 topup_path 和 linuxdo_client_id），执行 CDK 兑换
+                            if self.provider_config.needs_manual_topup() and self.provider_config.linuxdo_client_id and cdk_results:
+                                print(f"ℹ️ {self.account_name}: Provider requires CDK topup, logging in to main site...")
+
+                                # 使用 LinuxDo 登录主站获取 session
+                                main_site_cookies = None
+                                main_site_api_user = None
+
+                                # 优先使用已配置的 cookies
+                                if cookies_data:
+                                    user_cookies = parse_cookies(cookies_data)
+                                    api_user = self.account_config.api_user
+                                    if user_cookies and api_user:
+                                        print(f"ℹ️ {self.account_name}: Using configured cookies for main site")
+                                        main_site_cookies = {**waf_cookies, **user_cookies}
+                                        main_site_api_user = api_user
+
+                                # 如果没有配置 cookies，使用标准 LinuxDo OAuth 登录主站
+                                if not main_site_cookies:
+                                    print(f"ℹ️ {self.account_name}: Auto-login to main site using LinuxDo OAuth")
+                                    try:
+                                        # 复用标准的 LinuxDo OAuth 登录流程，只获取登录信息不执行签到
+                                        success, login_result = await self.check_in_with_linuxdo(
+                                            username,
+                                            password,
+                                            waf_cookies,
+                                            login_only=True,
+                                        )
+                                        if success and isinstance(login_result, dict):
+                                            if "cookies" in login_result and "api_user" in login_result:
+                                                # 转换 cookies 格式：从 [{name, value, ...}, ...] 到 {name: value}
+                                                raw_cookies = login_result.get("cookies")
+                                                if isinstance(raw_cookies, list):
+                                                    main_site_cookies = {c["name"]: c["value"] for c in raw_cookies if "name" in c and "value" in c}
+                                                elif isinstance(raw_cookies, dict):
+                                                    main_site_cookies = raw_cookies
+                                                else:
+                                                    main_site_cookies = {}
+                                                main_site_api_user = login_result.get("api_user")
+                                                print(f"✅ {self.account_name}: Main site login successful, api_user: {main_site_api_user}")
+                                            else:
+                                                print(f"❌ {self.account_name}: Login result missing cookies or api_user: {login_result}")
+                                        else:
+                                            print(f"❌ {self.account_name}: Failed to login to main site: {login_result}")
+                                    except Exception as e:
+                                        print(f"❌ {self.account_name}: Main site login error: {e}")
+
+                                # 执行 topup
+                                if main_site_cookies and main_site_api_user:
+                                    headers = {
+                                        "User-Agent": get_random_user_agent(),
+                                        "Accept": "application/json, text/plain, */*",
+                                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                                        "Referer": f"{self.provider_config.origin}/console/topup",
+                                        "Origin": self.provider_config.origin,
+                                        self.provider_config.api_user_key: f"{main_site_api_user}",
+                                    }
+
+                                    topup_success_count = 0
+                                    for i, cdk in enumerate(cdk_results):
+                                        if i > 0:
+                                            await asyncio.sleep(2)
+
+                                        print(f"💰 {self.account_name}: Topup CDK #{i+1}/{len(cdk_results)}: {cdk}")
+                                        topup_result = topup(
+                                            account_name=self.account_name,
+                                            topup_url=self.provider_config.get_topup_url(),
+                                            headers=headers,
+                                            cookies=main_site_cookies,
+                                            key=cdk,
+                                            proxy=None,  # 主站不使用代理
+                                        )
+
+                                        if topup_result.get("success"):
+                                            topup_success_count += 1
+                                            print(f"✅ {self.account_name}: CDK #{i+1} topup successful")
+                                        else:
+                                            error_msg = topup_result.get("error", "Unknown error")
+                                            print(f"❌ {self.account_name}: CDK #{i+1} topup failed: {error_msg}")
+
+                                    print(f"ℹ️ {self.account_name}: Topup completed - {topup_success_count}/{len(cdk_results)} successful")
+                                else:
+                                    print(f"⚠️ {self.account_name}: Failed to get main site credentials, CDKs not redeemed")
+
+                            results.append(("linux.do", True, {"success": True, "cdk_results": raw_results}))
                         else:
                             print(f"ℹ️ {self.account_name}: get_cdk completed (no CDK returned, may be normal)")
-                            results.append(("linux.do", True, {"success": True, "message": "get_cdk completed"}))
+                            results.append(("linux.do", True, {"success": True, "message": "get_cdk completed", "cdk_results": raw_results}))
                     except Exception as cdk_err:
                         print(f"❌ {self.account_name}: get_cdk failed: {cdk_err}")
                         results.append(("linux.do", False, {"error": f"get_cdk failed: {cdk_err}"}))

@@ -173,7 +173,7 @@ class LinuxDoSignIn:
                                     "document.title !== 'Just a moment...'",
                                     timeout=TIMEOUT_CLOUDFLARE
                                 )
-                                await page.wait_for_timeout(3000)  # 额外等待页面稳定
+                                await page.wait_for_timeout(1500)  # 额外等待页面稳定
                                 print(f"✅ {self.account_name}: Cloudflare challenge completed")
                             except Exception as cf_err:
                                 print(f"⚠️ {self.account_name}: Cloudflare challenge timeout: {cf_err}")
@@ -209,14 +209,18 @@ class LinuxDoSignIn:
                             await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
                         except Exception:
                             print(f"⚠️ {self.account_name}: Login form not found, page may be loading slowly")
-                            await page.wait_for_timeout(5000)
+                            await page.wait_for_timeout(2000)
 
                         await page.fill("#login-account-name", self.username, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(500)
                         await page.fill("#login-account-password", self.password, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(500)
                         await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                        await page.wait_for_timeout(10000)
+                        # 等待登录完成：检测用户元素出现或 URL 变化
+                        try:
+                            await page.wait_for_selector(".current-user", timeout=15000)
+                        except Exception:
+                            await page.wait_for_timeout(3000)
 
                         await save_page_content_to_file(page, "sign_in_result", self.account_name, prefix="linuxdo")
 
@@ -284,7 +288,7 @@ class LinuxDoSignIn:
                             try:
                                 await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
                             except Exception:
-                                await page.wait_for_timeout(5000)
+                                await page.wait_for_timeout(2000)
 
                             user_data = await page.evaluate("() => localStorage.getItem('user')")
                             if user_data:

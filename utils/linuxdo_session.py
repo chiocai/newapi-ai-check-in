@@ -93,7 +93,8 @@ class LinuxDoSession:
                 try:
                     # 访问 linux.do 检查登录状态
                     await page.goto("https://linux.do", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(3000)
+                    # 等待页面稳定，使用较短的固定等待
+                    await page.wait_for_timeout(1500)
 
                     # 检查是否有用户头像或登录按钮
                     # 如果有 .current-user 元素，说明已登录
@@ -112,7 +113,7 @@ class LinuxDoSession:
 
                     # 不确定状态，尝试访问 connect.linux.do 验证
                     await page.goto("https://connect.linux.do", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(1000)
 
                     # 如果被重定向到登录页，说明未登录
                     if "login" in page.url.lower():
@@ -153,19 +154,24 @@ class LinuxDoSession:
                 try:
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Navigating to login page")
                     await page.goto("https://linux.do/login", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1500)
 
                     # 填写登录表单
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Filling credentials")
                     await page.fill("#login-account-name", self.username)
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(500)
                     await page.fill("#login-account-password", self.password)
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(500)
 
                     # 点击登录按钮
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Clicking login button")
                     await page.click("#login-button")
-                    await page.wait_for_timeout(10000)
+                    # 等待登录完成：检测 URL 变化或用户元素出现
+                    try:
+                        await page.wait_for_selector(".current-user", timeout=15000)
+                    except Exception:
+                        # 如果超时，继续检查其他条件
+                        await page.wait_for_timeout(3000)
 
                     # 检查登录结果
                     current_url = page.url
@@ -181,11 +187,11 @@ class LinuxDoSession:
                             print(f"⚠️ LinuxDoSession [{self.username_hash}]: Cloudflare challenge timeout")
 
                     # 验证登录成功
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(1000)
                     current_user = await page.query_selector(".current-user")
                     if not current_user:
                         # 再等待一下
-                        await page.wait_for_timeout(5000)
+                        await page.wait_for_timeout(2000)
                         current_user = await page.query_selector(".current-user")
 
                     if current_user:
