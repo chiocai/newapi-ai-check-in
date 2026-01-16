@@ -411,10 +411,10 @@ class AppConfig:
                 login_path="/login",
                 status_path="/api/status",
                 auth_state_path="/api/oauth/state",
-                sign_in_path=None,  # 签到通过 fuli.hxi.me 完成
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成（账号配置 checkin: true）
                 user_info_path="/api/user/self",
-                topup_path="/api/user/topup",
-                get_cdk=[get_runawaytime_checkin_cdk, get_runawaytime_wheel_cdk],
+                topup_path=None,
+                get_cdk=None,
                 api_user_key="new-api-user",
                 github_client_id=None,
                 github_auth_path=None,

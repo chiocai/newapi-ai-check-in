@@ -8,6 +8,7 @@ Header: New-Api-User: {用户ID} 或 {api_user_key}: {用户ID}
 """
 
 import httpx
+import re
 from utils.http_utils import response_resolve
 
 
@@ -67,12 +68,49 @@ def new_api_checkin(
 				message = json_data.get("message", "")
 				success = json_data.get("success", False)
 
+				# 提取签到奖励金额（不同站点可能使用不同字段名）
+				# 常见字段: quota, reward, bonus, data.quota 等
+				# 或者从 message 中解析，如 "签到成功，获得 xxx 额度"
+				reward_quota = None
+				if "data" in json_data and isinstance(json_data["data"], (int, float)):
+					reward_quota = json_data["data"]
+				elif "data" in json_data and isinstance(json_data["data"], dict):
+					reward_quota = json_data["data"].get("quota") or json_data["data"].get("reward")
+				elif "quota" in json_data:
+					reward_quota = json_data["quota"]
+				elif "reward" in json_data:
+					reward_quota = json_data["reward"]
+
+				# 尝试从 message 中解析奖励金额（如 "签到成功，获得 10000 额度"）
+				if reward_quota is None and message:
+					# 匹配常见的奖励格式
+					patterns = [
+						r'获得\s*(\d+(?:\.\d+)?)\s*(?:额度|quota)',
+						r'奖励\s*(\d+(?:\.\d+)?)\s*(?:额度|quota)',
+						r'\+\s*(\d+(?:\.\d+)?)\s*(?:额度|quota)',
+						r'(\d+(?:\.\d+)?)\s*(?:额度|quota)',
+					]
+					for pattern in patterns:
+						match = re.search(pattern, message, re.IGNORECASE)
+						if match:
+							reward_quota = float(match.group(1))
+							break
+
+				# 转换为美元显示（New-API 内部单位是 1/500000 美元）
+				reward_display = None
+				if reward_quota is not None:
+					reward_display = round(reward_quota / 500000, 4)
+
 				if success:
-					print(f"✅ {account_name}: Checkin successful - {message}")
+					if reward_display is not None:
+						print(f"✅ {account_name}: Checkin successful - {message}, reward: ${reward_display}")
+					else:
+						print(f"✅ {account_name}: Checkin successful - {message}")
 					return {
 						"success": True,
 						"message": message,
 						"already_checked": False,
+						"reward": reward_display,
 					}
 				elif "已签到" in message or "already" in message.lower():
 					print(f"ℹ️ {account_name}: Already checked in today - {message}")
@@ -80,6 +118,7 @@ def new_api_checkin(
 						"success": True,
 						"message": message,
 						"already_checked": True,
+						"reward": None,
 					}
 				else:
 					print(f"❌ {account_name}: Checkin failed - {message}")

@@ -1040,6 +1040,7 @@ class CheckIn:
             # 如果账号配置启用了 New-API 通用签到功能
             # 对于 WAF 模式，签到将在浏览器中执行，这里跳过
             do_browser_checkin = False
+            checkin_reward = None  # 保存签到奖励信息
             if self.account_config.checkin:
                 if self.provider_config.needs_waf_cookies():
                     print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
@@ -1057,7 +1058,12 @@ class CheckIn:
                         proxy=self.http_proxy_config,
                         api_user_key=self.provider_config.api_user_key,
                     )
-                    if not checkin_result.get("success"):
+                    if checkin_result.get("success"):
+                        # 保存签到奖励信息
+                        checkin_reward = checkin_result.get("reward")
+                        if checkin_result.get("already_checked"):
+                            checkin_reward = None  # 已签到不显示奖励
+                    else:
                         error_msg = checkin_result.get("error", "New-API checkin failed")
                         print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
                         # 签到失败不阻止后续流程，只记录错误
@@ -1099,6 +1105,9 @@ class CheckIn:
             else:
                 user_info = await self.get_user_info(client, headers)
             if user_info and user_info.get("success"):
+                # 将签到奖励信息添加到 user_info 中
+                if checkin_reward is not None:
+                    user_info["checkin_reward"] = checkin_reward
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
                 return True, user_info

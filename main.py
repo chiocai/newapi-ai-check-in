@@ -116,7 +116,12 @@ async def process_single_account(
                         current_quota = user_info["quota"]
                         current_used = user_info["used_quota"]
                         current_bonus = user_info["bonus_quota"]
-                        account_result += f"  ✅ 签到成功\n"
+                        checkin_reward = user_info.get("checkin_reward")
+
+                        if checkin_reward is not None:
+                            account_result += f"  ✅ 签到成功 (+${checkin_reward})\n"
+                        else:
+                            account_result += f"  ✅ 签到成功\n"
                         account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
                         this_account_balances[f"{auth_method}"] = {
                             "quota": current_quota,
