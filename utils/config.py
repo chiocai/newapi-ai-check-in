@@ -425,7 +425,7 @@ class AppConfig:
             ),
             "hotaruapi": ProviderConfig(
                 name="hotaruapi",
-                origin="https://api.hotaruapi.top",
+                origin="https://hotaruapi.com",
                 login_path="/login",
                 status_path="/api/status",
                 auth_state_path="/api/oauth/state",
@@ -439,7 +439,7 @@ class AppConfig:
                 linuxdo_client_id="qVGkHnU8fLzJVEMgHCuNUCYifUQwePWn",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method="waf_cookies",
+                bypass_method=None,  # 新域名无需 WAF cookies 绕过
             ),
             "codex661118": ProviderConfig(
                 name="codex661118",
