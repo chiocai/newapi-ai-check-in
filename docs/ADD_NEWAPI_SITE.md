@@ -14,19 +14,21 @@
 
 ### 1. 检查站点是否支持 LinuxDo OAuth
 
-访问站点登录页面（如 `https://example.com/login`），查看是否有 **"使用 LinuxDO 继续"** 按钮。
+访问站点的 **`/console/personal`** 页面（如 `https://example.com/console/personal`），系统会自动跳转到登录页面，此时查看是否有 **"使用 LinuxDO 继续"** 按钮。
+
+**重要提示**：某些站点的登录页面（`/login`）默认不显示 LinuxDo 登录按钮，需要先访问 `/console/personal` 触发跳转后才会显示。
 
 **示例**：
-- ✅ `hotaruapi.com` - 有 LinuxDo 登录按钮
-- ✅ `kfc-api.sxxe.net` - 有 LinuxDo 登录按钮
-- ✅ `api.feisakura.fun` - 有 LinuxDo 登录按钮
-- ❌ `newapi.linuxdo.edu.rs` - 仅邮箱登录，不支持
+- ✅ `hotaruapi.com/console/personal` → 跳转到登录页，显示 LinuxDo 按钮
+- ✅ `newapi.linuxdo.edu.rs/console/personal` → 跳转到登录页，显示 LinuxDo 按钮
+- ✅ `api.feisakura.fun/console/personal` → 跳转到登录页，显示 LinuxDo 按钮
+- ❌ 某些站点仅支持邮箱登录，无 LinuxDo 选项
 
 ### 2. 获取 LinuxDo OAuth Client ID
 
 #### 方法一：通过浏览器开发者工具
 
-1. 打开站点登录页面
+1. 访问站点的 `/console/personal` 页面（会自动跳转到登录页）
 2. 打开浏览器开发者工具（F12）
 3. 切换到 **Network（网络）** 标签
 4. 点击 **"使用 LinuxDO 继续"** 按钮
@@ -301,16 +303,21 @@ https://connect.linux.do/oauth2/authorize?response_type=code&client_id=你的cli
 
 ## 已支持的站点列表
 
-| 站点名称 | 域名 | LinuxDo OAuth | WAF 绕过 |
-|---------|------|--------------|---------|
-| anyrouter | anyrouter.top | ✅ | ✅ |
-| hotaruapi | hotaruapi.com | ✅ | ❌ |
-| kfcapi | kfc-api.sxxe.net | ✅ | ❌ |
-| feisakura | api.feisakura.fun | ✅ | ❌ |
-| wong | wzw.pp.ua | ✅ | ❌ |
-| codex661118 | codex.661118.xyz | ✅ | ❌ |
-| gyapi | gyapi.zxiaoruan.cn | ✅ | ✅ |
-| huan666 | ai.huan666.de | ✅ | ❌ |
+| 站点名称 | 域名 | Provider 名称 | LinuxDo OAuth | WAF 绕过 |
+|---------|------|--------------|--------------|---------|
+| anyrouter | anyrouter.top | anyrouter | ✅ | ✅ |
+| hotaruapi | hotaruapi.com | hotaruapi | ✅ | ❌ |
+| kfcapi | kfc-api.sxxe.net | kfcapi | ✅ | ❌ |
+| feisakura | api.feisakura.fun | feisakura | ✅ | ❌ |
+| wong | wzw.pp.ua | wong | ✅ | ❌ |
+| codex661118 | codex.661118.xyz | codex661118 | ✅ | ❌ |
+| gyapi | gyapi.zxiaoruan.cn | gyapi | ✅ | ✅ |
+| huan666 | ai.huan666.de | huan666 | ✅ | ❌ |
+| 慕鸢の公益站 | newapi.linuxdo.edu.rs | linuxdoedu | ✅ | ❌ |
+| Einzieg API | api.einzieg.site | einzieg | ✅ | ❌ |
+| Jarvis API | ai.ctacy.cc | jarvisapi | ✅ | ❌ |
+| Lemon API | justdoitme.me | lemonapi | ✅ | ❌ |
+| AIPM | emtf.aipm9527.online | aipm | ✅ | ❌ |
 
 ## 参考资料
 
