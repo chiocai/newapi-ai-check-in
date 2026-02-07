@@ -318,6 +318,7 @@ https://connect.linux.do/oauth2/authorize?response_type=code&client_id=你的cli
 | Jarvis API | ai.ctacy.cc | jarvisapi | ✅ | ❌ |
 | Lemon API | justdoitme.me | lemonapi | ✅ | ❌ |
 | AIPM | emtf.aipm9527.online | aipm | ✅ | ❌ |
+| NPCodex | npcodex.kiroxubei.tech | npcodex | ✅ | ❌ |
 
 ## 参考资料
 
