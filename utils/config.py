@@ -601,7 +601,7 @@ class AppConfig:
                 linuxdo_client_id="rxyZeu4Wg8HNzwaG6YCj6OnFvap7ZfRU",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",
             ),
             "einzieg": ProviderConfig(
                 name="einzieg",
@@ -619,7 +619,7 @@ class AppConfig:
                 linuxdo_client_id="aBambSqvDqCgTW8fCarJBeQji8M5RATf",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",
             ),
             "jarvisapi": ProviderConfig(
                 name="jarvisapi",
