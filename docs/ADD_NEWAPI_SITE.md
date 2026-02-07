@@ -319,6 +319,7 @@ https://connect.linux.do/oauth2/authorize?response_type=code&client_id=你的cli
 | Lemon API | justdoitme.me | lemonapi | ✅ | ❌ |
 | AIPM | emtf.aipm9527.online | aipm | ✅ | ❌ |
 | NPCodex | npcodex.kiroxubei.tech | npcodex | ✅ | ❌ |
+| 361888 API | api.361888.xyz | api361888 | ✅ | ❌ |
 
 ## 参考资料
 

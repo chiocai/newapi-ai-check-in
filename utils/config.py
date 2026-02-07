@@ -693,6 +693,24 @@ class AppConfig:
                 aliyun_captcha=False,
                 bypass_method=None,
             ),
+            "api361888": ProviderConfig(
+                name="api361888",
+                origin="https://api.361888.xyz",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成（账号配置 checkin: true）
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="ze9QLEoERDgCdFnlBJeB0uASPwOTVyfM",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
         }
 
         # 尝试从环境变量加载自定义 providers
