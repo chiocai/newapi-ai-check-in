@@ -783,6 +783,42 @@ class AppConfig:
                 aliyun_captcha=False,
                 bypass_method=None,
             ),
+            "apitest": ProviderConfig(
+                name="apitest",
+                origin="https://openai.api-test.us.ci",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成（账号配置 checkin: true）
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="65Lj7gYXHoSAVDDUq6Plb11thoqAV1t7",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "moyu": ProviderConfig(
+                name="moyu",
+                origin="https://clove.cc.cd",
+                login_path="/login",
+                status_path="/api/status",
+                auth_state_path="/api/oauth/state",
+                sign_in_path=None,  # 签到通过 New-API 通用签到完成（账号配置 checkin: true）
+                user_info_path="/api/user/self",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id="Lr8C2Ny7JPr7c4YqysaDtVEqkO1a9eL7",
+                linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
         }
 
         # 尝试从环境变量加载自定义 providers

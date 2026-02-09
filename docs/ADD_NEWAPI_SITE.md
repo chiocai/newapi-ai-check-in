@@ -324,6 +324,8 @@ https://connect.linux.do/oauth2/authorize?response_type=code&client_id=你的cli
 | Jiuuij API | jiuuij.de5.net | jiuuij | ✅ | ❌ |
 | 佬友 | api.freestyle.cc.cd | freestyle | ✅ | ❌ |
 | PRY API | api.vip.crond.dev | pryapi | ✅ | ❌ |
+| API Test | openai.api-test.us.ci | apitest | ✅ | ❌ |
+| 摸鱼公益 | clove.cc.cd | moyu | ✅ | ❌ |
 
 ## 参考资料
 
