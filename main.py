@@ -8,12 +8,15 @@ import hashlib
 import json
 import sys
 from datetime import datetime
+from itertools import groupby
+
 from dotenv import load_dotenv
-from utils.config import AppConfig
-from utils.notify import notify
-from utils.balance_hash import load_balance_hash, save_balance_hash
-from utils.linuxdo_session import LinuxDoSessionManager
+
 from checkin import CheckIn
+from utils.balance_hash import load_balance_hash, save_balance_hash
+from utils.config import AppConfig
+from utils.linuxdo_session import LinuxDoSessionManager
+from utils.notify import notify
 
 load_dotenv(override=True)
 
@@ -63,6 +66,7 @@ async def process_single_account(
             "account_key": account_key,
             "account_name": account_name,
             "account_index": account_index,
+            "provider": "",
             "success": False,
             "results": [],
             "balances": {},
@@ -72,6 +76,7 @@ async def process_single_account(
         }
 
         try:
+            result["provider"] = account_config.provider
             provider_config = app_config.get_provider(account_config.provider)
             if not provider_config:
                 print(f"❌ {account_name}: Provider '{account_config.provider}' configuration not found")
@@ -105,68 +110,71 @@ async def process_single_account(
             failed_methods = []
             this_account_balances = {}
 
-            # 构建简化的中文结果报告
-            account_result = f"📌 {account_name}\n"
+            # 构建单行结果
+            line_parts = []
             for auth_method, success, user_info in results:
                 if success and user_info and user_info.get("success"):
                     account_success = True
                     successful_methods.append(auth_method)
-                    # 记录余额信息
                     if "quota" in user_info:
                         current_quota = user_info["quota"]
                         current_used = user_info["used_quota"]
                         current_bonus = user_info["bonus_quota"]
                         checkin_reward = user_info.get("checkin_reward")
-
-                        if checkin_reward is not None:
-                            account_result += f"  ✅ 签到成功 (+${checkin_reward})\n"
-                        else:
-                            account_result += f"  ✅ 签到成功\n"
-                        account_result += f"  💰 余额: ${current_quota} | 已用: ${current_used}\n"
                         this_account_balances[f"{auth_method}"] = {
                             "quota": current_quota,
                             "used": current_used,
                             "bonus": current_bonus,
                         }
+                        if checkin_reward is not None:
+                            line_parts.append(f"+${checkin_reward} | ${current_quota}")
+                        else:
+                            line_parts.append(f"${current_quota}")
                     elif "cdk_results" in user_info:
                         cdk_results = user_info['cdk_results']
-                        account_result += f"  ✅ 签到成功\n"
+                        cdk_parts = []
                         for cdk_result in cdk_results:
                             if isinstance(cdk_result, dict):
                                 result_type = cdk_result.get("type", "")
                                 if result_type == "checkin_success":
                                     quota = cdk_result.get("quota", 0)
                                     balance = cdk_result.get("balance", 0)
-                                    account_result += f"  🎰 转盘获得: ${quota}\n"
                                     if balance > 0:
-                                        account_result += f"  💰 当前余额: ${balance}\n"
+                                        cdk_parts.append(f"🎰 +${quota} | ${balance}")
+                                    else:
+                                        cdk_parts.append(f"🎰 +${quota}")
                                 elif result_type == "wheel_success":
                                     total_quota = cdk_result.get("total_quota", 0)
                                     spin_count = cdk_result.get("spin_count", 0)
                                     already_done = cdk_result.get("already_done", False)
                                     if already_done:
-                                        account_result += f"  🎰 今日已抽 {spin_count} 次, 获得: ${total_quota}\n"
+                                        cdk_parts.append(f"🎰 已抽x{spin_count} +${total_quota}")
                                     else:
-                                        account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
+                                        cdk_parts.append(f"🎰 转盘x{spin_count} +${total_quota}")
                                 elif result_type == "cdk_list":
-                                    cdks = cdk_result.get("cdks", [])
                                     total_quota = cdk_result.get("total_quota", 0)
                                     spin_count = cdk_result.get("spin_count", 0)
-                                    account_result += f"  🎰 转盘 {spin_count} 次, 获得: ${total_quota}\n"
-                                    if cdks:
-                                        account_result += f"  🎁 CDK: {len(cdks)} 个待兑换\n"
-                        if not any(isinstance(r, dict) for r in cdk_results):
-                            account_result += f"  🎁 抽奖完成: {len(cdk_results)} 个结果\n"
+                                    cdk_parts.append(f"🎰 转盘x{spin_count} +${total_quota}")
+                        if cdk_parts:
+                            line_parts.append(", ".join(cdk_parts))
+                        else:
+                            line_parts.append("签到成功")
                     elif "message" in user_info:
-                        account_result += f"  ✅ 签到成功\n"
-                        account_result += f"  ℹ️ {user_info['message']}\n"
+                        line_parts.append(user_info['message'])
                     else:
-                        account_result += f"  ✅ 签到成功\n"
+                        line_parts.append("签到成功")
                 else:
                     failed_methods.append(auth_method)
                     error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
-                    account_result += f"  ❌ 签到失败\n"
-                    account_result += f"  ⚠️ {str(error_msg)}\n"
+                    line_parts.append(str(error_msg)[:60])
+
+            # 生成单行通知
+            if account_success:
+                detail = line_parts[0] if line_parts else "签到成功"
+                account_result = f"✅ {account_name}: {detail}"
+            else:
+                detail = line_parts[0] if line_parts else "未知错误"
+                account_result = f"❌ {account_name}: {detail}"
 
             result["success"] = account_success
             result["balances"] = this_account_balances
@@ -185,7 +193,7 @@ async def process_single_account(
         except Exception as e:
             print(f"❌ {account_name} processing exception: {e}")
             result["need_notify"] = True
-            result["notification"] = f"❌ {account_name} Exception: {str(e)[:100]}..."
+            result["notification"] = f"❌ {account_name}: {str(e)[:80]}"
             result["error"] = str(e)
 
         return result
@@ -253,7 +261,7 @@ async def main():
     # 汇总结果
     success_count = 0
     total_count = 0
-    notification_content = []
+    notification_lines = []
     current_balances = {}
     need_notify = False
 
@@ -264,9 +272,6 @@ async def main():
     )
 
     for result in sorted_results:
-        if len(notification_content) > 0:
-            notification_content.append("\n-------------------------------")
-
         # 统计结果
         for auth_result in result.get("results", []):
             total_count += 1
@@ -277,30 +282,42 @@ async def main():
         if result.get("success") and result.get("balances"):
             current_balances[result["account_key"]] = result["balances"]
 
-        # 收集通知内容
-        if result.get("notification"):
-            notification_content.append(result["notification"])
-
         # 检查是否需要通知
         if result.get("need_notify"):
             need_notify = True
+
+    # 按 provider 分组（保持原有排序）
+    grouped = []
+    for provider, group in groupby(sorted_results, key=lambda x: x.get("provider", "")):
+        grouped.append(list(group))
+
+    # 智能合并：多账号 provider 前后加空行，单账号 provider 连续排列
+    for i, group in enumerate(grouped):
+        is_multi = len(group) >= 2
+        prev_is_multi = len(grouped[i - 1]) >= 2 if i > 0 else False
+
+        # 在多账号组前加空行（除非是第一组）
+        if i > 0 and (is_multi or prev_is_multi):
+            notification_lines.append("")
+
+        for result in group:
+            if result.get("notification"):
+                notification_lines.append(result["notification"])
 
     # 处理异常结果
     for result in account_results:
         if isinstance(result, Exception):
             need_notify = True
-            notification_content.append(f"❌ Exception: {str(result)[:100]}...")
+            notification_lines.append(f"❌ 异常: {str(result)[:80]}")
 
     # 检查余额变化
     current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
     print(f"\n\nℹ️ Current balance hash: {current_balance_hash}, Last balance hash: {last_balance_hash}")
     if current_balance_hash:
         if last_balance_hash is None:
-            # 首次运行
             need_notify = True
             print("🔔 First run detected, will send notification with current balances")
         elif current_balance_hash != last_balance_hash:
-            # 余额有变化
             need_notify = True
             print("🔔 Balance changes detected, will send notification")
         else:
@@ -310,24 +327,20 @@ async def main():
     if current_balance_hash:
         save_balance_hash(BALANCE_HASH_FILE, current_balance_hash)
 
-    if need_notify and notification_content:
+    if need_notify and notification_lines:
         # 构建通知内容
         failed_count = total_count - success_count
-        summary = [
-            "-------------------------------",
-            f"📊 统计: 成功 {success_count}/{total_count}, 失败 {failed_count}/{total_count}",
-        ]
-
         if success_count == total_count:
-            summary.append("✅ 全部签到成功")
+            status_icon = "✅"
         elif success_count > 0:
-            summary.append("⚠️ 部分签到成功")
+            status_icon = "⚠️"
         else:
-            summary.append("❌ 全部签到失败")
+            status_icon = "❌"
+        summary_line = f"📊 成功 {success_count}/{total_count} | 失败 {failed_count}/{total_count} {status_icon}"
 
         time_info = f'⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-        notify_content = "\n\n".join([time_info, "\n".join(notification_content), "\n".join(summary)])
+        notify_content = time_info + "\n\n" + "\n".join(notification_lines) + "\n\n" + summary_line
 
         print(notify_content)
         notify.push_message("签到通知", notify_content, msg_type="text")
