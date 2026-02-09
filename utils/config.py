@@ -781,7 +781,7 @@ class AppConfig:
                 linuxdo_client_id="Li3GFx4I7nn8gvseLxdH9fbNsVfxI0ZG",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",
             ),
             "apitest": ProviderConfig(
                 name="apitest",
