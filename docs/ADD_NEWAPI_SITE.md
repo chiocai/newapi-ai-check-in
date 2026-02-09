@@ -320,6 +320,10 @@ https://connect.linux.do/oauth2/authorize?response_type=code&client_id=你的cli
 | AIPM | emtf.aipm9527.online | aipm | ✅ | ❌ |
 | NPCodex | npcodex.kiroxubei.tech | npcodex | ✅ | ❌ |
 | 361888 API | api.361888.xyz | api361888 | ✅ | ❌ |
+| Sorai API | newapi.sorai.me | sorai | ✅ | ❌ |
+| Jiuuij API | jiuuij.de5.net | jiuuij | ✅ | ❌ |
+| 佬友 | api.freestyle.cc.cd | freestyle | ✅ | ❌ |
+| PRY API | api.vip.crond.dev | pryapi | ✅ | ❌ |
 
 ## 参考资料
 
