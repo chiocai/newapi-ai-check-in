@@ -3,22 +3,18 @@
 配置管理模块
 """
 
+import inspect
 import json
 import os
-import asyncio
-import inspect
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Callable, Dict, Generator, List, Literal
+from typing import AsyncGenerator, Callable, Dict, List, Literal
 
-from utils.signature import aiai_li_sign_in_url
 from utils.get_cdk import (
     get_b4u_cdk,
     get_fuli_wheel_cdk,
-    get_runawaytime_checkin_cdk,
-    get_runawaytime_wheel_cdk,
     get_x666_cdk,
 )
-
+from utils.signature import aiai_li_sign_in_url
 
 # 前向声明 AccountConfig 类型，用于类型注解
 # 实际的 AccountConfig 类在后面定义
@@ -853,17 +849,21 @@ class AppConfig:
     @classmethod
     def _load_accounts(cls, accounts_env: str) -> List["AccountConfig"]:
         """从环境变量加载多账号配置
-        
+
+        支持两种格式:
+        1. 数组格式（兼容旧版）: [{"provider":"x","linux.do":{...}}, ...]
+        2. 对象格式（简化版）: {"linux.do":[{...},{...}], "accounts":[{"provider":"x"}, ...]}
+           - 站点未配置 linux.do/github/cookies 时，自动用全局 linux.do 展开为多账号
+           - 站点显式配置了认证信息时，使用站点自己的配置
+
         Args:
-            accounts_env: 环境变量名称或直接的 JSON 字符串值
-                         优先尝试作为环境变量名获取，获取不到则作为值使用
-        
+            accounts_env: 环境变量名称
+
         Returns:
             账号配置列表，如果加载失败则返回空列表
         """
-        # 从环境变量获取账号配置
         accounts_str = os.getenv(accounts_env)
-        
+
         if not accounts_str:
             print(f"❌ {accounts_env} environment variable not found")
             return []
@@ -871,19 +871,48 @@ class AppConfig:
         try:
             accounts_data = json.loads(accounts_str)
 
-            # 检查是否为数组格式
+            # 对象格式：提取全局 linux.do 并展开
+            if isinstance(accounts_data, dict):
+                global_linuxdo = accounts_data.get("linux.do", [])
+                account_list = accounts_data.get("accounts", [])
+
+                if not isinstance(account_list, list):
+                    print("❌ 'accounts' field must be an array")
+                    return []
+
+                expanded = []
+                for account in account_list:
+                    if not isinstance(account, dict):
+                        continue
+                    has_auth = "linux.do" in account or "github" in account or "cookies" in account
+                    if has_auth or not global_linuxdo:
+                        expanded.append(account)
+                    else:
+                        # 用全局 linux.do 账号展开
+                        for idx, ld in enumerate(global_linuxdo):
+                            new_account = dict(account)
+                            new_account["linux.do"] = ld
+                            if "name" not in new_account:
+                                provider = new_account.get("provider", "account")
+                                if len(global_linuxdo) > 1:
+                                    new_account["name"] = f"{provider}-{idx + 1}"
+                                else:
+                                    new_account["name"] = provider
+                            expanded.append(new_account)
+
+                accounts_data = expanded
+                print(f"⚙️ Object format detected, expanded to {len(accounts_data)} account(s)")
+
             if not isinstance(accounts_data, list):
-                print("❌ Account configuration must use array format [{}]")
+                print("❌ Account configuration must use array format [...] or object format {...}")
                 return []
 
             accounts = []
-            # 验证账号数据格式
             for i, account in enumerate(accounts_data):
                 if not isinstance(account, dict):
                     print(f"❌ Account {i + 1} configuration format is incorrect")
                     return []
 
-                # 检查必须有 linux.do、github 或 cookies 配置
                 has_linux_do = "linux.do" in account
                 has_github = "github" in account
                 has_cookies = "cookies" in account
@@ -892,7 +921,6 @@ class AppConfig:
                     print(f"❌ Account {i + 1} must have either 'linux.do', 'github', or 'cookies' configuration")
                     return []
 
-                # 确保必要字段存在后再创建 AccountConfig
                 if has_cookies:
                     if not account.get("cookies"):
                         print(f"❌ Account {i + 1} cookies cannot be empty")
@@ -901,57 +929,42 @@ class AppConfig:
                         print(f"❌ Account {i + 1} api_user cannot be empty")
                         return []
 
-                # 验证 linux.do 配置
                 if has_linux_do:
                     auth_config = account["linux.do"]
                     if not isinstance(auth_config, dict):
                         print(f"❌ Account {i + 1} linux.do configuration must be a dictionary")
                         return []
-
-                    # 验证必需字段
                     if "username" not in auth_config or "password" not in auth_config:
                         print(f"❌ Account {i + 1} linux.do configuration must contain username and password")
                         return []
-
-                    # 验证字段不为空
                     if not auth_config["username"] or not auth_config["password"]:
                         print(f"❌ Account {i + 1} linux.do username and password cannot be empty")
                         return []
 
-                # 验证 github 配置
                 if has_github:
                     auth_config = account["github"]
                     if not isinstance(auth_config, dict):
                         print(f"❌ Account {i + 1} github configuration must be a dictionary")
                         return []
-
-                    # 验证必需字段
                     if "username" not in auth_config or "password" not in auth_config:
                         print(f"❌ Account {i + 1} github configuration must contain username and password")
                         return []
-
-                    # 验证字段不为空
                     if not auth_config["username"] or not auth_config["password"]:
                         print(f"❌ Account {i + 1} github username and password cannot be empty")
                         return []
 
-                # 验证 cookies 配置
                 if has_cookies:
                     cookies_config = account["cookies"]
                     if not cookies_config:
                         print(f"❌ Account {i + 1} cookies cannot be empty")
                         return []
-
-                    # 验证必须要有 api_user 字段
                     if "api_user" not in account:
                         print(f"❌ Account {i + 1} with cookies must have api_user field")
                         return []
-
                     if not account["api_user"]:
                         print(f"❌ Account {i + 1} api_user cannot be empty")
                         return []
 
-                # 如果有 name 字段,确保它不是空字符串
                 if "name" in account and not account["name"]:
                     print(f"❌ Account {i + 1} name field cannot be empty")
                     return []
