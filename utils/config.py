@@ -651,7 +651,7 @@ class AppConfig:
                 linuxdo_client_id="koBcJtVQhnU2xCWlPb5SM6hZB1JGt5nZ",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method=None,
+                bypass_method="waf_cookies",  # 需要浏览器处理 Turnstile 验证码
             ),
             "aipm": ProviderConfig(
                 name="aipm",
