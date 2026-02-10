@@ -4,17 +4,18 @@ CheckIn 类
 """
 
 import asyncio
-import json
 import hashlib
+import json
 import os
 import tempfile
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 from camoufox.async_api import AsyncCamoufox
-from typing import TYPE_CHECKING
+
+from utils.browser_utils import aliyun_captcha_check, get_random_user_agent, parse_cookies, take_screenshot
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
 
@@ -47,7 +48,7 @@ def _load_provider_session_cache(cache_path: str) -> dict | None:
         # 检查缓存是否过期
         timestamp = cache_data.get("timestamp", 0)
         if time.time() - timestamp > PROVIDER_SESSION_CACHE_TTL:
-            print(f"ℹ️ Provider session cache expired")
+            print("ℹ️ Provider session cache expired")
             return None
 
         # 验证必要字段
@@ -1114,7 +1115,7 @@ class CheckIn:
             elif user_info:
                 error_msg = user_info.get("error", "Unknown error")
                 print(f"❌ {self.account_name}: {error_msg}")
-                return False, {"error": "Failed to get user info"}
+                return False, {"error": error_msg}
             else:
                 return False, {"error": "No user info available"}
 
