@@ -1307,8 +1307,8 @@ class CheckIn:
             # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
             if not success and "error" in result:
                 error_msg = result.get("error", "").lower()
-                # 检测需要重新认证的错误类型
-                retry_keywords = ["unauthorized", "401", "session", "invalid response format", "waf"]
+                # 检测需要重新认证的错误类型（支持中英文错误信息）
+                retry_keywords = ["unauthorized", "401", "session", "invalid response format", "waf", "未登录", "无权", "access token"]
                 if any(keyword in error_msg for keyword in retry_keywords):
                     print(f"⚠️ {self.account_name}: Cached session may be expired or WAF challenge, clearing cache and re-authenticating")
                     try:
