@@ -42,6 +42,7 @@ class ProviderConfig:
     linuxdo_auth_path: str = "/api/oauth/lunuxdo",
     aliyun_captcha: bool = False
     bypass_method: Literal["waf_cookies"] | None = None
+    turnstile_site_key: str | None = None
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "ProviderConfig":
@@ -68,6 +69,7 @@ class ProviderConfig:
             linuxdo_auth_path=data.get("linuxdo_auth_path", "/api/oauth/linuxdo"),
             aliyun_captcha=data.get("aliyun_captcha", False),
             bypass_method=data.get("bypass_method"),
+            turnstile_site_key=data.get("turnstile_site_key"),
         )
 
     def needs_waf_cookies(self) -> bool:
@@ -651,7 +653,8 @@ class AppConfig:
                 linuxdo_client_id="koBcJtVQhnU2xCWlPb5SM6hZB1JGt5nZ",
                 linuxdo_auth_path="/api/oauth/linuxdo",
                 aliyun_captcha=False,
-                bypass_method="waf_cookies",  # 需要浏览器处理 Turnstile 验证码
+                bypass_method=None,
+                turnstile_site_key="0x4AAAAAACZMa7ScM69nHPaC",
             ),
             "aipm": ProviderConfig(
                 name="aipm",

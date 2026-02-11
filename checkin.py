@@ -1039,13 +1039,33 @@ class CheckIn:
                 print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
 
             # 如果账号配置启用了 New-API 通用签到功能
-            # 对于 WAF 模式，签到将在浏览器中执行，这里跳过
+            # 对于 WAF 模式或 Turnstile 模式，签到将在浏览器中执行，这里跳过
             do_browser_checkin = False
             checkin_reward = None  # 保存签到奖励信息
             if self.account_config.checkin:
                 if self.provider_config.needs_waf_cookies():
                     print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
                     do_browser_checkin = True
+                elif self.provider_config.turnstile_site_key:
+                    print(f"ℹ️ {self.account_name}: New-API checkin requires Turnstile, using browser...")
+                    from utils.new_api_checkin import new_api_checkin_with_turnstile
+
+                    checkin_result = await new_api_checkin_with_turnstile(
+                        account_name=self.account_name,
+                        origin=self.provider_config.origin,
+                        api_user=api_user,
+                        cookies=cookies,
+                        turnstile_site_key=self.provider_config.turnstile_site_key,
+                        proxy=self.camoufox_proxy_config,
+                        api_user_key=self.provider_config.api_user_key,
+                    )
+                    if checkin_result.get("success"):
+                        checkin_reward = checkin_result.get("reward")
+                        if checkin_result.get("already_checked"):
+                            checkin_reward = None
+                    else:
+                        error_msg = checkin_result.get("error", "New-API checkin failed")
+                        print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
                 else:
                     print(f"ℹ️ {self.account_name}: New-API checkin enabled, executing...")
                     from utils.new_api_checkin import new_api_checkin
