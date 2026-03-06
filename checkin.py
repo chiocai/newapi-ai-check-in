@@ -14,7 +14,14 @@ from urllib.parse import urlparse
 import httpx
 from camoufox.async_api import AsyncCamoufox
 
-from utils.browser_utils import aliyun_captcha_check, get_random_user_agent, parse_cookies, take_screenshot
+from utils.browser_utils import (
+    aliyun_captcha_check,
+    filter_cookies,
+    get_random_user_agent,
+    parse_cookies,
+    save_page_content_to_file,
+    take_screenshot,
+)
 from utils.config import AccountConfig, ProviderConfig
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
@@ -1148,9 +1155,27 @@ class CheckIn:
             # anyrouter 特殊处理：虽然需要 WAF cookies，但直接使用 HTTP 请求获取用户信息
             # 其他需要绕过 WAF 的站点使用浏览器获取 user info（同时执行签到）
             if self.provider_config.name == "anyrouter":
-                # anyrouter 直接使用 HTTP 请求，不使用浏览器
+                # anyrouter 优先使用 HTTP，请求失败时再回退浏览器
                 print(f"ℹ️ {self.account_name}: Using HTTP request to get user info (anyrouter)")
                 user_info = await self.get_user_info(client, headers)
+                if not (user_info and user_info.get("success")):
+                    print(f"⚠️ {self.account_name}: HTTP user info failed for anyrouter, fallback to browser")
+                    auth_cookies_list = []
+                    parsed_domain = urlparse(self.provider_config.origin).netloc
+                    for name, value in cookies.items():
+                        auth_cookies_list.append({
+                            "name": name,
+                            "value": value,
+                            "domain": parsed_domain,
+                            "path": "/",
+                        })
+                    browser_user_info = await self.get_user_info_with_browser(
+                        auth_cookies_list,
+                        api_user,
+                        do_checkin=do_browser_checkin,
+                    )
+                    if browser_user_info and browser_user_info.get("success"):
+                        user_info = browser_user_info
             elif self.provider_config.needs_waf_cookies():
                 print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
                 # 将 cookies dict 转换为 Camoufox 格式的 list
@@ -1306,48 +1331,12 @@ class CheckIn:
                         else:
                             error_msg = json_data.get("message", "Unknown error") if json_data else "Invalid response"
                             print(f"❌ {self.account_name}: OAuth callback failed: {error_msg}")
-                            fallback_result = await self.complete_linuxdo_callback_with_browser(
-                                str(callback_url),
-                                auth_state_result.get("cookies", []),
-                            )
-                            if fallback_result.get("success"):
-                                merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
-                                api_user = fallback_result["api_user"]
-                                _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
-                                print(f"✅ {self.account_name}: Browser callback fallback succeeded")
-                                if login_only:
-                                    return True, {"cookies": merged_cookies, "api_user": api_user}
-                                return await self.check_in_with_cookies(merged_cookies, api_user)
                             return False, {"error": f"OAuth callback failed: {error_msg}"}
                     else:
                         print(f"❌ {self.account_name}: OAuth callback HTTP {response.status_code}")
-                        fallback_result = await self.complete_linuxdo_callback_with_browser(
-                            str(callback_url),
-                            auth_state_result.get("cookies", []),
-                        )
-                        if fallback_result.get("success"):
-                            merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
-                            api_user = fallback_result["api_user"]
-                            _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
-                            print(f"✅ {self.account_name}: Browser callback fallback succeeded")
-                            if login_only:
-                                return True, {"cookies": merged_cookies, "api_user": api_user}
-                            return await self.check_in_with_cookies(merged_cookies, api_user)
                         return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: Error calling OAuth callback: {callback_err}")
-                    fallback_result = await self.complete_linuxdo_callback_with_browser(
-                        str(callback_url),
-                        auth_state_result.get("cookies", []),
-                    )
-                    if fallback_result.get("success"):
-                        merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
-                        api_user = fallback_result["api_user"]
-                        _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
-                        print(f"✅ {self.account_name}: Browser callback fallback succeeded")
-                        if login_only:
-                            return True, {"cookies": merged_cookies, "api_user": api_user}
-                        return await self.check_in_with_cookies(merged_cookies, api_user)
                     return False, {"error": f"OAuth callback error: {callback_err}"}
             else:
                 # 返回错误信息
@@ -1405,7 +1394,18 @@ class CheckIn:
             if not success and "error" in result:
                 error_msg = result.get("error", "").lower()
                 # 检测需要重新认证的错误类型（支持中英文错误信息）
-                retry_keywords = ["unauthorized", "401", "session", "invalid response format", "waf", "未登录", "无权", "access token"]
+                retry_keywords = [
+                    "unauthorized",
+                    "401",
+                    "session",
+                    "invalid response format",
+                    "invalid response type",
+                    "failed to get user info",
+                    "waf",
+                    "未登录",
+                    "无权",
+                    "access token",
+                ]
                 if any(keyword in error_msg for keyword in retry_keywords):
                     print(f"⚠️ {self.account_name}: Cached session may be expired or WAF challenge, clearing cache and re-authenticating")
                     try:
@@ -1554,12 +1554,48 @@ class CheckIn:
                         else:
                             error_msg = json_data.get("message", "Unknown error") if json_data else "Invalid response"
                             print(f"❌ {self.account_name}: OAuth callback failed: {error_msg}")
+                            fallback_result = await self.complete_linuxdo_callback_with_browser(
+                                str(callback_url),
+                                auth_state_result.get("cookies", []),
+                            )
+                            if fallback_result.get("success"):
+                                merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                                api_user = fallback_result["api_user"]
+                                _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                                print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                                if login_only:
+                                    return True, {"cookies": merged_cookies, "api_user": api_user}
+                                return await self.check_in_with_cookies(merged_cookies, api_user)
                             return False, {"error": f"OAuth callback failed: {error_msg}"}
                     else:
                         print(f"❌ {self.account_name}: OAuth callback HTTP {response.status_code}")
+                        fallback_result = await self.complete_linuxdo_callback_with_browser(
+                            str(callback_url),
+                            auth_state_result.get("cookies", []),
+                        )
+                        if fallback_result.get("success"):
+                            merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                            api_user = fallback_result["api_user"]
+                            _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                            print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                            if login_only:
+                                return True, {"cookies": merged_cookies, "api_user": api_user}
+                            return await self.check_in_with_cookies(merged_cookies, api_user)
                         return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: Error calling OAuth callback: {callback_err}")
+                    fallback_result = await self.complete_linuxdo_callback_with_browser(
+                        str(callback_url),
+                        auth_state_result.get("cookies", []),
+                    )
+                    if fallback_result.get("success"):
+                        merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                        api_user = fallback_result["api_user"]
+                        _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                        print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                        if login_only:
+                            return True, {"cookies": merged_cookies, "api_user": api_user}
+                        return await self.check_in_with_cookies(merged_cookies, api_user)
                     return False, {"error": f"OAuth callback error: {callback_err}"}
             else:
                 # 返回错误信息

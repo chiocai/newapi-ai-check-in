@@ -18,7 +18,7 @@ from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
 from utils.linuxdo_session import LinuxDoSessionManager
 from utils.notify import notify
-from utils.site_discovery import ensure_runtime_site_overrides
+from utils.site_discovery import ensure_runtime_site_overrides, update_runtime_site_override
 
 load_dotenv(override=True)
 
@@ -236,12 +236,71 @@ def collect_failed_account_indices(account_results: list) -> list[int]:
     return failed_indices
 
 
+def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
+    """判断失败结果是否应自动切换为 WAF 模式后重试"""
+    provider_name = result.get("provider", "")
+    provider = app_config.get_provider(provider_name)
+    site_definition = app_config.site_definitions.get(provider_name)
+    if not provider or not site_definition:
+        return False
+    if provider.needs_waf_cookies():
+        return False
+    if site_definition.mode in {"turnstile", "special", "signed", "newapi-waf", "auto-waf", "manual-waf"}:
+        return False
+
+    error_text = " ".join(
+        str(value)
+        for value in [result.get("error_summary"), result.get("error")]
+        if value
+    ).lower()
+    waf_indicators = [
+        "http 403",
+        "403",
+        "无权进行此操作",
+        "未登录且未提供 access token",
+        "without access token",
+    ]
+    return any(indicator in error_text for indicator in waf_indicators)
+
+
+def apply_waf_runtime_overrides_for_failed_accounts(account_results: list, app_config: AppConfig) -> list[str]:
+    """为触发 403 的失败站点自动写入 WAF 运行时覆盖"""
+    updated_providers = []
+    seen = set()
+
+    for result in account_results:
+        if not isinstance(result, dict) or result.get("success"):
+            continue
+        provider_name = result.get("provider", "")
+        if not provider_name or provider_name in seen:
+            continue
+        if not should_enable_waf_retry(result, app_config):
+            continue
+
+        provider = app_config.get_provider(provider_name)
+        if not provider:
+            continue
+
+        overrides = {"bypass_method": "waf_cookies"}
+        update_runtime_site_override(app_config.runtime_sites_file, provider_name, overrides)
+        app_config.update_provider(provider_name, provider.apply_overrides(overrides))
+        updated_providers.append(provider_name)
+        seen.add(provider_name)
+        print(f"🔧 Auto-adjusted {provider_name} to WAF browser mode due to 403-style failure")
+
+    return updated_providers
+
+
 async def rerun_failed_accounts_once(account_results: list, app_config, semaphore: asyncio.Semaphore) -> list:
     """对失败账号补跑一轮，并用补跑结果覆盖原结果"""
     failed_indices = collect_failed_account_indices(account_results)
     if not failed_indices:
         print("ℹ️ No failed accounts to retry")
         return account_results
+
+    updated_providers = apply_waf_runtime_overrides_for_failed_accounts(account_results, app_config)
+    if updated_providers:
+        print(f"⚙️ Runtime WAF overrides applied for {len(updated_providers)} provider(s): {updated_providers}")
 
     print(f"\n🔁 Retrying {len(failed_indices)} failed account(s) once...")
     retry_tasks = [
