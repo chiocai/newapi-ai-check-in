@@ -28,6 +28,7 @@ BALANCE_HASH_FILE = "balance_hash.txt"
 MAX_CONCURRENT_ACCOUNTS = 10  # 最大并发账号数
 MAX_CONCURRENT_RUNTIME_DISCOVERY = 10  # 运行时自动发现最大并发数
 MAX_CONCURRENT_LINUXDO_PRELOGIN = 2  # LinuxDo 预登录最大并发数
+MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
 
 
 def generate_balance_hash(balances: dict) -> str:
@@ -223,6 +224,50 @@ async def process_single_account(
         return result
 
 
+def collect_failed_account_indices(account_results: list) -> list[int]:
+    """收集需要补跑的账号索引"""
+    failed_indices = []
+    for index, result in enumerate(account_results):
+        if isinstance(result, Exception):
+            failed_indices.append(index)
+            continue
+        if isinstance(result, dict) and not result.get("success"):
+            failed_indices.append(index)
+    return failed_indices
+
+
+async def rerun_failed_accounts_once(account_results: list, app_config, semaphore: asyncio.Semaphore) -> list:
+    """对失败账号补跑一轮，并用补跑结果覆盖原结果"""
+    failed_indices = collect_failed_account_indices(account_results)
+    if not failed_indices:
+        print("ℹ️ No failed accounts to retry")
+        return account_results
+
+    print(f"\n🔁 Retrying {len(failed_indices)} failed account(s) once...")
+    retry_tasks = [
+        process_single_account(index, app_config.accounts[index], app_config, semaphore)
+        for index in failed_indices
+    ]
+    retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+    recovered_count = 0
+    for index, retry_result in zip(failed_indices, retry_results):
+        original_result = account_results[index]
+        account_results[index] = retry_result
+        if (
+            isinstance(retry_result, dict)
+            and retry_result.get("success")
+            and (
+                isinstance(original_result, Exception)
+                or (isinstance(original_result, dict) and not original_result.get("success"))
+            )
+        ):
+            recovered_count += 1
+
+    print(f"✅ Retry round finished, recovered {recovered_count}/{len(failed_indices)} failed account(s)")
+    return account_results
+
+
 def get_site_label(provider_name: str, site_origin: str | None = None) -> str:
     """获取站点展示名称"""
     if site_origin:
@@ -359,6 +404,13 @@ async def main():
 
     # 并行执行所有任务
     account_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for retry_round in range(MAX_FAILED_RETRY_ROUNDS):
+        failed_indices = collect_failed_account_indices(account_results)
+        if not failed_indices:
+            break
+        print(f"ℹ️ Retry round {retry_round + 1}/{MAX_FAILED_RETRY_ROUNDS}")
+        account_results = await rerun_failed_accounts_once(account_results, app_config, semaphore)
 
     # 汇总结果
     current_balances = {}

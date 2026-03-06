@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 # Provider session 缓存有效期（秒）- 默认 23 小时
 PROVIDER_SESSION_CACHE_TTL = 23 * 60 * 60
+TIMEOUT_PAGE_LOAD = 60000
+TIMEOUT_NAVIGATION = 45000
 
 
 def _get_provider_session_cache_path(storage_dir: str, provider_name: str, username_hash: str) -> str:
@@ -561,33 +563,24 @@ class CheckIn:
         headers: dict,
     ) -> dict:
         """获取认证状态"""
+        async def fallback_to_browser(reason: str) -> dict:
+            print(f"⚠️ {self.account_name}: HTTP auth state failed ({reason}), fallback to browser auth state")
+            auth_result = await self.get_auth_state_with_browser()
+            if auth_result.get("success"):
+                return auth_result
+            error_msg = auth_result.get("error", "Unknown error")
+            return {
+                "success": False,
+                "error": f"Failed to get auth state: {error_msg}",
+            }
+
         try:
             response = client.get(self.provider_config.get_auth_state_url(), headers=headers, timeout=30)
 
             if response.status_code == 200:
                 json_data = response_resolve(response, "get_auth_state", self.account_name)
                 if json_data is None:
-                    # 尝试从浏览器 localStorage 获取状态
-                    # print(f"ℹ️ {self.account_name}: Getting auth state from browser")
-                    # try:
-                    #     auth_result = await self.get_auth_state_with_browser()
-
-                    #     if not auth_result.get("success"):
-                    #         error_msg = auth_result.get("error", "Unknown error")
-                    #         print(f"❌ {self.account_name}: {error_msg}")
-                    #         return {
-                    #             "success": False,
-                    #             "error": "Failed to get auth state with browser",
-                    #         }
-
-                    #     return auth_result
-                    # except Exception as browser_err:
-                    #     print(f"⚠️ {self.account_name}: Failed to get auth state from browser: " f"{browser_err}")
-
-                    return {
-                        "success": False,
-                        "error": "Failed to get auth state: Invalid response type (saved to logs)",
-                    }
+                    return await fallback_to_browser("invalid response type")
 
                 # 检查响应是否成功
                 if json_data.get("success"):
@@ -628,19 +621,67 @@ class CheckIn:
                     }
                 else:
                     error_msg = json_data.get("message", "Unknown error")
-                    return {
-                        "success": False,
-                        "error": f"Failed to get auth state: {error_msg}",
-                    }
-            return {
-                "success": False,
-                "error": f"Failed to get auth state: HTTP {response.status_code}",
-            }
+                    return await fallback_to_browser(error_msg)
+            return await fallback_to_browser(f"HTTP {response.status_code}")
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"Failed to get auth state, {e}",
-            }
+            return await fallback_to_browser(str(e))
+
+    async def complete_linuxdo_callback_with_browser(
+        self,
+        callback_url: str,
+        auth_cookies: list[dict] | None = None,
+    ) -> dict:
+        """使用浏览器完成 LinuxDo OAuth callback，兼容部分站点的 JS / 重定向逻辑"""
+        print(f"ℹ️ {self.account_name}: Trying browser-based OAuth callback fallback")
+        async with AsyncCamoufox(
+            headless=True,
+            humanize=True,
+            locale="en-US",
+            geoip=True if self.camoufox_proxy_config else False,
+            proxy=self.camoufox_proxy_config,
+        ) as browser:
+            context = await browser.new_context()
+            page = await context.new_page()
+            try:
+                if auth_cookies:
+                    await context.add_cookies(auth_cookies)
+                    print(f"ℹ️ {self.account_name}: Added {len(auth_cookies)} auth cookies for callback fallback")
+
+                await page.goto(callback_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                await page.wait_for_timeout(5000)
+
+                parsed = urlparse(self.provider_config.origin)
+                if parsed.netloc not in page.url:
+                    try:
+                        await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
+                    except Exception:
+                        pass
+
+                api_user = None
+                try:
+                    user_data = await page.evaluate("() => localStorage.getItem('user')")
+                    if user_data:
+                        user_obj = json.loads(user_data)
+                        api_user = user_obj.get("id")
+                except Exception as e:
+                    print(f"⚠️ {self.account_name}: Browser callback fallback failed to read localStorage user: {e}")
+
+                if api_user:
+                    restore_cookies = await page.context.cookies()
+                    user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+                    print(f"✅ {self.account_name}: Browser callback fallback got api_user: {api_user}")
+                    return {
+                        "success": True,
+                        "api_user": api_user,
+                        "cookies": user_cookies,
+                    }
+
+                await save_page_content_to_file(page, "linuxdo_callback_browser_fallback_failed", self.account_name, prefix="linuxdo")
+                await take_screenshot(page, "linuxdo_callback_browser_fallback_failed", self.account_name)
+                return {"success": False, "error": "Browser callback fallback could not extract api_user"}
+            finally:
+                await page.close()
+                await context.close()
 
     async def get_user_info_with_browser(
         self, auth_cookies: list[dict], api_user: str | int, do_checkin: bool = False
@@ -1265,12 +1306,48 @@ class CheckIn:
                         else:
                             error_msg = json_data.get("message", "Unknown error") if json_data else "Invalid response"
                             print(f"❌ {self.account_name}: OAuth callback failed: {error_msg}")
+                            fallback_result = await self.complete_linuxdo_callback_with_browser(
+                                str(callback_url),
+                                auth_state_result.get("cookies", []),
+                            )
+                            if fallback_result.get("success"):
+                                merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                                api_user = fallback_result["api_user"]
+                                _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                                print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                                if login_only:
+                                    return True, {"cookies": merged_cookies, "api_user": api_user}
+                                return await self.check_in_with_cookies(merged_cookies, api_user)
                             return False, {"error": f"OAuth callback failed: {error_msg}"}
                     else:
                         print(f"❌ {self.account_name}: OAuth callback HTTP {response.status_code}")
+                        fallback_result = await self.complete_linuxdo_callback_with_browser(
+                            str(callback_url),
+                            auth_state_result.get("cookies", []),
+                        )
+                        if fallback_result.get("success"):
+                            merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                            api_user = fallback_result["api_user"]
+                            _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                            print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                            if login_only:
+                                return True, {"cookies": merged_cookies, "api_user": api_user}
+                            return await self.check_in_with_cookies(merged_cookies, api_user)
                         return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: Error calling OAuth callback: {callback_err}")
+                    fallback_result = await self.complete_linuxdo_callback_with_browser(
+                        str(callback_url),
+                        auth_state_result.get("cookies", []),
+                    )
+                    if fallback_result.get("success"):
+                        merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                        api_user = fallback_result["api_user"]
+                        _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                        print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                        if login_only:
+                            return True, {"cookies": merged_cookies, "api_user": api_user}
+                        return await self.check_in_with_cookies(merged_cookies, api_user)
                     return False, {"error": f"OAuth callback error: {callback_err}"}
             else:
                 # 返回错误信息
