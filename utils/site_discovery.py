@@ -3,6 +3,7 @@
 站点运行时自动发现与缓存
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -236,7 +237,7 @@ async def discover_browser_runtime_overrides(provider_config: ProviderConfig, re
 	return {key: value for key, value in discovered.items() if key in fields and value}
 
 
-async def ensure_runtime_site_overrides(app_config: AppConfig) -> dict[str, dict]:
+async def ensure_runtime_site_overrides(app_config: AppConfig, max_concurrency: int = 10) -> dict[str, dict]:
 	"""确保缺失的站点运行时配置已被自动发现并缓存"""
 	required_map = get_required_runtime_fields(app_config)
 	if not required_map:
@@ -244,21 +245,31 @@ async def ensure_runtime_site_overrides(app_config: AppConfig) -> dict[str, dict
 		return {}
 
 	discovered_overrides = {}
-	for site_name, required_fields in required_map.items():
+	semaphore = asyncio.Semaphore(max_concurrency)
+
+	async def discover_one(site_name: str, required_fields: set[str]) -> tuple[str, ProviderConfig | None, dict]:
 		provider = app_config.get_provider(site_name)
 		if not provider:
+			return site_name, None, {}
+
+		async with semaphore:
+			print(f'🔎 Runtime discovery for {site_name}: {sorted(required_fields)}')
+			overrides = await discover_status_runtime_overrides(provider, required_fields, app_config.global_proxy)
+			missing_fields = required_fields - set(overrides)
+			if missing_fields:
+				overrides.update(await discover_browser_runtime_overrides(provider, missing_fields, app_config.global_proxy))
+
+			if not overrides:
+				print(f'⚠️ Runtime discovery found nothing for {site_name}')
+			return site_name, provider, overrides
+
+	results = await asyncio.gather(
+		*(discover_one(site_name, required_fields) for site_name, required_fields in required_map.items())
+	)
+
+	for site_name, provider, overrides in results:
+		if not provider or not overrides:
 			continue
-
-		print(f'🔎 Runtime discovery for {site_name}: {sorted(required_fields)}')
-		overrides = await discover_status_runtime_overrides(provider, required_fields, app_config.global_proxy)
-		missing_fields = required_fields - set(overrides)
-		if missing_fields:
-			overrides.update(await discover_browser_runtime_overrides(provider, missing_fields, app_config.global_proxy))
-
-		if not overrides:
-			print(f'⚠️ Runtime discovery found nothing for {site_name}')
-			continue
-
 		update_runtime_site_override(app_config.runtime_sites_file, site_name, overrides)
 		app_config.update_provider(site_name, provider.apply_overrides(overrides))
 		discovered_overrides[site_name] = overrides

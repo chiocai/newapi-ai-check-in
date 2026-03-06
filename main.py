@@ -25,7 +25,9 @@ load_dotenv(override=True)
 BALANCE_HASH_FILE = "balance_hash.txt"
 
 # 并行处理配置
-MAX_CONCURRENT_ACCOUNTS = 4  # 最大并发账号数
+MAX_CONCURRENT_ACCOUNTS = 10  # 最大并发账号数
+MAX_CONCURRENT_RUNTIME_DISCOVERY = 10  # 运行时自动发现最大并发数
+MAX_CONCURRENT_LINUXDO_PRELOGIN = 2  # LinuxDo 预登录最大并发数
 
 
 def generate_balance_hash(balances: dict) -> str:
@@ -301,7 +303,7 @@ async def main():
 
     print(f"⚙️ Found {len(app_config.accounts)} account(s)")
 
-    discovered_runtime_overrides = await ensure_runtime_site_overrides(app_config)
+    discovered_runtime_overrides = await ensure_runtime_site_overrides(app_config, max_concurrency=MAX_CONCURRENT_RUNTIME_DISCOVERY)
     if discovered_runtime_overrides:
         print(f"⚙️ Runtime site overrides updated for {len(discovered_runtime_overrides)} site(s)")
 
@@ -315,17 +317,31 @@ async def main():
 
     if linuxdo_usernames:
         print(f"\n🔐 Pre-logging in {len(linuxdo_usernames)} unique Linux.do account(s)...")
-        for username in linuxdo_usernames:
-            # 找到第一个使用该用户名的账号配置，获取密码和代理
-            for account_config in app_config.accounts:
-                if account_config.linux_do and account_config.linux_do.get("username") == username:
-                    password = account_config.linux_do.get("password")
-                    proxy = account_config.proxy or app_config.global_proxy
-                    try:
-                        await LinuxDoSessionManager.get_session(username, password, proxy)
-                    except Exception as e:
-                        print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {e}")
-                    break
+        linuxdo_credentials = {}
+        for account_config in app_config.accounts:
+            if account_config.linux_do:
+                username = account_config.linux_do.get("username")
+                if username and username not in linuxdo_credentials:
+                    linuxdo_credentials[username] = {
+                        "password": account_config.linux_do.get("password"),
+                        "proxy": account_config.proxy or app_config.global_proxy,
+                    }
+
+        prelogin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_PRELOGIN)
+
+        async def prelogin_one(username: str, password: str, proxy):
+            async with prelogin_semaphore:
+                try:
+                    await LinuxDoSessionManager.get_session(username, password, proxy)
+                except Exception as e:
+                    print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {e}")
+
+        await asyncio.gather(
+            *(
+                prelogin_one(username, config["password"], config["proxy"])
+                for username, config in linuxdo_credentials.items()
+            )
+        )
         print(f"✅ Linux.do pre-login completed, {LinuxDoSessionManager.get_session_count()} session(s) cached\n")
 
     # 加载余额hash
