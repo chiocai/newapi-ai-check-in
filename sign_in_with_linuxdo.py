@@ -3,13 +3,23 @@
 使用 Camoufox 绕过 Cloudflare 验证执行 Linux.do 签到
 """
 
+import asyncio
 import json
 import os
-import asyncio
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs
+
 from camoufox.async_api import AsyncCamoufox
-from utils.browser_utils import filter_cookies, take_screenshot, save_page_content_to_file
+
+from utils.browser_utils import (
+    attempt_linuxdo_human_verification,
+    detect_linuxdo_page_guard,
+    filter_cookies,
+    has_linuxdo_human_verification,
+    save_page_content_to_file,
+    take_screenshot,
+    wait_for_linuxdo_login_ready,
+)
 from utils.config import ProviderConfig
 
 if TYPE_CHECKING:
@@ -85,7 +95,14 @@ class LinuxDoSignIn:
                 else:
                     last_error = result[1].get("error", "Unknown error")
                     # 某些错误不需要重试
-                    if "not found" in str(last_error).lower():
+                    non_retry_keywords = [
+                        "not found",
+                        "human verification",
+                        "hcaptcha",
+                        "h-captcha",
+                        "cloudflare challenge",
+                    ]
+                    if any(keyword in str(last_error).lower() for keyword in non_retry_keywords):
                         print(f"❌ {self.account_name}: Non-retryable error: {last_error}")
                         return result
                     print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error}")
@@ -204,17 +221,42 @@ class LinuxDoSignIn:
 
                         await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
 
-                        # 等待登录表单加载
                         try:
-                            await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
-                        except Exception:
-                            print(f"⚠️ {self.account_name}: Login form not found, page may be loading slowly")
+                            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
+                        except Exception as ready_err:
+                            guard = await detect_linuxdo_page_guard(page)
+                            print(f"⚠️ {self.account_name}: Login form not ready: {ready_err}")
+                            if guard.get("human_verification"):
+                                await save_page_content_to_file(page, "linuxdo_hcaptcha_before_login_ready", self.account_name, prefix="linuxdo")
+                                await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", self.account_name)
+                                return False, {"error": "LinuxDo login blocked by Human Verification before form ready"}
+                            if guard.get("cloudflare_challenge"):
+                                await save_page_content_to_file(page, "linuxdo_cloudflare_before_login_ready", self.account_name, prefix="linuxdo")
+                                await take_screenshot(page, "linuxdo_cloudflare_before_login_ready", self.account_name)
+                                return False, {"error": "LinuxDo login blocked by Cloudflare challenge before form ready"}
                             await page.wait_for_timeout(2000)
+                            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
 
                         await page.fill("#login-account-name", self.username, timeout=TIMEOUT_FILL)
                         await page.wait_for_timeout(500)
                         await page.fill("#login-account-password", self.password, timeout=TIMEOUT_FILL)
                         await page.wait_for_timeout(500)
+
+                        if await has_linuxdo_human_verification(page):
+                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
+                            if not solved:
+                                guard = await detect_linuxdo_page_guard(page)
+                                await save_page_content_to_file(page, "linuxdo_hcaptcha_detected", self.account_name, prefix="linuxdo")
+                                await take_screenshot(page, "linuxdo_hcaptcha_detected", self.account_name)
+                                sitekey = guard.get("human_verification_sitekey")
+                                suffix = f", sitekey={sitekey}" if sitekey else ""
+                                return False, {
+                                    "error": (
+                                        f"LinuxDo login requires Human Verification (hCaptcha){suffix}. "
+                                        "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
+                                    )
+                                }
+
                         await page.click("#login-button", timeout=TIMEOUT_CLICK)
                         # 等待登录完成：检测用户元素出现或 URL 变化
                         try:
@@ -241,9 +283,36 @@ class LinuxDoSignIn:
                             # 即使超时，也尝试继续
                             pass
 
-                        # 保存新的会话状态
-                        await context.storage_state(path=cache_file_path)
-                        print(f"✅ {self.account_name}: Storage state saved to cache file")
+                        post_login_guard = await detect_linuxdo_page_guard(page)
+                        if "linux.do/login" in page.url and post_login_guard.get("human_verification"):
+                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
+                            if solved:
+                                print(f"ℹ️ {self.account_name}: Human Verification solved after login submit, retrying login once")
+                                await page.click("#login-button", timeout=TIMEOUT_CLICK)
+                                await page.wait_for_timeout(5000)
+                                post_login_guard = await detect_linuxdo_page_guard(page)
+
+                            if "linux.do/login" in page.url and post_login_guard.get("human_verification"):
+                                await save_page_content_to_file(
+                                    page, "linuxdo_hcaptcha_after_login_click", self.account_name, prefix="linuxdo"
+                                )
+                                await take_screenshot(page, "linuxdo_hcaptcha_after_login_click", self.account_name)
+                                sitekey = post_login_guard.get("human_verification_sitekey")
+                                suffix = f", sitekey={sitekey}" if sitekey else ""
+                                return False, {
+                                    "error": (
+                                        f"LinuxDo login still requires Human Verification after submit{suffix}. "
+                                        "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
+                                    )
+                                }
+
+                        current_url = page.url
+                        current_user = await page.query_selector(".current-user")
+                        if current_user or "linux.do/login" not in current_url:
+                            await context.storage_state(path=cache_file_path)
+                            print(f"✅ {self.account_name}: Storage state saved to cache file")
+                        else:
+                            print(f"⚠️ {self.account_name}: Login not confirmed, skip overwriting LinuxDo cache file")
 
                     except Exception as e:
                         print(f"❌ {self.account_name}: Error occurred while signing in linux.do: {e}")
@@ -261,6 +330,30 @@ class LinuxDoSignIn:
 
                 # 统一处理授权逻辑（无论是否通过缓存登录）
                 try:
+                    if "linux.do/login" in page.url:
+                        guard = await detect_linuxdo_page_guard(page)
+                        if guard.get("human_verification"):
+                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
+                            if not solved:
+                                print(f"❌ {self.account_name}: Redirected back to LinuxDo login with Human Verification")
+                                await save_page_content_to_file(
+                                    page, "linuxdo_authorize_hcaptcha", self.account_name, prefix="linuxdo"
+                                )
+                                await take_screenshot(page, "linuxdo_authorize_hcaptcha", self.account_name)
+                                sitekey = guard.get("human_verification_sitekey")
+                                suffix = f", sitekey={sitekey}" if sitekey else ""
+                                return False, {"error": f"LinuxDo authorization blocked by Human Verification (hCaptcha){suffix}"}
+
+                        print(f"❌ {self.account_name}: Redirected back to LinuxDo login page before authorization")
+                        await save_page_content_to_file(page, "linuxdo_authorize_redirect_login", self.account_name, prefix="linuxdo")
+                        await take_screenshot(page, "linuxdo_authorize_redirect_login", self.account_name)
+                        return False, {
+                            "error": (
+                                "LinuxDo authorization redirected back to login page. "
+                                "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
+                            )
+                        }
+
                     # 等待授权按钮出现
                     print(f"ℹ️ {self.account_name}: Waiting for authorization button...")
                     await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)

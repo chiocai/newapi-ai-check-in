@@ -8,10 +8,19 @@ Linux.do 会话管理器
 import hashlib
 import json
 import os
+import time
 from typing import TYPE_CHECKING
 
 from camoufox.async_api import AsyncCamoufox
-from utils.browser_utils import take_screenshot, save_page_content_to_file
+
+from utils.browser_utils import (
+    attempt_linuxdo_human_verification,
+    detect_linuxdo_page_guard,
+    has_linuxdo_human_verification,
+    save_page_content_to_file,
+    take_screenshot,
+    wait_for_linuxdo_login_ready,
+)
 
 if TYPE_CHECKING:
     pass
@@ -154,7 +163,28 @@ class LinuxDoSession:
                 try:
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Navigating to login page")
                     await page.goto("https://linux.do/login", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(1500)
+                    try:
+                        await wait_for_linuxdo_login_ready(page, f"session_{self.username_hash}")
+                    except Exception as ready_err:
+                        guard = await detect_linuxdo_page_guard(page)
+                        print(f"⚠️ LinuxDoSession [{self.username_hash}]: Login form not ready: {ready_err}")
+                        if guard.get("human_verification"):
+                            await save_page_content_to_file(
+                                page,
+                                "linuxdo_hcaptcha_before_login_ready",
+                                f"session_{self.username_hash}",
+                            )
+                            await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", f"session_{self.username_hash}")
+                            return False
+                        if guard.get("cloudflare_challenge"):
+                            await save_page_content_to_file(
+                                page,
+                                "linuxdo_cloudflare_before_login_ready",
+                                f"session_{self.username_hash}",
+                            )
+                            await take_screenshot(page, "linuxdo_cloudflare_before_login_ready", f"session_{self.username_hash}")
+                            return False
+                        raise
 
                     # 填写登录表单
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Filling credentials")
@@ -162,6 +192,20 @@ class LinuxDoSession:
                     await page.wait_for_timeout(500)
                     await page.fill("#login-account-password", self.password)
                     await page.wait_for_timeout(500)
+
+                    if await has_linuxdo_human_verification(page):
+                        solved = await attempt_linuxdo_human_verification(page, f"session_{self.username_hash}")
+                        if not solved:
+                            guard = await detect_linuxdo_page_guard(page)
+                            print(f"❌ LinuxDoSession [{self.username_hash}]: Human Verification (hCaptcha) detected")
+                            await save_page_content_to_file(page, "linuxdo_hcaptcha_detected", f"session_{self.username_hash}")
+                            await take_screenshot(page, "linuxdo_hcaptcha_detected", f"session_{self.username_hash}")
+                            if guard.get("human_verification_sitekey"):
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"hCaptcha sitekey={guard['human_verification_sitekey']}"
+                                )
+                            return False
 
                     # 点击登录按钮
                     print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Clicking login button")
@@ -185,6 +229,33 @@ class LinuxDoSession:
                             print(f"✅ LinuxDoSession [{self.username_hash}]: Cloudflare challenge bypassed")
                         except Exception:
                             print(f"⚠️ LinuxDoSession [{self.username_hash}]: Cloudflare challenge timeout")
+
+                    current_url = page.url
+                    post_login_guard = await detect_linuxdo_page_guard(page)
+                    if "linux.do/login" in current_url and post_login_guard.get("human_verification"):
+                        solved = await attempt_linuxdo_human_verification(page, f"session_{self.username_hash}")
+                        if solved:
+                            print(
+                                f"ℹ️ LinuxDoSession [{self.username_hash}]: "
+                                "Human Verification solved after submit, retrying login once"
+                            )
+                            await page.click("#login-button")
+                            await page.wait_for_timeout(5000)
+                            current_url = page.url
+                            post_login_guard = await detect_linuxdo_page_guard(page)
+
+                        if "linux.do/login" in current_url and post_login_guard.get("human_verification"):
+                            print(f"❌ LinuxDoSession [{self.username_hash}]: Human Verification still blocks session after submit")
+                            await save_page_content_to_file(
+                                page, "linuxdo_hcaptcha_after_login_click", f"session_{self.username_hash}"
+                            )
+                            await take_screenshot(page, "linuxdo_hcaptcha_after_login_click", f"session_{self.username_hash}")
+                            if post_login_guard.get("human_verification_sitekey"):
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"hCaptcha sitekey={post_login_guard['human_verification_sitekey']}"
+                                )
+                            return False
 
                     # 验证登录成功
                     await page.wait_for_timeout(1000)
@@ -257,6 +328,58 @@ class LinuxDoSession:
         self.is_logged_in = False
         self._storage_state = None
         print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Session invalidated")
+
+    async def prepare_manually(self, timeout_seconds: int = 600) -> bool:
+        """手工预热 Linux.do 登录会话"""
+        deadline = time.time() + timeout_seconds
+        try:
+            async with AsyncCamoufox(
+                headless=False,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.proxy else False,
+                proxy=self.proxy,
+            ) as browser:
+                storage_state = self.storage_state_path if os.path.exists(self.storage_state_path) else None
+                context = await browser.new_context(storage_state=storage_state)
+                page = await context.new_page()
+
+                try:
+                    print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Opening visible browser for manual warm-up")
+                    await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+
+                    try:
+                        await wait_for_linuxdo_login_ready(page, f"session_{self.username_hash}")
+                        await page.fill("#login-account-name", self.username)
+                        await page.fill("#login-account-password", self.password)
+                        print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Credentials pre-filled, please complete login manually")
+                    except Exception as exc:
+                        print(f"⚠️ LinuxDoSession [{self.username_hash}]: Unable to pre-fill login form: {exc}")
+
+                    while time.time() < deadline:
+                        current_url = page.url
+                        current_user = await page.query_selector(".current-user")
+                        guard = await detect_linuxdo_page_guard(page)
+
+                        if current_user or ("linux.do/login" not in current_url and not guard.get("human_verification")):
+                            await context.storage_state(path=self.storage_state_path)
+                            self._storage_state = await context.storage_state()
+                            self.is_logged_in = True
+                            print(f"✅ LinuxDoSession [{self.username_hash}]: Manual warm-up successful, session saved")
+                            return True
+
+                        await page.wait_for_timeout(2000)
+
+                    print(f"❌ LinuxDoSession [{self.username_hash}]: Manual warm-up timeout")
+                    await save_page_content_to_file(page, "linuxdo_manual_warmup_timeout", f"session_{self.username_hash}")
+                    await take_screenshot(page, "linuxdo_manual_warmup_timeout", f"session_{self.username_hash}")
+                    return False
+                finally:
+                    await page.close()
+                    await context.close()
+        except Exception as exc:
+            print(f"❌ LinuxDoSession [{self.username_hash}]: Manual warm-up error: {exc}")
+            return False
 
 
 class LinuxDoSessionManager:

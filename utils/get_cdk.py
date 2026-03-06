@@ -16,7 +16,6 @@ from utils.http_utils import proxy_resolve, response_resolve
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig
-    from utils.linuxdo_session import LinuxDoSession
 
 # 超时配置（毫秒）
 TIMEOUT_PAGE_LOAD = 60000  # 页面加载超时
@@ -42,7 +41,9 @@ async def _get_fuli_session_cookies(account_config: "AccountConfig") -> dict | N
     """
     import hashlib
     import os
+
     from camoufox.async_api import AsyncCamoufox
+
     from utils.browser_utils import take_screenshot
     from utils.linuxdo_session import LinuxDoSessionManager
 
@@ -532,7 +533,9 @@ async def _b4u_browser_impl(account_config: "AccountConfig", username: str, pass
     """b4u 浏览器操作实现"""
     import hashlib
     import os
+
     from camoufox.async_api import AsyncCamoufox
+
     from utils.browser_utils import take_screenshot
     from utils.linuxdo_session import LinuxDoSessionManager
 
@@ -989,9 +992,17 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     linux_do = account_config.linux_do
     access_token = account_config.get("access_token")
 
-    # 检查是否有 linux_do 配置
+    # 如果有 access_token，先尝试使用它
+    if access_token:
+        print(f"ℹ️ {account_name}: Trying existing access_token for x666 checkin")
+        result = await _execute_x666_checkin_with_token(account_name, access_token, None)
+        if result:
+            return result
+        print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
+
+    # 检查是否有 linux_do 配置（仅在 token 不可用时才需要）
     if not linux_do:
-        print(f"❌ {account_name}: linux.do credentials not found for x666 checkin")
+        print(f"❌ {account_name}: linux.do credentials not found for x666 checkin fallback")
         return None
 
     username = linux_do.get("username")
@@ -1000,14 +1011,6 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     if not username or not password:
         print(f"❌ {account_name}: linux.do username or password not found")
         return None
-
-    # 如果有 access_token，先尝试使用它
-    if access_token:
-        print(f"ℹ️ {account_name}: Trying existing access_token for x666 checkin")
-        result = await _execute_x666_checkin_with_token(account_name, access_token, None)
-        if result:
-            return result
-        print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
 
     # 通过浏览器登录获取新 token（带重试机制）
     last_error = None
@@ -1036,7 +1039,9 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
     """x666 浏览器登录实现"""
     import hashlib
     import os
+
     from camoufox.async_api import AsyncCamoufox
+
     from utils.browser_utils import take_screenshot
     from utils.linuxdo_session import LinuxDoSessionManager
 
@@ -1411,7 +1416,9 @@ async def _fuli_wheel_browser_impl(account_config: "AccountConfig", username: st
     """fuli.hxi.me 大转盘浏览器操作实现"""
     import hashlib
     import os
+
     from camoufox.async_api import AsyncCamoufox
+
     from utils.browser_utils import take_screenshot
     from utils.linuxdo_session import LinuxDoSessionManager
 

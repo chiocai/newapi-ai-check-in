@@ -1,0 +1,95 @@
+# 格式：name | origin | mode | 可选 key=value
+# 模式：
+#   newapi                     标准 New-API 通用签到
+#   newapi-waf                 标准 New-API + 先过 CF/WAF
+#   auto                       登录后自动签到，无需额外签到请求
+#   auto-waf                   登录后自动签到 + 先过 CF/WAF
+#   signed:aiai_li             使用内置签名签到 URL
+#   special:b4u                b4u 特殊 CDK / topup 流程
+#   special:fuli_wheel         福利轮盘特殊流程
+#   manual:/api/user/checkin   非标准签到接口
+#   manual-waf:/api/user/sign_in  非标准签到接口 + 先过 CF/WAF
+#   turnstile:<site_key>       标准 New-API + Turnstile
+#
+# 说明：
+# - 必配：
+#   - `name`：站点唯一标识
+#   - `origin`：站点根地址
+#   - `mode`：站点签到模式（`auto` / `newapi` / `manual:/path` 等）
+# - 一般可自动处理：
+#   - `linuxdo_client_id`
+#   - `github_client_id`
+#   - `turnstile_site_key`
+#   - 自动发现结果优先写入 `storage-states/newapi-sites.runtime.json`
+# - 首次新增推荐最小配置：
+#   - 普通标准站点：`name | origin | newapi`
+#   - 自动签到站点：`name | origin | auto` 或 `auto-waf`
+#   - 非标准接口：`name | origin | manual:/path`
+#   - Turnstile 站点：`name | origin | turnstile`
+# - 建议手工填写以提高首次成功率（不是必需）：
+#   - `linuxdo_client_id`
+#   - `turnstile:<site_key>` 中的 `site_key`
+# - 以下字段通常只在特殊站点或已知差异站点需要手工配置：
+#   - `api_user_key`
+#   - `login_path`
+#   - `console_personal_path`
+#   - `status_path`
+#   - `auth_state_path`
+#   - `user_info_path`
+#   - `topup_path`
+#   - `linuxdo_auth_path`
+#   - `github_auth_path`
+#   - `aliyun_captcha=true`
+# - `special:*` 站点默认不会跟随全局 `linux.do` 自动展开；如需启用，请在 `ACCOUNTS.accounts` 中显式配置
+# - 每行一个站点，注释行以 `#` 开头
+# fuli_wheel | https://fuli.hxi.me | special:fuli_wheel
+
+
+anyrouter | https://anyrouter.top | auto-waf
+aipm | https://emtf.aipm9527.online | newapi
+api361888 | https://api.361888.xyz | newapi
+apitest | https://openai.api-test.us.ci | newapi
+codex661118 | https://codex.661118.xyz | newapi
+einzieg | https://api.einzieg.site | newapi-waf
+freestyle | https://api.freestyle.cc.cd | newapi
+gyapi | https://gyapi.zxiaoruan.cn | newapi-waf
+hotaruapi | https://hotaruapi.com | newapi
+huan666 | https://ai.huan666.de | newapi
+jarvisapi | https://ai.ctacy.cc | newapi
+jiuuij | https://jiuuij.de5.net | newapi
+kfcapi | https://kfc-api.sxxe.net | newapi
+lemonapi | https://justdoitme.me | turnstile
+linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf
+moyu | https://clove.cc.cd | newapi
+pryapi | https://api.vip.crond.dev | newapi-waf
+runawaytime | https://runanytime.hxi.me | newapi
+sorai | https://newapi.sorai.me | newapi
+wong | https://wzw.pp.ua | manual:/api/user/checkin
+dev88 | https://api.dev88.tech | newapi
+kegui | https://www.kegui.net | newapi
+lividness | https://api.livedless.com | newapi
+dgbmc | https://freeapi.dgbmc.top | newapi
+zapi | https://zapi.aicc0.com | newapi
+lxsummer | https://lx.lxsummer.cloud | newapi
+codexmakeup | https://codex.makeup | newapi
+anthorpic | https://anthorpic.us.ci | newapi
+CurryAPI | https://stephecurry.asia | newapi
+lufei | https://xgent.me | newapi
+LogosAPI | https://api.777114.xyz | newapi
+小辣椒 | https://yyds.215.im | newapi
+云端api | https://cloudapi.wdyu.eu.cc | newapi
+左大臣api | https://zuodachen.zdc.mom | newapi
+小呆api | https://api.daiju.live | newapi
+爱你api | https://x.ainiaini.xyz | newapi
+ibsgss | https://codex.ibsgss.uk | newapi
+xingyungept | https://ai.xingyungept.cn | newapi
+鱼汤公益站 | https://ai.zhansi.top | newapi
+溟如池鱼の公益站 | https://yiliya.shikinatsume.xyz | newapi
+Rosmontis | https://ai.rosmontis.de | newapi
+凉心の中转站 | https://open.lxcloud.dev | newapi
+NPCAPI | https://codex.hyw.me | newapi
+明天倒闭 | https://zmjjkk.us.ci | newapi
+Neb公益站 | https://ai.zzhdsgsss.xyz | newapi
+赶紧蹬 | https://bus.042999.xyz | newapi
+42API | https://api.42w.shop | newapi
+431128hys | https://newapi.431128hys.site | newapi

@@ -256,3 +256,259 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
         print(f"❌ {account_name}: Error occurred while getting traceid, {e}")
         await take_screenshot(page, "aliyun_captcha_error", account_name)
         return False
+
+
+async def wait_for_linuxdo_login_ready(page, account_name: str, timeout: int = 45000) -> None:
+    """等待 LinuxDo 登录页前端完全就绪
+
+    LinuxDo 当前登录页是 Ember 单页应用，表单元素会先渲染出来，
+    但登录按钮事件绑定可能稍后才完成。过早点击会停留在 `/login`，
+    且不会真正发出登录请求。
+    """
+    await page.wait_for_selector('#login-account-name', timeout=timeout)
+    await page.wait_for_function(
+        """() => {
+            return !!window.requirejs || !!window.Ember || !!document.querySelector('.ember-application');
+        }""",
+        timeout=timeout,
+    )
+    await page.wait_for_timeout(1500)
+    print(f"ℹ️ {account_name}: LinuxDo login page is ready")
+
+
+async def has_linuxdo_human_verification(page) -> bool:
+    """检测 LinuxDo 登录页是否出现 Human Verification / hCaptcha"""
+    snapshot = await get_linuxdo_human_verification_snapshot(page)
+    return classify_linuxdo_human_verification_snapshot(snapshot)['present']
+
+
+def classify_linuxdo_human_verification_snapshot(snapshot: dict) -> dict:
+    """根据页面快照判断 LinuxDo Human Verification 状态"""
+    token_values = [
+        value.strip()
+        for value in [
+            snapshot.get('hcaptcha_response'),
+            snapshot.get('grecaptcha_response'),
+            snapshot.get('iframe_response'),
+        ]
+        if isinstance(value, str)
+    ]
+    has_token = any(token_values)
+
+    present = bool(
+        snapshot.get('has_hcaptcha_modal')
+        or snapshot.get('has_hcaptcha_field')
+        or snapshot.get('verify_button_present')
+        or snapshot.get('iframe_count', 0) > 0
+        or snapshot.get('human_verification_title')
+    )
+
+    return {
+        'present': present,
+        'solved': bool(present and has_token),
+        'blocking': bool(present and not has_token),
+        'sitekey': snapshot.get('sitekey'),
+        'verify_button_disabled': bool(snapshot.get('verify_button_disabled')),
+        'verify_button_present': bool(snapshot.get('verify_button_present')),
+        'iframe_count': snapshot.get('iframe_count', 0),
+        'token_present': has_token,
+    }
+
+
+async def get_linuxdo_human_verification_snapshot(page) -> dict:
+    """采集 LinuxDo Human Verification 页面快照"""
+    return await page.evaluate(
+        """() => {
+            const hcaptchaIframe =
+                document.querySelector('iframe[data-hcaptcha-widget-id]') ||
+                document.querySelector('iframe[src*="hcaptcha.com"]') ||
+                document.querySelector('iframe[title*="hCaptcha"]');
+            const verifyButton = Array.from(document.querySelectorAll('button'))
+                .find(button => (button.innerText || '').trim().includes('Verify'));
+            const hcaptchaResponse = document.querySelector('textarea[name="h-captcha-response"]');
+            const grecaptchaResponse = document.querySelector('textarea[name="g-recaptcha-response"]');
+            const modalTitle = document.querySelector('#discourse-modal-title');
+            let sitekey = null;
+            if (hcaptchaIframe) {
+                const iframeSrc = hcaptchaIframe.getAttribute('src') || '';
+                if (iframeSrc) {
+                    try {
+                        const iframeUrl = new URL(iframeSrc, window.location.href);
+                        sitekey = iframeUrl.searchParams.get('sitekey');
+                    } catch (e) {}
+                }
+            }
+            return {
+                has_hcaptcha_modal: !!document.querySelector('.hcaptcha-verify-modal'),
+                has_hcaptcha_field: !!document.querySelector('#h-captcha-field'),
+                human_verification_title: (modalTitle?.innerText || '').trim(),
+                verify_button_present: !!verifyButton,
+                verify_button_disabled: !!verifyButton?.disabled,
+                iframe_count: document.querySelectorAll('iframe[data-hcaptcha-widget-id], iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha"]').length,
+                iframe_response: hcaptchaIframe?.getAttribute('data-hcaptcha-response') || '',
+                hcaptcha_response: hcaptchaResponse?.value || '',
+                grecaptcha_response: grecaptchaResponse?.value || '',
+                sitekey,
+            };
+        }"""
+    )
+
+
+async def try_bypass_linuxdo_human_verification(page, account_name: str, timeout: int = 20000) -> dict:
+    """尝试被动通过 LinuxDo Human Verification
+
+    这里只做页面内的被动尝试：
+    1. 检测现有 token
+    2. 点击 hCaptcha 复选框 iframe
+    3. 在按钮可用时点击 Verify
+
+    不接入第三方打码服务；若仍失败则走降级分支。
+    """
+    initial_snapshot = await get_linuxdo_human_verification_snapshot(page)
+    initial_state = classify_linuxdo_human_verification_snapshot(initial_snapshot)
+    if not initial_state['present']:
+        return {'present': False, 'solved': False, 'sitekey': None, 'reason': 'not_present'}
+    if initial_state['solved']:
+        print(f"✅ {account_name}: Human Verification token already present")
+        return {'present': True, 'solved': True, 'sitekey': initial_state['sitekey'], 'reason': 'token_present'}
+
+    print(
+        f"⚠️ {account_name}: Human Verification detected"
+        f"{', sitekey=' + initial_state['sitekey'] if initial_state['sitekey'] else ''}"
+    )
+
+    deadline = datetime.now().timestamp() + timeout / 1000
+    iframe_click_count = 0
+    verify_click_count = 0
+
+    while datetime.now().timestamp() < deadline:
+        snapshot = await get_linuxdo_human_verification_snapshot(page)
+        state = classify_linuxdo_human_verification_snapshot(snapshot)
+        if not state['present']:
+            print(f"✅ {account_name}: Human Verification dialog disappeared")
+            return {'present': True, 'solved': True, 'sitekey': state['sitekey'], 'reason': 'dialog_disappeared'}
+        if state['solved']:
+            print(f"✅ {account_name}: Human Verification token captured")
+            return {'present': True, 'solved': True, 'sitekey': state['sitekey'], 'reason': 'token_captured'}
+
+        if iframe_click_count < 2 and state['iframe_count'] > 0:
+            iframe_locator = page.locator(
+                'iframe[data-hcaptcha-widget-id], iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha"]'
+            ).first
+            iframe = await iframe_locator.bounding_box()
+            if iframe:
+                await page.mouse.click(iframe['x'] + iframe['width'] / 2, iframe['y'] + iframe['height'] / 2)
+                iframe_click_count += 1
+                print(f"ℹ️ {account_name}: Clicked hCaptcha iframe center ({iframe_click_count}/2)")
+                await page.wait_for_timeout(4000)
+                continue
+
+        if verify_click_count < 2 and snapshot.get('verify_button_present') and not snapshot.get('verify_button_disabled'):
+            verify_button = page.get_by_role('button', name='Verify')
+            if await verify_button.count():
+                await verify_button.click()
+                verify_click_count += 1
+                print(f"ℹ️ {account_name}: Clicked Verify button ({verify_click_count}/2)")
+                await page.wait_for_timeout(3000)
+                continue
+
+        await page.wait_for_timeout(1000)
+
+    final_snapshot = await get_linuxdo_human_verification_snapshot(page)
+    final_state = classify_linuxdo_human_verification_snapshot(final_snapshot)
+    return {
+        'present': final_state['present'],
+        'solved': final_state['solved'],
+        'sitekey': final_state['sitekey'],
+        'reason': 'timeout',
+        'verify_button_disabled': final_state['verify_button_disabled'],
+        'iframe_count': final_state['iframe_count'],
+    }
+
+
+async def get_linuxdo_hcaptcha_response(page) -> str:
+    """获取 LinuxDo 页面中的 hCaptcha 响应 token"""
+    selectors = [
+        'textarea[name="h-captcha-response"]',
+        'input[name="h-captcha-response"]',
+        'textarea[name="g-recaptcha-response"]',
+        'input[name="g-recaptcha-response"]',
+    ]
+    for selector in selectors:
+        locator = page.locator(selector)
+        if await locator.count():
+            try:
+                value = await locator.first.input_value()
+            except Exception:
+                value = await locator.first.evaluate('(el) => el.value || el.textContent || ""')
+            if value:
+                return value
+    return ''
+
+
+def detect_linuxdo_page_guard_from_text(text: str) -> dict:
+    """从页面文本中检测 LinuxDo 的拦截类型"""
+    normalized = (text or '').lower()
+    return {
+        'human_verification': any(
+            keyword in normalized
+            for keyword in [
+                'human verification',
+                'hcaptcha',
+                'h-captcha',
+                'turnstile 正在检查用户环境',
+            ]
+        ),
+        'human_verification_sitekey': None,
+        'cloudflare_challenge': any(
+            keyword in normalized
+            for keyword in [
+                'just a moment',
+                'checking your browser',
+                '/cdn-cgi/challenge-platform/',
+                'challenge-platform',
+            ]
+        ),
+    }
+
+
+async def detect_linuxdo_page_guard(page) -> dict:
+    """检测当前 LinuxDo 页面是否被验证码或挑战页拦截"""
+    try:
+        page_text = await page.locator('body').inner_text()
+    except Exception:
+        page_text = ''
+
+    result = detect_linuxdo_page_guard_from_text(page_text)
+
+    snapshot = await get_linuxdo_human_verification_snapshot(page)
+    state = classify_linuxdo_human_verification_snapshot(snapshot)
+    if state['present']:
+        result['human_verification'] = True
+        result['human_verification_sitekey'] = state.get('sitekey')
+        result['human_verification_solved'] = state.get('solved')
+        result['human_verification_blocking'] = state.get('blocking')
+        result['human_verification_verify_button_disabled'] = state.get('verify_button_disabled')
+        result['human_verification_iframe_count'] = state.get('iframe_count')
+
+    try:
+        title = (await page.title()).lower()
+    except Exception:
+        title = ''
+
+    if 'just a moment' in title or 'challenge' in page.url.lower():
+        result['cloudflare_challenge'] = True
+
+    return result
+
+
+async def attempt_linuxdo_human_verification(page, account_name: str, timeout_ms: int = 25000) -> bool:
+    """尝试自动触发并等待 LinuxDo Human Verification 完成
+
+    说明：
+    - 不引入第三方打码服务
+    - 只做轻量自动尝试：点击 Verify / hCaptcha checkbox，并等待 token
+    - 若环境可信且站点允许，有机会自动通过；否则走明确降级
+    """
+    result = await try_bypass_linuxdo_human_verification(page, account_name, timeout=timeout_ms)
+    return bool(result.get('solved'))

@@ -36,48 +36,107 @@ Affs:
 > 配置中 `cookies`、`github`、`linux.do` 必须至少配置 1 个。   
 > 使用 `cookies` 设置时，`api_user` 字段必填。
 
-示例：
+#### 最常用配置：只配全局 `linux.do`
+
+如果你只跑 `newapi-sites.txt` 里的普通 NewAPI 站点，**通常只需要配置全局 `linux.do` 账号列表**：
 
 ```json
-[
+{
+  "linux.do": [
     {
-      "name": "我的账号",
-      "cookies": {
-        "session": "account1_session_value"
-      },
-      "api_user": "account1_api_user_id"
-      "github": {
-        "username": "myuser",
-        "password": "mypass",
-      },
-      "linux.do": {
-        "username": "myuser",
-        "password": "mypass",
-      }
+      "username": "myuser",
+      "password": "mypass"
     },
     {
-      "name": "另一个账号",
-      "provider": "x666",
-      "proxy": {
-        "server": "http://username:password@proxy.example.com:8080"
-      }
-      "linux.do": {
-        "username": "user2",
-        "password": "pass2",
-      },
-      // 额外的配置说明
-      "access_token": "provider: x666 必须配置, 来自 https://qd.x666.me/"
-      "fuli_cookies": {
-        "session": "provider: runtimeaway 必须配置， 来自 https://fuli.hxi.me/"
-      }
+      "username": "user2",
+      "password": "pass2"
     }
   ]
+}
 ```
+
+脚本会自动把这些 LinuxDo 账号展开到 `newapi-sites.txt` 里的普通站点。
+
+#### 什么时候还需要 `accounts`
+
+只有下面这些情况，才通常需要额外写 `accounts`：
+
+- 你要启用 **特殊 provider**，例如 `special:x666`、`special:b4u`、`special:fuli_wheel`
+- 某个账号需要 **额外字段**，例如 `x666` 的 `access_token`
+- 某个账号要用 **单独代理**
+- 某个账号要用 **cookies / github** 登录，而不是全局 `linux.do`
+- 你只想启用少数特殊站点，不想跟随 `newapi-sites.txt` 自动展开
+
+像 `x666` 这种特殊站点，建议继续放在 `ACCOUNTS.accounts` 中单独控制，不再放进 `newapi-sites.txt`。
+
+如果你还希望在 `token` 失效后，自动回退到 LinuxDo 浏览器登录刷新 token，也应该继续用下面这种 `accounts` 写法：
+
+示例：给 `x666` 单独配置额外参数
+
+```json
+{
+  "linux.do": [
+    {
+      "username": "myuser",
+      "password": "mypass"
+    }
+  ],
+  "accounts": [
+    {
+      "provider": "x666",
+      "linux.do": {
+        "username": "special_user",
+        "password": "special_pass"
+      },
+      "access_token": "provider: x666 推荐配置"
+    }
+  ]
+}
+```
+
+如果你有 **两个 `x666` 账号 / token**，就继续在 `accounts` 里写两条：
+
+```json
+{
+  "linux.do": [
+    {
+      "username": "myuser",
+      "password": "mypass"
+    }
+  ],
+  "accounts": [
+    {
+      "name": "x666-1",
+      "provider": "x666",
+      "linux.do": {
+        "username": "special_user_1",
+        "password": "special_pass_1"
+      },
+      "access_token": "第一个x666_access_token"
+    },
+    {
+      "name": "x666-2",
+      "provider": "x666",
+      "linux.do": {
+        "username": "special_user_2",
+        "password": "special_pass_2"
+      },
+      "access_token": "第二个x666_access_token"
+    }
+  ]
+}
+```
+
+说明：
+
+- `accounts` 里每一条 `x666` 都会作为一个独立账号运行
+- `name` 建议显式填写，方便通知里区分两个 `x666` 账号
+- 如果某条 `access_token` 失效，该条账号仍可尝试用它自己的 `linux.do` 配置回退登录刷新
 
 #### 字段说明：
 
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
-- `provider` (可选)：供应商，内置 `anyrouter`、`agentrouter`、`wong`、`huan666`、 `x666`, `runawaytime` `aiai.li`, 默认使用 `anyrouter`
+- `provider` (可选)：特殊站点或独立 provider；普通 NewAPI 站点建议改 `newapi-sites.txt`
 - `proxy` (可选)：单个账号代理配置，支持 `http`、`socks5` 代理
 - `cookies`(可选)：用于身份验证的 cookies 数据
 - `api_user`(cookies 设置时必需)：用于请求头的 new-api-user 参数
@@ -88,11 +147,30 @@ Affs:
   - `username`: 用户名
   - `password`: 密码
 
-#### 供应商配置：
+#### NewAPI 站点配置（推荐）
 
-在仓库的 Settings -> Environments -> production -> Environment secrets 中添加：
-   - Name: `PROVIDERS`
-   - Value: 供应商
+普通 NewAPI 站点不再需要写进 `ACCOUNTS` 或 `PROVIDERS`，直接维护仓库根目录的 `newapi-sites.txt`：
+
+```txt
+agentrouter | https://agentrouter.org | newapi
+wong | https://wzw.pp.ua | manual:/api/user/checkin
+linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf
+lemonapi | https://justdoitme.me | turnstile
+```
+
+- `newapi`：标准 New-API 通用签到
+- `auto`：登录后自动签到，无需额外请求签到接口
+- `manual:/path`：非标准签到接口
+- `newapi-waf` / `manual-waf:/path` / `auto-waf`：需要无头浏览器先过 CF / WAF
+- `turnstile:<site_key>`：需要 Turnstile
+- 可选 `linuxdo_client_id=...`、`github_client_id=...`、`turnstile_site_key=...`；不写时脚本会尝试自动获取
+- 自动发现到的 `linuxdo_client_id`、`turnstile_site_key` 等会写入 `storage-states/newapi-sites.runtime.json`
+- `newapi-sites.txt` 中：
+  - **必配**：`name | origin | mode`
+  - **通常可自动发现**：`linuxdo_client_id`、`github_client_id`、`turnstile_site_key`
+  - **特殊站点才常需手工写**：`api_user_key`、`login_path`、`console_personal_path`、`status_path`、`auth_state_path`、`user_info_path`、`topup_path`
+
+`PROVIDERS` 环境变量仍可用于临时覆盖或追加特殊 provider，但日常新增/删除站点建议只改 `newapi-sites.txt`。
 
 
 #### 代理配置
@@ -222,6 +300,28 @@ python3 -m camoufox fetch
 # 按 .env.example 创建 .env
 uv run main.py
 ```
+
+## 手工预热 LinuxDo 会话
+
+如果某些站点登录时被 `LinuxDo` 的 `Human Verification / hCaptcha` 拦截，可以先手工预热会话，再让签到脚本复用缓存：
+
+```bash
+uv run python prepare_linuxdo_session.py
+```
+
+只预热某一个 LinuxDo 账号：
+
+```bash
+uv run python prepare_linuxdo_session.py --username your_linuxdo_username
+```
+
+说明：
+
+- 脚本会打开可见浏览器
+- 会自动预填账号密码
+- 你只需要在浏览器里手工完成登录 / 验证
+- 成功后会保存到 `storage-states/linuxdo_<hash>_storage_state.json`
+- 后续普通签到流程会优先复用这份会话缓存
 
 ## 测试
 

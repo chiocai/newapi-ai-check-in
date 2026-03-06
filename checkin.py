@@ -133,8 +133,8 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    print(f"ℹ️ {self.account_name}: Access login page to get initial cookies")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+                    print(f"ℹ️ {self.account_name}: Access console/personal page to get initial cookies")
+                    await page.goto(self.provider_config.get_console_personal_url(), wait_until="networkidle")
 
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
@@ -196,8 +196,8 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    print(f"ℹ️ {self.account_name}: Access login page to get initial cookies")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+                    print(f"ℹ️ {self.account_name}: Access console/personal page to get initial cookies")
+                    await page.goto(self.provider_config.get_console_personal_url(), wait_until="networkidle")
 
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
@@ -366,8 +366,8 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    print(f"ℹ️ {self.account_name}: Access status page to get status from localStorage")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+                    print(f"ℹ️ {self.account_name}: Access console/personal page to get status from localStorage")
+                    await page.goto(self.provider_config.get_console_personal_url(), wait_until="networkidle")
 
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
@@ -502,9 +502,9 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. Open the login page first (使用 domcontentloaded 避免等待过长)
-                    print(f"ℹ️ {self.account_name}: Opening login page")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="domcontentloaded")
+                    # 1. Open console/personal first，部分站点需从这里跳转后才会出现 LinuxDo 登录按钮
+                    print(f"ℹ️ {self.account_name}: Opening console/personal page")
+                    await page.goto(self.provider_config.get_console_personal_url(), wait_until="domcontentloaded")
 
                     # 等待页面稳定，避免执行上下文被销毁
                     await page.wait_for_timeout(3000)

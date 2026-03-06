@@ -9,6 +9,7 @@ import json
 import sys
 from datetime import datetime
 from itertools import groupby
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -17,6 +18,7 @@ from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
 from utils.linuxdo_session import LinuxDoSessionManager
 from utils.notify import notify
+from utils.site_discovery import ensure_runtime_site_overrides
 
 load_dotenv(override=True)
 
@@ -67,11 +69,16 @@ async def process_single_account(
             "account_name": account_name,
             "account_index": account_index,
             "provider": "",
+            "site_origin": "",
             "success": False,
+            "status": "failed",
             "results": [],
             "balances": {},
             "notification": "",
             "need_notify": False,
+            "successful_methods": [],
+            "failed_methods": [],
+            "error_summary": None,
             "error": None,
         }
 
@@ -82,8 +89,10 @@ async def process_single_account(
                 print(f"❌ {account_name}: Provider '{account_config.provider}' configuration not found")
                 result["need_notify"] = True
                 result["notification"] = f"[FAIL] {account_name}: Provider '{account_config.provider}' configuration not found"
+                result["error_summary"] = f"Provider '{account_config.provider}' configuration not found"
                 result["error"] = f"Provider '{account_config.provider}' not found"
                 return result
+            result["site_origin"] = provider_config.origin
 
             print(f"🌀 Processing {account_name} using provider '{account_config.provider}'\n")
 
@@ -108,6 +117,7 @@ async def process_single_account(
             account_success = False
             successful_methods = []
             failed_methods = []
+            failed_details = []
             this_account_balances = {}
 
             # 构建单行结果
@@ -166,6 +176,7 @@ async def process_single_account(
                 else:
                     failed_methods.append(auth_method)
                     error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
+                    failed_details.append(str(error_msg)[:60])
                     line_parts.append(str(error_msg)[:60])
 
             # 生成单行通知
@@ -179,6 +190,16 @@ async def process_single_account(
             result["success"] = account_success
             result["balances"] = this_account_balances
             result["notification"] = account_result
+            result["successful_methods"] = successful_methods
+            result["failed_methods"] = failed_methods
+            result["error_summary"] = failed_details[0] if failed_details else None
+            if account_success and failed_methods:
+                result["status"] = "partial"
+            elif account_success:
+                result["status"] = "success"
+            else:
+                result["status"] = "failed"
+                result["error"] = result["error_summary"] or result["error"]
 
             # 如果所有认证方式都失败，需要通知
             if not account_success and results:
@@ -194,9 +215,70 @@ async def process_single_account(
             print(f"❌ {account_name} processing exception: {e}")
             result["need_notify"] = True
             result["notification"] = f"❌ {account_name}: {str(e)[:80]}"
+            result["error_summary"] = str(e)[:80]
             result["error"] = str(e)
 
         return result
+
+
+def get_site_label(provider_name: str, site_origin: str | None = None) -> str:
+    """获取站点展示名称"""
+    if site_origin:
+        host = urlparse(site_origin).netloc
+        if host:
+            return host
+    return provider_name or "unknown-site"
+
+
+def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
+    """按站点聚合通知内容"""
+    grouped_results = []
+
+    for provider, group in groupby(sorted_results, key=lambda x: x.get("provider", "")):
+        site_results = list(group)
+        site_origin = next((item.get("site_origin") for item in site_results if item.get("site_origin")), "")
+        site_label = get_site_label(provider, site_origin)
+        total_accounts = len(site_results)
+        success_accounts = sum(1 for item in site_results if item.get("success"))
+
+        detail_parts = []
+        for item in site_results:
+            status = item.get("status")
+            if status == "failed":
+                reason = item.get("error_summary") or item.get("error") or "未知错误"
+                detail_parts.append(f"{item['account_name']}: {str(reason)[:40]}")
+            elif status == "partial":
+                failed_methods = ", ".join(item.get("failed_methods") or [])
+                if failed_methods:
+                    detail_parts.append(f"{item['account_name']}: 部分失败({failed_methods})")
+                else:
+                    detail_parts.append(f"{item['account_name']}: 部分失败")
+
+        if success_accounts == total_accounts and not detail_parts:
+            icon = "✅"
+        elif success_accounts > 0:
+            icon = "⚠️"
+        else:
+            icon = "❌"
+
+        line = f"{icon} {site_label}: {success_accounts}/{total_accounts} 账号签到成功"
+        if detail_parts:
+            brief = "；".join(detail_parts[:2])
+            if len(detail_parts) > 2:
+                brief += f"；其余 {len(detail_parts) - 2} 个账号请看日志"
+            line = f"{line} | {brief}"
+
+        grouped_results.append(
+            {
+                "provider": provider,
+                "site_label": site_label,
+                "line": line,
+                "success_accounts": success_accounts,
+                "total_accounts": total_accounts,
+            }
+        )
+
+    return grouped_results
 
 
 async def main():
@@ -218,6 +300,10 @@ async def main():
         return 1
 
     print(f"⚙️ Found {len(app_config.accounts)} account(s)")
+
+    discovered_runtime_overrides = await ensure_runtime_site_overrides(app_config)
+    if discovered_runtime_overrides:
+        print(f"⚙️ Runtime site overrides updated for {len(discovered_runtime_overrides)} site(s)")
 
     # 预登录所有 Linux.do 账号（会话共享优化）
     linuxdo_usernames = set()
@@ -259,9 +345,6 @@ async def main():
     account_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 汇总结果
-    success_count = 0
-    total_count = 0
-    notification_lines = []
     current_balances = {}
     need_notify = False
 
@@ -272,12 +355,6 @@ async def main():
     )
 
     for result in sorted_results:
-        # 统计结果
-        for auth_result in result.get("results", []):
-            total_count += 1
-            if auth_result[1] and auth_result[2] and auth_result[2].get("success"):
-                success_count += 1
-
         # 收集余额信息
         if result.get("success") and result.get("balances"):
             current_balances[result["account_key"]] = result["balances"]
@@ -286,23 +363,8 @@ async def main():
         if result.get("need_notify"):
             need_notify = True
 
-    # 按 provider 分组（保持原有排序）
-    grouped = []
-    for provider, group in groupby(sorted_results, key=lambda x: x.get("provider", "")):
-        grouped.append(list(group))
-
-    # 智能合并：多账号 provider 前后加空行，单账号 provider 连续排列
-    for i, group in enumerate(grouped):
-        is_multi = len(group) >= 2
-        prev_is_multi = len(grouped[i - 1]) >= 2 if i > 0 else False
-
-        # 在多账号组前加空行（除非是第一组）
-        if i > 0 and (is_multi or prev_is_multi):
-            notification_lines.append("")
-
-        for result in group:
-            if result.get("notification"):
-                notification_lines.append(result["notification"])
+    grouped_notifications = build_site_notification_groups(sorted_results)
+    notification_lines = [item["line"] for item in grouped_notifications]
 
     # 处理异常结果
     for result in account_results:
@@ -329,14 +391,23 @@ async def main():
 
     if need_notify and notification_lines:
         # 构建通知内容
-        failed_count = total_count - success_count
-        if success_count == total_count:
+        total_accounts = len(sorted_results)
+        success_accounts = sum(1 for result in sorted_results if result.get("success"))
+        total_sites = len(grouped_notifications)
+        success_sites = sum(
+            1 for item in grouped_notifications if item["success_accounts"] == item["total_accounts"]
+        )
+
+        if success_accounts == total_accounts:
             status_icon = "✅"
-        elif success_count > 0:
+        elif success_accounts > 0:
             status_icon = "⚠️"
         else:
             status_icon = "❌"
-        summary_line = f"📊 成功 {success_count}/{total_count} | 失败 {failed_count}/{total_count} {status_icon}"
+        summary_line = (
+            f"📊 站点全成功 {success_sites}/{total_sites} | "
+            f"账号成功 {success_accounts}/{total_accounts} {status_icon}"
+        )
 
         time_info = f'⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
@@ -349,7 +420,8 @@ async def main():
         print("ℹ️ All accounts successful and no balance changes detected, notification skipped")
 
     # 设置退出码
-    sys.exit(0 if success_count > 0 else 1)
+    success_accounts = sum(1 for result in sorted_results if result.get("success"))
+    sys.exit(0 if success_accounts > 0 else 1)
 
 
 def run_main():
