@@ -153,6 +153,7 @@ Affs:
 
 ```txt
 agentrouter | https://agentrouter.org | newapi
+anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=...
 wong | https://wzw.pp.ua | manual:/api/user/checkin
 linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf
 lemonapi | https://justdoitme.me | turnstile
@@ -163,6 +164,7 @@ lemonapi | https://justdoitme.me | turnstile
 - `manual:/path`：非标准签到接口
 - `newapi-waf` / `manual-waf:/path` / `auto-waf`：需要无头浏览器先过 CF / WAF
 - `turnstile:<site_key>`：需要 Turnstile
+- `anyrouter` 当前建议继续按旧逻辑配置为 `manual-waf:/api/user/sign_in`，不要改成 `auto-waf`
 - 可选 `linuxdo_client_id=...`、`github_client_id=...`、`turnstile_site_key=...`；不写时脚本会尝试自动获取
 - 自动发现到的 `linuxdo_client_id`、`turnstile_site_key` 等会写入 `storage-states/newapi-sites.runtime.json`
 - `newapi-sites.txt` 中：

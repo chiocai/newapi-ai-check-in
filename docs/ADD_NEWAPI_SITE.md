@@ -66,6 +66,7 @@ name | origin | mode | 可选 key=value
 
 ```txt
 agentrouter | https://agentrouter.org | newapi
+anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=...
 wong | https://wzw.pp.ua | manual:/api/user/checkin
 linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf
 lemonapi | https://justdoitme.me | turnstile
@@ -86,6 +87,11 @@ lemonapi | https://justdoitme.me | turnstile
 - `topup_path=...`
 - `linuxdo_auth_path=...`
 - `github_auth_path=...`
+
+特殊说明：
+
+- `anyrouter` 当前建议继续按旧逻辑配置为 `manual-waf:/api/user/sign_in`
+- 原因是该站点对 WAF / 登录态更敏感，直接沿用历史稳定配置更稳
 
 ## 4. 本地验证
 

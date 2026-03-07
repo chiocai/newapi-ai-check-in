@@ -45,7 +45,7 @@
 # fuli_wheel | https://fuli.hxi.me | special:fuli_wheel
 
 
-anyrouter | https://anyrouter.top | auto-waf
+anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=8w2uZtoWH9AUXrZr1qeCEEmvXLafea3c | topup_path=/api/user/topup
 aipm | https://emtf.aipm9527.online | newapi
 api361888 | https://api.361888.xyz | newapi
 apitest | https://openai.api-test.us.ci | newapi
