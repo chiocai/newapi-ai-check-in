@@ -82,6 +82,7 @@ async def process_single_account(
             "successful_methods": [],
             "failed_methods": [],
             "error_summary": None,
+            "success_detail": None,
             "error": None,
         }
 
@@ -196,6 +197,7 @@ async def process_single_account(
             result["successful_methods"] = successful_methods
             result["failed_methods"] = failed_methods
             result["error_summary"] = failed_details[0] if failed_details else None
+            result["success_detail"] = line_parts[0] if account_success and line_parts else None
             if account_success and failed_methods:
                 result["status"] = "partial"
             elif account_success:
@@ -348,6 +350,7 @@ def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
         success_accounts = sum(1 for item in site_results if item.get("success"))
 
         detail_parts = []
+        success_detail_parts = []
         for item in site_results:
             status = item.get("status")
             if status == "failed":
@@ -359,6 +362,8 @@ def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
                     detail_parts.append(f"{item['account_name']}: 部分失败({failed_methods})")
                 else:
                     detail_parts.append(f"{item['account_name']}: 部分失败")
+            elif item.get("success_detail") and provider in {"x666", "anyrouter"}:
+                success_detail_parts.append(f"{item['account_name']}: {item['success_detail']}")
 
         if success_accounts == total_accounts and not detail_parts:
             icon = "✅"
@@ -368,6 +373,8 @@ def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
             icon = "❌"
 
         line = f"{icon} {site_label}: {success_accounts}/{total_accounts} 账号签到成功"
+        if success_detail_parts:
+            line = f"{line} | {'；'.join(success_detail_parts[:2])}"
         if detail_parts:
             brief = "；".join(detail_parts[:2])
             if len(detail_parts) > 2:

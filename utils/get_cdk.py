@@ -1042,26 +1042,21 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
 
     from camoufox.async_api import AsyncCamoufox
 
-    from utils.browser_utils import take_screenshot
+    from utils.browser_utils import save_page_content_to_file, take_screenshot
     from utils.linuxdo_session import LinuxDoSessionManager
 
     account_name = account_config.get_display_name()
     print(f"ℹ️ {account_name}: Starting browser login for x666 checkin")
 
-    # 尝试获取共享的 Linux.do 会话
-    shared_session = LinuxDoSessionManager.get_cached_session(username)
-
-    # 确定 storage_state 来源：优先使用共享会话
     storage_state_dir = "storage-states"
     os.makedirs(storage_state_dir, exist_ok=True)
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+    x666_cache_file_path = f"{storage_state_dir}/x666_linuxdo_{username_hash}_storage_state.json"
 
-    if shared_session:
-        cache_file_path = shared_session.get_storage_state_path()
-        print(f"ℹ️ {account_name}: Using shared Linux.do session for x666")
-    else:
-        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-        cache_file_path = f"{storage_state_dir}/x666_linuxdo_{username_hash}_storage_state.json"
-        print(f"ℹ️ {account_name}: No shared session, using standalone cache for x666")
+    # 强制复用当前更稳的 LinuxDoSession 逻辑
+    shared_session = await LinuxDoSessionManager.get_session(username, password, auto_login=True)
+    cache_file_path = shared_session.get_storage_state_path()
+    print(f"ℹ️ {account_name}: Using shared Linux.do session for x666")
 
     try:
         async with AsyncCamoufox(
@@ -1069,8 +1064,8 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
             humanize=True,
             locale="en-US",
         ) as browser:
-            # 加载缓存的 storage state
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            # 优先恢复 x666 自己的缓存，没有则复用 LinuxDo 已预热 session
+            storage_state = x666_cache_file_path if os.path.exists(x666_cache_file_path) else cache_file_path
             if storage_state:
                 print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
             else:
@@ -1080,10 +1075,8 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
             page = await context.new_page()
 
             try:
-                is_logged_in = False
-
                 # 如果有缓存，先尝试直接访问 up.x666.me 检查是否已登录
-                if os.path.exists(cache_file_path):
+                if os.path.exists(x666_cache_file_path):
                     print(f"ℹ️ {account_name}: Checking login status on up.x666.me")
                     await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
                     await page.wait_for_timeout(2000)
@@ -1095,75 +1088,10 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                         result = await _execute_x666_checkin_with_token(account_name, token, None)
                         if result:
                             print(f"✅ {account_name}: Token from cache is valid")
-                            await context.storage_state(path=cache_file_path)
+                            await context.storage_state(path=x666_cache_file_path)
                             return result
                         print(f"ℹ️ {account_name}: Cached token expired, need to re-login")
-
-                # 参考 sign_in_with_linuxdo.py：先直接访问 linux.do/login 登录
-                if not is_logged_in:
-                    print(f"ℹ️ {account_name}: Starting to sign in linux.do")
-                    await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(1500)
-
-                    # 检查是否遇到 Cloudflare 人机验证页面
-                    page_title = await page.title()
-                    if "Just a moment" in page_title or "Verify" in page_title:
-                        print(f"⚠️ {account_name}: Cloudflare human verification detected, waiting for completion...")
-                        try:
-                            # 等待 Cloudflare 验证完成（页面标题变化）
-                            await page.wait_for_function(
-                                "!document.title.includes('Just a moment') && !document.title.includes('Verify')",
-                                timeout=TIMEOUT_CLOUDFLARE
-                            )
-                            await page.wait_for_timeout(2000)  # 额外等待页面稳定
-                            print(f"✅ {account_name}: Cloudflare verification completed")
-                        except Exception as cf_err:
-                            print(f"❌ {account_name}: Cloudflare verification timeout: {cf_err}")
-                            await take_screenshot(page, "x666_cloudflare_timeout", account_name)
-                            return None
-
-                    # 检查当前页面状态
-                    current_url = page.url
-                    # 如果已经登录（被重定向到首页），跳过登录流程
-                    if "linux.do/login" not in current_url and "linux.do" in current_url:
-                        print(f"✅ {account_name}: Already logged in to linux.do (redirected to {current_url})")
-                    else:
-                        # 等待登录表单加载
-                        try:
-                            await page.wait_for_selector("#login-account-name", timeout=TIMEOUT_ELEMENT_WAIT)
-                        except Exception:
-                            print(f"⚠️ {account_name}: Login form not found, page may be loading slowly")
-                            await page.wait_for_timeout(2000)
-
-                        # 填写登录凭据
-                        print(f"ℹ️ {account_name}: Filling credentials")
-                        await page.fill("#login-account-name", username, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(500)
-                        await page.fill("#login-account-password", password, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(500)
-                        await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                        # 等待登录完成
-                        try:
-                            await page.wait_for_selector(".current-user", timeout=15000)
-                        except Exception:
-                            await page.wait_for_timeout(3000)
-
-                        # 检查登录结果
-                        current_url = page.url
-                        print(f"ℹ️ {account_name}: URL after login: {current_url}")
-
-                        # 检查是否遇到 Cloudflare 验证
-                        if "linux.do/challenge" in current_url:
-                            print(f"⚠️ {account_name}: Cloudflare challenge detected, waiting for Camoufox to bypass...")
-                            try:
-                                await page.wait_for_url("https://linux.do/", timeout=TIMEOUT_CLOUDFLARE)
-                                print(f"✅ {account_name}: Cloudflare challenge bypassed")
-                            except Exception:
-                                print(f"⚠️ {account_name}: Cloudflare challenge timeout")
-
-                    # 保存登录状态
-                    await context.storage_state(path=cache_file_path)
-                    print(f"✅ {account_name}: Storage state saved to cache file")
+                print(f"ℹ️ {account_name}: Shared Linux.do session is ready, continue OAuth on up.x666.me")
 
                 # 登录成功后，访问 up.x666.me 触发 OAuth 获取 token
                 print(f"ℹ️ {account_name}: Navigating to up.x666.me to get token")
@@ -1178,7 +1106,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 token = await page.evaluate("() => localStorage.getItem('userToken')")
                 if token:
                     print(f"✅ {account_name}: Got token from up.x666.me")
-                    await context.storage_state(path=cache_file_path)
+                    await context.storage_state(path=x666_cache_file_path)
                     result = await _execute_x666_checkin_with_token(account_name, token, None)
                     return result
 
@@ -1208,6 +1136,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                             await page.wait_for_timeout(2000)
                     except Exception as e:
                         print(f"⚠️ {account_name}: OAuth approve failed: {e}")
+                        await save_page_content_to_file(page, "x666_oauth_approve_failed", account_name, prefix="x666")
                         await take_screenshot(page, "x666_oauth_approve_failed", account_name)
 
                 # 等待回调完成
@@ -1223,16 +1152,18 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 token = await page.evaluate("() => localStorage.getItem('userToken')")
                 if token:
                     print(f"✅ {account_name}: Successfully got token via browser login")
-                    await context.storage_state(path=cache_file_path)
+                    await context.storage_state(path=x666_cache_file_path)
                     result = await _execute_x666_checkin_with_token(account_name, token, None)
                     return result
 
                 print(f"❌ {account_name}: Failed to get token after login")
+                await save_page_content_to_file(page, "x666_login_failed", account_name, prefix="x666")
                 await take_screenshot(page, "x666_login_failed", account_name)
                 return None
 
             except Exception as e:
                 print(f"❌ {account_name}: Error in browser login: {e}")
+                await save_page_content_to_file(page, "x666_error", account_name, prefix="x666")
                 await take_screenshot(page, "x666_error", account_name)
                 return None
             finally:

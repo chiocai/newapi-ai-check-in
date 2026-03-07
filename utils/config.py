@@ -184,6 +184,10 @@ class ProviderConfig:
 				cdks = result.get('cdks', [])
 				if cdks:
 					yield (cdks, result)
+				else:
+					yield ([], result)
+			elif isinstance(result, dict):
+				yield ([], result)
 			elif isinstance(result, list):
 				yield (result, result)
 			else:

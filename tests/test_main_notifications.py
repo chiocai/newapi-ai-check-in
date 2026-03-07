@@ -4,6 +4,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from checkin import should_rebuild_provider_cache
 from main import (
 	apply_waf_runtime_overrides_for_failed_accounts,
 	build_site_notification_groups,
@@ -74,6 +75,33 @@ def test_build_site_notification_groups_includes_failure_summary():
 	assert 'beta-1: 部分失败(github)' in groups[0]['line']
 	assert 'beta-2: 401 Unauthorized' in groups[0]['line']
 	assert '$' not in groups[0]['line']
+
+
+def test_build_site_notification_groups_shows_success_detail_for_x666_and_anyrouter():
+	sorted_results = [
+		{
+			'provider': 'x666',
+			'site_origin': 'https://x666.me',
+			'account_name': 'x666-1',
+			'success': True,
+			'status': 'success',
+			'success_detail': '🎰 +$75.0 | $0',
+		},
+		{
+			'provider': 'x666',
+			'site_origin': 'https://x666.me',
+			'account_name': 'x666-2',
+			'success': True,
+			'status': 'success',
+			'success_detail': '🎰 +$1800.0 | $0',
+		},
+	]
+
+	groups = build_site_notification_groups(sorted_results)
+
+	assert groups[0]['line'].startswith('✅ x666.me: 2/2 账号签到成功 | ')
+	assert 'x666-1: 🎰 +$75.0 | $0' in groups[0]['line']
+	assert 'x666-2: 🎰 +$1800.0 | $0' in groups[0]['line']
 
 
 def test_collect_failed_account_indices():
@@ -158,3 +186,9 @@ def test_apply_waf_runtime_overrides_for_failed_accounts(monkeypatch, tmp_path):
 
 	assert updated == ['alpha']
 	assert app.provider.bypass_method == 'waf_cookies'
+
+
+def test_should_rebuild_provider_cache_for_anyrouter_html_like_error():
+	assert should_rebuild_provider_cache('anyrouter', 'Failed to get user info: Invalid response type') is True
+	assert should_rebuild_provider_cache('anyrouter', 'Failed to get user info: HTTP 403') is True
+	assert should_rebuild_provider_cache('aipm', 'other random error') is False

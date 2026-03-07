@@ -87,6 +87,36 @@ def _save_provider_session_cache(cache_path: str, cookies: dict, api_user: str |
         return False
 
 
+def should_rebuild_provider_cache(provider_name: str, error_msg: str) -> bool:
+    """判断是否应丢弃 provider cache 并重建"""
+    normalized = (error_msg or "").lower()
+    common_keywords = [
+        "unauthorized",
+        "401",
+        "session",
+        "invalid response format",
+        "invalid response type",
+        "failed to get user info",
+        "waf",
+        "未登录",
+        "无权",
+        "access token",
+    ]
+    if any(keyword in normalized for keyword in common_keywords):
+        return True
+
+    if provider_name == "anyrouter":
+        anyrouter_keywords = [
+            "http 403",
+            "403",
+            "text/html",
+            "html response",
+        ]
+        return any(keyword in normalized for keyword in anyrouter_keywords)
+
+    return False
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -1393,25 +1423,30 @@ class CheckIn:
             # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
             if not success and "error" in result:
                 error_msg = result.get("error", "").lower()
-                # 检测需要重新认证的错误类型（支持中英文错误信息）
-                retry_keywords = [
-                    "unauthorized",
-                    "401",
-                    "session",
-                    "invalid response format",
-                    "invalid response type",
-                    "failed to get user info",
-                    "waf",
-                    "未登录",
-                    "无权",
-                    "access token",
-                ]
-                if any(keyword in error_msg for keyword in retry_keywords):
+                if should_rebuild_provider_cache(self.provider_config.name, error_msg):
                     print(f"⚠️ {self.account_name}: Cached session may be expired or WAF challenge, clearing cache and re-authenticating")
                     try:
                         os.remove(provider_cache_path)
                     except Exception:
                         pass
+                    if self.provider_config.name == "anyrouter":
+                        from utils.linuxdo_session import LinuxDoSessionManager
+
+                        print(f"ℹ️ {self.account_name}: anyrouter cache invalid, forcing LinuxDo shared session rebuild")
+                        refreshed_session = await LinuxDoSessionManager.get_session(
+                            username,
+                            password,
+                            proxy=self.camoufox_proxy_config,
+                            auto_login=True,
+                        )
+                        if not getattr(refreshed_session, "is_logged_in", False):
+                            return False, {
+                                "error": (
+                                    "anyrouter provider cache invalid and LinuxDo shared session is not warmed. "
+                                    "Please run `uv run python prepare_linuxdo_session.py` first"
+                                )
+                            }
+                        self.linuxdo_session = refreshed_session
                     # 继续执行下面的 OAuth 流程
                 else:
                     return success, result
