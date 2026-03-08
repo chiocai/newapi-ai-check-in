@@ -1064,6 +1064,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
     # 强制复用当前更稳的 LinuxDoSession 逻辑
     shared_session = await LinuxDoSessionManager.get_session(username, password, auto_login=True)
     cache_file_path = shared_session.get_storage_state_path()
+    shared_session_state = await shared_session.get_storage_state()
     print(f"ℹ️ {account_name}: Using shared Linux.do session for x666")
 
     try:
@@ -1072,19 +1073,21 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
             humanize=True,
             locale="en-US",
         ) as browser:
-            def load_storage_state(path: str) -> dict | None:
-                if not path or not os.path.exists(path):
+            def load_storage_state(source: dict | str | None) -> dict | None:
+                if isinstance(source, dict):
+                    return source
+                if not source or not os.path.exists(source):
                     return None
                 try:
-                    with open(path, 'r', encoding='utf-8') as f:
+                    with open(source, 'r', encoding='utf-8') as f:
                         return json.load(f)
                 except Exception as load_err:
-                    print(f"⚠️ {account_name}: Failed to load storage state {path}: {load_err}")
+                    print(f"⚠️ {account_name}: Failed to load storage state {source}: {load_err}")
                     return None
 
-            def merge_storage_states(shared_path: str, x666_path: str) -> dict | str | None:
-                shared_state = load_storage_state(shared_path)
-                x666_state = load_storage_state(x666_path)
+            def merge_storage_states(shared_source: dict | str | None, x666_source: dict | str | None) -> dict | str | None:
+                shared_state = load_storage_state(shared_source)
+                x666_state = load_storage_state(x666_source)
 
                 if shared_state and x666_state:
                     merged_state = {
@@ -1135,14 +1138,14 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                     return shared_state
                 if x666_state:
                     return x666_state
-                if shared_path and os.path.exists(shared_path):
-                    return shared_path
-                if x666_path and os.path.exists(x666_path):
-                    return x666_path
+                if isinstance(shared_source, str) and os.path.exists(shared_source):
+                    return shared_source
+                if isinstance(x666_source, str) and os.path.exists(x666_source):
+                    return x666_source
                 return None
 
             # 共享 Linux.do 会话必须优先级更高，避免旧 x666 缓存覆盖新会话
-            storage_state = merge_storage_states(cache_file_path, x666_cache_file_path)
+            storage_state = merge_storage_states(shared_session_state or cache_file_path, x666_cache_file_path)
             if storage_state:
                 print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
             else:
@@ -1267,6 +1270,90 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                     print(f"✅ {account_name}: Linux.do login ready for x666 OAuth")
                     return True
 
+                async def handle_sso_provider_page() -> str:
+                    print(f"ℹ️ {account_name}: x666 OAuth reached linux.do/session/sso_provider, waiting for redirect")
+                    # 第一阶段：等待自动跳转（sso_provider 通常会自动 POST 并跳走）
+                    try:
+                        await page.wait_for_url('**connect.linux.do/**', timeout=12000)
+                        return page.url
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_url('**up.x666.me/**', timeout=5000)
+                        return page.url
+                    except Exception:
+                        pass
+
+                    current_url = page.url
+                    if 'linux.do/session/sso_provider' not in current_url:
+                        return current_url
+
+                    # 第二阶段：尝试 JS 点击/提交
+                    print(f"⚠️ {account_name}: sso_provider did not auto-redirect, trying generic submit/click handlers")
+                    handled = await page.evaluate("""() => {
+                        const textMatches = (el) => {
+                            const text = (el.innerText || el.textContent || el.value || '').trim();
+                            return /允许|继续|authorize|continue|approve|sign in/i.test(text);
+                        };
+
+                        const clickable = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]'))
+                            .find((el) => textMatches(el));
+                        if (clickable) {
+                            clickable.click();
+                            return 'clicked:' + (clickable.innerText || clickable.value || clickable.tagName);
+                        }
+
+                        const form = document.querySelector('form');
+                        if (form) {
+                            form.submit();
+                            return 'submitted:form';
+                        }
+
+                        return 'noop';
+                    }""")
+                    print(f"ℹ️ {account_name}: x666 sso_provider handler result: {handled}")
+
+                    # noop 说明页面没有可操作元素，尝试直接 fetch POST sso_provider 表单
+                    if handled == 'noop':
+                        print(f"ℹ️ {account_name}: No clickable element found, trying fetch POST to sso_provider")
+                        try:
+                            post_result = await page.evaluate("""async () => {
+                                const form = document.querySelector('form');
+                                if (!form) return 'no-form';
+                                const action = form.action || window.location.href;
+                                const data = new FormData(form);
+                                const body = new URLSearchParams(data).toString();
+                                const resp = await fetch(action, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: body,
+                                    redirect: 'follow',
+                                });
+                                return 'fetch:' + resp.status + ':' + resp.url;
+                            }""")
+                            print(f"ℹ️ {account_name}: fetch POST result: {post_result}")
+                        except Exception as fetch_err:
+                            print(f"⚠️ {account_name}: fetch POST failed: {fetch_err}")
+
+                    # 等待跳转，超时缩短为 15s 避免长时间阻塞
+                    try:
+                        await page.wait_for_url('**connect.linux.do/**', timeout=15000)
+                        return page.url
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_url('**up.x666.me/**', timeout=10000)
+                        return page.url
+                    except Exception:
+                        pass
+
+                    current_url = page.url
+                    print(f"ℹ️ {account_name}: URL after sso_provider handler: {current_url}")
+                    if 'linux.do/session/sso_provider' in current_url:
+                        await save_page_content_to_file(page, 'x666_sso_provider_stuck', account_name, prefix='x666')
+                        await take_screenshot(page, 'x666_sso_provider_stuck', account_name)
+                    return current_url
+
                 print(f"ℹ️ {account_name}: Checking x666 token state on up.x666.me")
                 await page.goto('https://up.x666.me', wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
                 await page.wait_for_timeout(1500)
@@ -1288,8 +1375,16 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                     if flow_round > 1:
                         print(f"ℹ️ {account_name}: Continuing x666 OAuth flow round {flow_round}")
 
-                    await page.goto(auth_url, wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(1500)
+                    # 等待页面加载并给 sso_provider 的 JS 足够时间自动提交
+                    try:
+                        await page.goto(auth_url, wait_until='networkidle', timeout=TIMEOUT_PAGE_LOAD)
+                    except Exception:
+                        # networkidle 可能超时，降级为 domcontentloaded + 额外等待
+                        try:
+                            await page.goto(auth_url, wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(3000)
                     current_url = page.url
                     print(f"ℹ️ {account_name}: x666 OAuth current URL: {current_url}")
 
@@ -1301,16 +1396,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                         continue
 
                     if 'linux.do/session/sso_provider' in current_url:
-                        print(f"ℹ️ {account_name}: x666 OAuth reached linux.do/session/sso_provider, waiting for redirect")
-                        try:
-                            await page.wait_for_url('**connect.linux.do/**', timeout=15000)
-                        except Exception:
-                            await page.wait_for_timeout(3000)
-                        current_url = page.url
-                        print(f"ℹ️ {account_name}: URL after sso_provider wait: {current_url}")
-                        if 'linux.do/session/sso_provider' in current_url:
-                            await save_page_content_to_file(page, 'x666_sso_provider_stuck', account_name, prefix='x666')
-                            await take_screenshot(page, 'x666_sso_provider_stuck', account_name)
+                        current_url = await handle_sso_provider_page()
 
                     if 'connect.linux.do' in current_url and 'oauth2/authorize' in current_url:
                         print(f"ℹ️ {account_name}: At x666 OAuth authorization page, waiting for approve button")
@@ -1327,7 +1413,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                             await take_screenshot(page, 'x666_oauth_approve_failed', account_name)
 
                     try:
-                        await page.wait_for_url('**up.x666.me/**', timeout=TIMEOUT_NAVIGATION)
+                        await page.wait_for_url('**up.x666.me/**', timeout=20000)
                     except Exception:
                         await page.wait_for_timeout(1500)
 
@@ -1417,7 +1503,7 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
                         if not status_data.get('can_spin'):
                             today_record = status_data.get('today_record', {})
                             quota = today_record.get('quota_amount', 0) if today_record else 0
-                            balance = status_data.get('balance', 0)
+                            balance = status_data.get('current_quota', status_data.get('balance', 0))
                             print(f"✅ {account_name}: Already checked in today on {origin}, quota: {quota}, balance: {balance}")
                             return {'type': 'checkin_success', 'quota': quota, 'balance': balance}
                     elif status_data:
