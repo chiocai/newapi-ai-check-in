@@ -36,6 +36,17 @@ TIMEOUT_NAVIGATION = 45000  # 导航超时
 # 重试配置
 MAX_RETRIES = 3  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
+MAX_CONCURRENT_LINUXDO_OAUTH = 2  # Linux.do OAuth 浏览器流程最大并发数
+
+_linuxdo_signin_semaphore: asyncio.Semaphore | None = None
+
+
+def get_linuxdo_signin_semaphore() -> asyncio.Semaphore:
+    """延迟初始化 Linux.do OAuth 并发控制信号量"""
+    global _linuxdo_signin_semaphore
+    if _linuxdo_signin_semaphore is None:
+        _linuxdo_signin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_OAUTH)
+    return _linuxdo_signin_semaphore
 
 
 def _build_linuxdo_error(error_type: str, error_summary: str, error_detail: str | None = None, **extra) -> dict:
@@ -159,7 +170,8 @@ class LinuxDoSignIn:
                     print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
                     await asyncio.sleep(RETRY_DELAY)
 
-                result = await self._signin_impl(client_id, auth_state, auth_cookies, cache_file_path)
+                async with get_linuxdo_signin_semaphore():
+                    result = await self._signin_impl(client_id, auth_state, auth_cookies, cache_file_path)
                 if result[0]:  # 成功
                     return result
                 else:
@@ -394,9 +406,16 @@ class LinuxDoSignIn:
                                     f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization"
                                 )
                             else:
-                                if "linux.do/session/sso_provider" in current_url or "connect.linux.do" in current_url:
-                                    print(f"ℹ️ {self.account_name}: Cache session reached Linux.do SSO flow, proceeding to authorization")
-                                    is_logged_in = True
+                                if "linux.do/session/sso_provider" in current_url:
+                                    print(
+                                        f"⚠️ {self.account_name}: Cache session stalled at Linux.do SSO provider page, "
+                                        "fallback to fresh Linux.do login"
+                                    )
+                                elif "connect.linux.do" in current_url:
+                                    print(
+                                        f"⚠️ {self.account_name}: Cache session reached connect.linux.do but approve button is missing, "
+                                        "fallback to fresh Linux.do login"
+                                    )
                                 else:
                                     print(f"ℹ️ {self.account_name}: Cache session expired, need to login again")
                     except Exception as e:
@@ -558,7 +577,16 @@ class LinuxDoSignIn:
                 # 统一处理授权逻辑（无论是否通过缓存登录）
                 try:
                     if "linux.do/session/sso_provider" in page.url:
-                        await self._handle_sso_provider_page(page)
+                        current_url = await self._handle_sso_provider_page(page)
+                        if "linux.do/session/sso_provider" in current_url:
+                            diagnosed = await _diagnose_linuxdo_page_issue(page)
+                            if diagnosed:
+                                return False, diagnosed
+                            return False, _build_linuxdo_error(
+                                "linuxdo_sso_provider_stuck",
+                                "Linux.do SSO 中转页卡住",
+                                f"Linux.do SSO provider page is still stuck after handler: {current_url}",
+                            )
 
                     if "linux.do/login" in page.url:
                         guard = await detect_linuxdo_page_guard(page)

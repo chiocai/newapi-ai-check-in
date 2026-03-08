@@ -993,9 +993,12 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
     access_token = account_config.get("access_token")
 
     # 如果有 access_token，先尝试使用它
+    proxy = account_config.proxy or account_config.get('global_proxy')
+    http_proxy = proxy_resolve(proxy) if proxy else None
+
     if access_token:
         print(f"ℹ️ {account_name}: Trying existing access_token for x666 checkin")
-        result = await _execute_x666_checkin_with_token(account_name, access_token, None)
+        result = await _execute_x666_checkin_with_token(account_name, access_token, http_proxy)
         if result:
             return result
         print(f"ℹ️ {account_name}: Existing token invalid or expired, will login via browser")
@@ -1362,7 +1365,9 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                 if token:
                     print(f"✅ {account_name}: Reusing valid token from x666 page cache")
                     await context.storage_state(path=x666_cache_file_path)
-                    return await _execute_x666_checkin_with_token(account_name, token, None)
+                    _proxy = account_config.proxy or account_config.get('global_proxy')
+                    _http_proxy = proxy_resolve(_proxy) if _proxy else None
+                    return await _execute_x666_checkin_with_token(account_name, token, _http_proxy)
 
                 print(f"ℹ️ {account_name}: Shared Linux.do session is ready, starting x666 OAuth")
                 auth_url = await get_auth_url()
@@ -1397,6 +1402,17 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
 
                     if 'linux.do/session/sso_provider' in current_url:
                         current_url = await handle_sso_provider_page()
+                        # sso_provider 卡住且页面为空，说明 linux.do session 已失效，需重新登录
+                        if 'linux.do/session/sso_provider' in current_url:
+                            print(f"ℹ️ {account_name}: sso_provider stuck, trying to re-login linux.do")
+                            login_ok = await ensure_linuxdo_login()
+                            if not login_ok:
+                                return None
+                            # 重新获取 auth_url，旧的 state 已失效
+                            auth_url = await get_auth_url()
+                            if not auth_url:
+                                return None
+                            continue
 
                     if 'connect.linux.do' in current_url and 'oauth2/authorize' in current_url:
                         print(f"ℹ️ {account_name}: At x666 OAuth authorization page, waiting for approve button")
@@ -1427,7 +1443,9 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                     if token:
                         print(f"✅ {account_name}: Successfully got valid token via x666 browser login")
                         await context.storage_state(path=x666_cache_file_path)
-                        return await _execute_x666_checkin_with_token(account_name, token, None)
+                        _proxy = account_config.proxy or account_config.get('global_proxy')
+                        _http_proxy = proxy_resolve(_proxy) if _proxy else None
+                        return await _execute_x666_checkin_with_token(account_name, token, _http_proxy)
 
                 print(f"❌ {account_name}: Failed to get valid token after x666 OAuth flow")
                 await save_page_content_to_file(page, 'x666_login_failed', account_name, prefix='x666')
@@ -1472,7 +1490,7 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
     print(f"ℹ️ {account_name}: Executing x666 checkin with token")
 
     try:
-        client = httpx.Client(http2=True, timeout=30.0)
+        client = httpx.Client(http2=True, timeout=30.0, proxy=http_proxy)
         try:
             x666_origins = [
                 'https://up.x666.me',

@@ -475,6 +475,9 @@ def detect_linuxdo_page_guard_from_text(text: str) -> dict:
                 'server is currently experiencing high load',
                 'please try again later',
                 'server is too busy',
+                'too many requests',
+                'rate limited',
+                'rate limit exceeded',
             ]
         ),
     }

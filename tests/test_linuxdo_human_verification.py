@@ -85,3 +85,13 @@ def test_detect_linuxdo_page_guard_from_text_high_load():
 	result = detect_linuxdo_page_guard_from_text(text)
 
 	assert result['high_load'] is True
+
+
+def test_detect_linuxdo_page_guard_from_text_too_many_requests():
+	text = """
+	Too Many Requests
+	"""
+
+	result = detect_linuxdo_page_guard_from_text(text)
+
+	assert result['high_load'] is True
