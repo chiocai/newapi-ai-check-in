@@ -410,9 +410,14 @@ class LinuxDoSignIn:
                                 )
                             else:
                                 if "linux.do/session/sso_provider" in current_url:
-                                    print(
-                                        f"⚠️ {self.account_name}: Cache session stalled at Linux.do SSO provider page, "
-                                        "fallback to fresh Linux.do login"
+                                    print(f"❌ {self.account_name}: Cache session stalled at Linux.do SSO provider page")
+                                    diagnosed = await _diagnose_linuxdo_page_issue(page)
+                                    if diagnosed:
+                                        return False, diagnosed
+                                    return False, _build_linuxdo_error(
+                                        "linuxdo_sso_provider_stuck",
+                                        "Linux.do SSO 中转页卡住",
+                                        f"Linux.do SSO provider page is stuck after cache restore: {current_url}",
                                     )
                                 elif "connect.linux.do" in current_url:
                                     print(

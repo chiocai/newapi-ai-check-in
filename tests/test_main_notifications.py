@@ -16,6 +16,7 @@ from main import (
 	rerun_failed_accounts_once,
 	should_enable_linuxdo_backoff_retry,
 	should_enable_waf_retry,
+	should_skip_failed_retry,
 )
 from utils.config import AccountConfig
 
@@ -196,6 +197,24 @@ def test_collect_linuxdo_backoff_retry_indices():
 	assert collect_linuxdo_backoff_retry_indices(account_results) == [0, 3]
 
 
+def test_should_skip_failed_retry():
+	assert should_skip_failed_retry({
+		'success': False,
+		'error_type': 'linuxdo_high_load',
+		'error_label': '🔥 高负载',
+	}) is True
+	assert should_skip_failed_retry({
+		'success': False,
+		'error_type': 'linuxdo_sso_provider_stuck',
+		'error_label': '🔄 SSO 卡住',
+	}) is True
+	assert should_skip_failed_retry({
+		'success': False,
+		'error_type': 'linuxdo_hcaptcha_login',
+		'error_label': '🧩 hCaptcha',
+	}) is False
+
+
 def test_rerun_failed_accounts_once_replaces_failed_results(monkeypatch):
 	async def fake_process_single_account(index, account_config, app_config, semaphore):
 		return {'account_index': index, 'success': True, 'status': 'success'}
@@ -217,6 +236,34 @@ def test_rerun_failed_accounts_once_replaces_failed_results(monkeypatch):
 	assert result[0]['success'] is True
 	assert result[1]['success'] is True
 	assert result[2]['success'] is True
+
+
+def test_rerun_failed_accounts_once_skips_linuxdo_high_load(monkeypatch):
+	calls = []
+
+	async def fake_process_single_account(index, account_config, app_config, semaphore):
+		calls.append(index)
+		return {'account_index': index, 'success': True, 'status': 'success'}
+
+	monkeypatch.setattr('main.process_single_account', fake_process_single_account)
+
+	class DummyApp:
+		accounts = [object(), object()]
+		runtime_sites_file = 'dummy.json'
+		site_definitions = {}
+		def get_provider(self, name):
+			return None
+
+	account_results = [
+		{'account_index': 0, 'success': False, 'provider': 'alpha', 'error_type': 'linuxdo_high_load', 'error_label': '🔥 高负载'},
+		{'account_index': 1, 'success': False, 'provider': 'beta', 'error_type': 'linuxdo_hcaptcha_login', 'error_label': '🧩 hCaptcha'},
+	]
+
+	result = asyncio.run(rerun_failed_accounts_once(account_results, DummyApp(), asyncio.Semaphore(1)))
+
+	assert calls == [1]
+	assert result[0]['error_label'] == '🔥 高负载'
+	assert result[1]['success'] is True
 
 
 def test_prewarm_linuxdo_sessions_deduplicates_accounts(monkeypatch):

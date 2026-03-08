@@ -26,8 +26,8 @@ load_dotenv(override=True)
 BALANCE_HASH_FILE = "balance_hash.txt"
 
 # 并行处理配置
-MAX_CONCURRENT_ACCOUNTS = 10  # 最大并发账号数
-MAX_CONCURRENT_RUNTIME_DISCOVERY = 10  # 运行时自动发现最大并发数
+MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "1")))  # 最大并发账号数
+MAX_CONCURRENT_RUNTIME_DISCOVERY = max(1, int(os.getenv("MAX_CONCURRENT_RUNTIME_DISCOVERY", "1")))  # 运行时自动发现最大并发数
 MAX_CONCURRENT_LINUXDO_PRELOGIN = max(1, int(os.getenv("MAX_CONCURRENT_LINUXDO_PRELOGIN", "1")))  # LinuxDo 预登录最大并发数
 MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
 LINUXDO_BACKOFF_RETRY_DELAYS = tuple(
@@ -322,6 +322,29 @@ def collect_failed_account_indices(account_results: list) -> list[int]:
     return failed_indices
 
 
+def should_skip_failed_retry(result: dict) -> bool:
+    """判断失败结果是否应跳过 failed retry，避免放大 Linux.do 限流"""
+    if not isinstance(result, dict) or result.get("success"):
+        return False
+
+    error_type = result.get("error_type", "")
+    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck"}:
+        return True
+
+    error_text = " ".join(
+        str(value)
+        for value in [result.get("error_label"), result.get("error_summary"), result.get("error_detail"), result.get("error")]
+        if value
+    ).lower()
+    skip_indicators = [
+        "高负载",
+        "too many requests",
+        "sso 卡住",
+        "sso provider page is stuck",
+    ]
+    return any(indicator in error_text for indicator in skip_indicators)
+
+
 def should_enable_linuxdo_backoff_retry(result: dict) -> bool:
     """判断失败结果是否值得做延迟退避重试"""
     if not isinstance(result, dict) or result.get("success"):
@@ -496,7 +519,29 @@ def apply_waf_runtime_overrides_for_failed_accounts(account_results: list, app_c
 
 async def rerun_failed_accounts_once(account_results: list, app_config, semaphore: asyncio.Semaphore) -> list:
     """对失败账号补跑一轮，并用补跑结果覆盖原结果"""
-    failed_indices = collect_failed_account_indices(account_results)
+    failed_indices = [
+        index
+        for index in collect_failed_account_indices(account_results)
+        if not (
+            index < len(account_results)
+            and isinstance(account_results[index], dict)
+            and should_skip_failed_retry(account_results[index])
+        )
+    ]
+
+    skipped_retry_indices = [
+        index
+        for index in collect_failed_account_indices(account_results)
+        if index < len(account_results)
+        and isinstance(account_results[index], dict)
+        and should_skip_failed_retry(account_results[index])
+    ]
+    if skipped_retry_indices:
+        print(
+            f"ℹ️ Retrying failed account(s) once: skipping {len(skipped_retry_indices)} account(s) "
+            "with Linux.do high-load/SSO-stuck errors"
+        )
+
     return await rerun_selected_accounts(
         account_results,
         app_config,
