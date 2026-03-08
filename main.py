@@ -6,6 +6,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime
 from itertools import groupby
@@ -27,9 +28,13 @@ BALANCE_HASH_FILE = "balance_hash.txt"
 # 并行处理配置
 MAX_CONCURRENT_ACCOUNTS = 10  # 最大并发账号数
 MAX_CONCURRENT_RUNTIME_DISCOVERY = 10  # 运行时自动发现最大并发数
-MAX_CONCURRENT_LINUXDO_PRELOGIN = 2  # LinuxDo 预登录最大并发数
+MAX_CONCURRENT_LINUXDO_PRELOGIN = max(1, int(os.getenv("MAX_CONCURRENT_LINUXDO_PRELOGIN", "1")))  # LinuxDo 预登录最大并发数
 MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
-LINUXDO_BACKOFF_RETRY_DELAYS = (20, 60)  # Linux.do 高负载/Cloudflare 退避重试延迟（秒）
+LINUXDO_BACKOFF_RETRY_DELAYS = tuple(
+    int(item.strip())
+    for item in os.getenv("LINUXDO_BACKOFF_RETRY_DELAYS", "60,180").split(",")
+    if item.strip()
+) or (60, 180)  # Linux.do 高负载/Cloudflare 退避重试延迟（秒）
 
 
 def generate_balance_hash(balances: dict) -> str:

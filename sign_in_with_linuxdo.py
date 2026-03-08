@@ -36,7 +36,10 @@ TIMEOUT_NAVIGATION = 45000  # 导航超时
 # 重试配置
 MAX_RETRIES = 3  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
-MAX_CONCURRENT_LINUXDO_OAUTH = 2  # Linux.do OAuth 浏览器流程最大并发数
+MAX_CONCURRENT_LINUXDO_OAUTH = max(
+    1,
+    int(os.getenv("MAX_CONCURRENT_LINUXDO_OAUTH", "1"))
+)  # Linux.do OAuth 浏览器流程最大并发数
 
 _linuxdo_signin_semaphore: asyncio.Semaphore | None = None
 
