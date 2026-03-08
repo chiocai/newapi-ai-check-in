@@ -1484,6 +1484,17 @@ class CheckIn:
                     print(f"✅ {self.account_name}: Stale provider session cache is still valid, timestamp refreshed")
                 return success, result
 
+        from utils.linuxdo_session import LinuxDoSessionManager
+
+        circuit_reason = LinuxDoSessionManager.get_circuit_reason(username)
+        if circuit_reason:
+            return False, {
+                "error_type": "linuxdo_circuit_open",
+                "error_summary": "Linux.do OAuth 已熔断，本轮跳过",
+                "error_detail": circuit_reason,
+                "error": f"Linux.do circuit is open for this run: {circuit_reason}",
+            }
+
         client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
         try:
             client.cookies.update(waf_cookies)
@@ -1565,6 +1576,14 @@ class CheckIn:
                 auth_cookies=auth_state_result.get("cookies", []),
                 cache_file_path=cache_file_path,
             )
+
+            if not success and isinstance(result_data, dict):
+                error_type = result_data.get("error_type", "")
+                if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login"}:
+                    LinuxDoSessionManager.trip_circuit(
+                        username,
+                        result_data.get("error_detail") or result_data.get("error_summary") or error_type,
+                    )
 
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:

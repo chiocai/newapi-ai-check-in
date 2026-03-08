@@ -164,14 +164,19 @@ def test_collect_failed_account_indices():
 def test_should_enable_linuxdo_backoff_retry():
 	assert should_enable_linuxdo_backoff_retry({
 		'success': False,
-		'error_type': 'linuxdo_high_load',
-		'error_summary': 'Linux.do 授权页高负载，请稍后重试',
-	}) is True
-	assert should_enable_linuxdo_backoff_retry({
-		'success': False,
 		'error_type': 'linuxdo_cloudflare_challenge',
 		'error_summary': 'Linux.do Cloudflare 挑战页',
 	}) is True
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_high_load',
+		'error_summary': 'Linux.do 授权页高负载，请稍后重试',
+	}) is False
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_sso_provider_stuck',
+		'error_summary': 'Linux.do SSO 中转页卡住',
+	}) is False
 	assert should_enable_linuxdo_backoff_retry({
 		'success': False,
 		'error_type': 'linuxdo_hcaptcha_login',
@@ -183,6 +188,7 @@ def test_get_error_label():
 	assert get_error_label('linuxdo_hcaptcha_login', 'Linux.do 登录页人机验证(hCaptcha)') == '🧩 hCaptcha'
 	assert get_error_label('linuxdo_high_load', 'Linux.do 授权页高负载，请稍后重试') == '🔥 高负载'
 	assert get_error_label('linuxdo_sso_provider_stuck', 'Linux.do SSO 中转页卡住') == '🔄 SSO 卡住'
+	assert get_error_label('linuxdo_circuit_open', 'Linux.do OAuth 已熔断，本轮跳过') == '⛔ OAuth 熔断'
 	assert get_error_label('linuxdo_auth_state_failed', '站点 auth state 403/疑似 WAF 拦截') == '🚧 auth state 403'
 
 
@@ -194,7 +200,7 @@ def test_collect_linuxdo_backoff_retry_indices():
 		{'success': False, 'error_summary': 'Linux.do Cloudflare 挑战页'},
 	]
 
-	assert collect_linuxdo_backoff_retry_indices(account_results) == [0, 3]
+	assert collect_linuxdo_backoff_retry_indices(account_results) == [3]
 
 
 def test_should_skip_failed_retry():
@@ -207,6 +213,11 @@ def test_should_skip_failed_retry():
 		'success': False,
 		'error_type': 'linuxdo_sso_provider_stuck',
 		'error_label': '🔄 SSO 卡住',
+	}) is True
+	assert should_skip_failed_retry({
+		'success': False,
+		'error_type': 'linuxdo_circuit_open',
+		'error_label': '⛔ OAuth 熔断',
 	}) is True
 	assert should_skip_failed_retry({
 		'success': False,

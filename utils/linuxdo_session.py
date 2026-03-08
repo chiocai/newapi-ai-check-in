@@ -386,6 +386,7 @@ class LinuxDoSessionManager:
     """Linux.do 会话管理器 - 单例模式"""
 
     _sessions: dict[str, LinuxDoSession] = {}
+    _circuit_breakers: dict[str, str] = {}
 
     @classmethod
     async def get_session(
@@ -407,13 +408,16 @@ class LinuxDoSessionManager:
             LinuxDoSession: 会话对象
         """
         username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        circuit_reason = cls._circuit_breakers.get(username_hash)
 
         # 检查是否已有会话
         if username_hash in cls._sessions:
             session = cls._sessions[username_hash]
             print(f"ℹ️ LinuxDoSessionManager: Reusing existing session for [{username_hash}]")
-            if auto_login:
+            if auto_login and not circuit_reason:
                 await session.ensure_logged_in()
+            elif auto_login and circuit_reason:
+                print(f"⚠️ LinuxDoSessionManager: Session [{username_hash}] circuit is open, skip auto-login: {circuit_reason}")
             return session
 
         # 创建新会话
@@ -421,8 +425,10 @@ class LinuxDoSessionManager:
         session = LinuxDoSession(username, password, proxy)
         cls._sessions[username_hash] = session
 
-        if auto_login:
+        if auto_login and not circuit_reason:
             await session.ensure_logged_in()
+        elif auto_login and circuit_reason:
+            print(f"⚠️ LinuxDoSessionManager: Session [{username_hash}] circuit is open, skip auto-login: {circuit_reason}")
 
         return session
 
@@ -459,6 +465,35 @@ class LinuxDoSessionManager:
             session.invalidate()
         cls._sessions.clear()
         print("ℹ️ LinuxDoSessionManager: All sessions cleared")
+
+    @classmethod
+    def trip_circuit(cls, username: str, reason: str):
+        """对指定 Linux.do 用户名开启本轮熔断，避免继续打 OAuth"""
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        cls._circuit_breakers[username_hash] = reason
+        if username_hash in cls._sessions:
+            cls._sessions[username_hash].invalidate()
+        print(f"⚠️ LinuxDoSessionManager: Circuit opened for [{username_hash}] - {reason}")
+
+    @classmethod
+    def get_circuit_reason(cls, username: str) -> str | None:
+        """获取指定 Linux.do 用户名的熔断原因"""
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        return cls._circuit_breakers.get(username_hash)
+
+    @classmethod
+    def clear_circuit(cls, username: str):
+        """清除指定 Linux.do 用户名的熔断状态"""
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        if username_hash in cls._circuit_breakers:
+            del cls._circuit_breakers[username_hash]
+            print(f"ℹ️ LinuxDoSessionManager: Circuit cleared for [{username_hash}]")
+
+    @classmethod
+    def clear_all_circuits(cls):
+        """清除所有 Linux.do 熔断状态"""
+        cls._circuit_breakers.clear()
+        print("ℹ️ LinuxDoSessionManager: All circuits cleared")
 
     @classmethod
     def get_session_count(cls) -> int:

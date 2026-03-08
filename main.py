@@ -69,6 +69,7 @@ def get_error_label(
         'linuxdo_high_load': '🔥 高负载',
         'linuxdo_sso_provider_stuck': '🔄 SSO 卡住',
         'linuxdo_redirect_login': '🔑 会话失效',
+        'linuxdo_circuit_open': '⛔ OAuth 熔断',
         'linuxdo_client_id_failed': '🆔 client_id',
         'linuxdo_allow_button_not_found': '🚫 未找到允许按钮',
         'linuxdo_authorization_navigation_failed': '🧭 授权页打开失败',
@@ -328,7 +329,7 @@ def should_skip_failed_retry(result: dict) -> bool:
         return False
 
     error_type = result.get("error_type", "")
-    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck"}:
+    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login", "linuxdo_circuit_open"}:
         return True
 
     error_text = " ".join(
@@ -351,7 +352,9 @@ def should_enable_linuxdo_backoff_retry(result: dict) -> bool:
         return False
 
     error_type = result.get("error_type", "")
-    if error_type in {"linuxdo_high_load", "linuxdo_cloudflare_challenge"}:
+    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login", "linuxdo_circuit_open"}:
+        return False
+    if error_type in {"linuxdo_cloudflare_challenge"}:
         return True
 
     error_text = " ".join(
@@ -675,6 +678,8 @@ async def main():
 
     print("🚀 newapi.ai multi-account auto check-in script started (using Camoufox)")
     print(f'🕒 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+
+    LinuxDoSessionManager.clear_all_circuits()
 
     app_config = AppConfig.load_from_env()
     print(f"⚙️ Loaded {len(app_config.providers)} provider(s)")
