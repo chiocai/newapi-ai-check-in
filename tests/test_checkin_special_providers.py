@@ -1,11 +1,13 @@
 import asyncio
+import json
 import sys
+import time
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import CheckIn
+from checkin import CheckIn, _load_provider_session_cache
 from utils.config import AccountConfig, ProviderConfig
 
 
@@ -74,3 +76,19 @@ def test_execute_keeps_structured_get_cdk_result_as_success():
 			}
 		],
 	}
+
+
+def test_load_provider_session_cache_returns_stale_cache(tmp_path):
+	cache_path = tmp_path / 'provider_session.json'
+	cache_path.write_text(json.dumps({
+		'cookies': {'session': 'abc'},
+		'api_user': '123',
+		'timestamp': time.time() - (24 * 60 * 60),
+	}))
+
+	cache = _load_provider_session_cache(str(cache_path))
+
+	assert cache is not None
+	assert cache['cookies'] == {'session': 'abc'}
+	assert cache['api_user'] == '123'
+	assert cache['_stale'] is True

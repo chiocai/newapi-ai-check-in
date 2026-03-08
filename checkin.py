@@ -56,12 +56,16 @@ def _load_provider_session_cache(cache_path: str) -> dict | None:
 
         # 检查缓存是否过期
         timestamp = cache_data.get("timestamp", 0)
-        if time.time() - timestamp > PROVIDER_SESSION_CACHE_TTL:
-            print("ℹ️ Provider session cache expired")
-            return None
+        cache_age = time.time() - timestamp
+        is_stale = cache_age > PROVIDER_SESSION_CACHE_TTL
 
         # 验证必要字段
         if "cookies" in cache_data and "api_user" in cache_data:
+            if is_stale:
+                print("ℹ️ Provider session cache expired by TTL, will try stale cache once before re-auth")
+                cache_data["_stale"] = True
+            else:
+                cache_data["_stale"] = False
             return cache_data
 
         return None
@@ -1428,7 +1432,11 @@ class CheckIn:
         if cached_session:
             cached_cookies = cached_session["cookies"]
             cached_api_user = cached_session["api_user"]
-            print(f"✅ {self.account_name}: Found valid provider session cache, skipping OAuth flow")
+            is_stale_cache = bool(cached_session.get("_stale"))
+            if is_stale_cache:
+                print(f"ℹ️ {self.account_name}: Found stale provider session cache, trying it before OAuth flow")
+            else:
+                print(f"✅ {self.account_name}: Found valid provider session cache, skipping OAuth flow")
 
             # 合并 WAF cookies 和缓存的 cookies
             merged_cookies = {**waf_cookies, **cached_cookies}
@@ -1471,6 +1479,9 @@ class CheckIn:
                 else:
                     return success, result
             else:
+                if success and is_stale_cache:
+                    _save_provider_session_cache(provider_cache_path, cached_cookies, cached_api_user)
+                    print(f"✅ {self.account_name}: Stale provider session cache is still valid, timestamp refreshed")
                 return success, result
 
         client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
