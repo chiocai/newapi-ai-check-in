@@ -181,6 +181,7 @@ def test_should_enable_linuxdo_backoff_retry():
 def test_get_error_label():
 	assert get_error_label('linuxdo_hcaptcha_login', 'Linux.do 登录页人机验证(hCaptcha)') == '🧩 hCaptcha'
 	assert get_error_label('linuxdo_high_load', 'Linux.do 授权页高负载，请稍后重试') == '🔥 高负载'
+	assert get_error_label('linuxdo_sso_provider_stuck', 'Linux.do SSO 中转页卡住') == '🔄 SSO 卡住'
 	assert get_error_label('linuxdo_auth_state_failed', '站点 auth state 403/疑似 WAF 拦截') == '🚧 auth state 403'
 
 
@@ -272,6 +273,40 @@ def test_should_enable_waf_retry_for_403_error():
 		site_definitions = {'alpha': DummySite()}
 
 	result = {'provider': 'alpha', 'error_summary': 'Failed to get user info: HTTP 403'}
+	assert should_enable_waf_retry(result, DummyApp()) is True
+
+
+def test_should_enable_waf_retry_for_linuxdo_session_expired():
+	class DummyProvider:
+		def needs_waf_cookies(self):
+			return False
+
+	class DummySite:
+		mode = 'newapi'
+
+	class DummyApp:
+		def get_provider(self, name):
+			return DummyProvider()
+		site_definitions = {'alpha': DummySite()}
+
+	result = {'provider': 'alpha', 'error_type': 'linuxdo_redirect_login', 'error_label': '🔑 会话失效'}
+	assert should_enable_waf_retry(result, DummyApp()) is True
+
+
+def test_should_enable_waf_retry_for_linuxdo_sso_stuck():
+	class DummyProvider:
+		def needs_waf_cookies(self):
+			return False
+
+	class DummySite:
+		mode = 'newapi'
+
+	class DummyApp:
+		def get_provider(self, name):
+			return DummyProvider()
+		site_definitions = {'alpha': DummySite()}
+
+	result = {'provider': 'alpha', 'error_type': 'linuxdo_sso_provider_stuck', 'error_label': '🔄 SSO 卡住'}
 	assert should_enable_waf_retry(result, DummyApp()) is True
 
 

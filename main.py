@@ -62,6 +62,7 @@ def get_error_label(
         'linuxdo_hcaptcha_authorize': '🧩 hCaptcha',
         'linuxdo_cloudflare_challenge': '☁️ Cloudflare',
         'linuxdo_high_load': '🔥 高负载',
+        'linuxdo_sso_provider_stuck': '🔄 SSO 卡住',
         'linuxdo_redirect_login': '🔑 会话失效',
         'linuxdo_client_id_failed': '🆔 client_id',
         'linuxdo_allow_button_not_found': '🚫 未找到允许按钮',
@@ -439,9 +440,13 @@ def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
     if site_definition.mode in {"turnstile", "special", "signed", "newapi-waf", "auto-waf", "manual-waf"}:
         return False
 
+    error_type = result.get("error_type", "")
+    if error_type in {"linuxdo_redirect_login", "linuxdo_sso_provider_stuck"}:
+        return True
+
     error_text = " ".join(
         str(value)
-        for value in [result.get("error_summary"), result.get("error")]
+        for value in [result.get("error_label"), result.get("error_summary"), result.get("error")]
         if value
     ).lower()
     waf_indicators = [
@@ -450,6 +455,8 @@ def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
         "无权进行此操作",
         "未登录且未提供 access token",
         "without access token",
+        "会话失效",
+        "sso 卡住",
     ]
     return any(indicator in error_text for indicator in waf_indicators)
 

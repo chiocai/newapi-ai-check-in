@@ -89,6 +89,13 @@ async def _diagnose_linuxdo_page_issue(page) -> dict | None:
             f'Linux.do Cloudflare challenge is blocking the flow at {current_url}',
         )
 
+    if 'linux.do/session/sso_provider' in current_url_lower:
+        return _build_linuxdo_error(
+            'linuxdo_sso_provider_stuck',
+            'Linux.do SSO 中转页卡住',
+            f'Linux.do SSO provider page is stuck at {current_url}',
+        )
+
     if 'linux.do/login' in current_url_lower:
         return _build_linuxdo_error(
             'linuxdo_redirect_login',
@@ -194,6 +201,87 @@ class LinuxDoSignIn:
         payload.setdefault("error_type", "linuxdo_signin_failed")
         return False, payload
 
+    async def _handle_sso_provider_page(self, page) -> str:
+        """处理 linux.do/session/sso_provider 中转页"""
+        print(f"ℹ️ {self.account_name}: Linux.do SSO provider page detected, waiting for redirect...")
+
+        try:
+            await page.wait_for_url("**connect.linux.do/**", timeout=12000)
+            return page.url
+        except Exception:
+            pass
+
+        try:
+            await page.wait_for_url(f"**{self.provider_config.origin.replace('https://', '').replace('http://', '')}/**", timeout=5000)
+            return page.url
+        except Exception:
+            pass
+
+        current_url = page.url
+        if "linux.do/session/sso_provider" not in current_url:
+            return current_url
+
+        print(f"⚠️ {self.account_name}: sso_provider did not auto-redirect, trying generic submit/click handlers")
+        handled = await page.evaluate("""() => {
+            const textMatches = (el) => {
+                const text = (el.innerText || el.textContent || el.value || '').trim();
+                return /允许|继续|authorize|continue|approve|sign in|login/i.test(text);
+            };
+
+            const clickable = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]'))
+                .find((el) => textMatches(el));
+            if (clickable) {
+                clickable.click();
+                return 'clicked:' + (clickable.innerText || clickable.value || clickable.tagName);
+            }
+
+            const form = document.querySelector('form');
+            if (form) {
+                form.submit();
+                return 'submitted:form';
+            }
+
+            return 'noop';
+        }""")
+        print(f"ℹ️ {self.account_name}: Linux.do sso_provider handler result: {handled}")
+
+        if handled == "noop":
+            try:
+                post_result = await page.evaluate("""async () => {
+                    const form = document.querySelector('form');
+                    if (!form) return 'no-form';
+                    const action = form.action || window.location.href;
+                    const data = new FormData(form);
+                    const body = new URLSearchParams(data).toString();
+                    const resp = await fetch(action, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body,
+                        redirect: 'follow',
+                    });
+                    return 'fetch:' + resp.status + ':' + resp.url;
+                }""")
+                print(f"ℹ️ {self.account_name}: Linux.do sso_provider fetch POST result: {post_result}")
+            except Exception as fetch_err:
+                print(f"⚠️ {self.account_name}: Linux.do sso_provider fetch POST failed: {fetch_err}")
+
+        try:
+            await page.wait_for_url("**connect.linux.do/**", timeout=12000)
+        except Exception:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(self.provider_config.origin)
+                await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
+            except Exception:
+                await page.wait_for_timeout(2000)
+
+        current_url = page.url
+        print(f"ℹ️ {self.account_name}: URL after Linux.do sso_provider handler: {current_url}")
+        if "linux.do/session/sso_provider" in current_url:
+            await save_page_content_to_file(page, "linuxdo_sso_provider_stuck", self.account_name, prefix="linuxdo")
+            await take_screenshot(page, "linuxdo_sso_provider_stuck", self.account_name)
+        return current_url
+
     async def _signin_impl(
         self,
         client_id: str,
@@ -210,10 +298,15 @@ class LinuxDoSignIn:
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = None
         if self.shared_session:
-            shared_state_path = self.shared_session.get_storage_state_path()
-            if os.path.exists(shared_state_path):
-                storage_state = shared_state_path
-                print(f"ℹ️ {self.account_name}: Using shared session storage state")
+            shared_state = await self.shared_session.get_storage_state()
+            if shared_state:
+                storage_state = shared_state
+                print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
+            else:
+                shared_state_path = self.shared_session.get_storage_state_path()
+                if os.path.exists(shared_state_path):
+                    storage_state = shared_state_path
+                    print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
 
         if not storage_state and cache_file_path and os.path.exists(cache_file_path):
             storage_state = cache_file_path
@@ -254,7 +347,11 @@ class LinuxDoSignIn:
                     try:
                         print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
                         # 直接访问授权页面检查是否已登录
-                        response = await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                        try:
+                            response = await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
+                        except Exception:
+                            response = await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                            await page.wait_for_timeout(3000)
                         print(f"ℹ️ {self.account_name}: redirected to app page {response.url if response else 'N/A'}")
 
                         # 检查是否遇到 Cloudflare 挑战页面
@@ -277,8 +374,15 @@ class LinuxDoSignIn:
 
                         await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
 
+                        current_url = page.url
+                        if "linux.do/session/sso_provider" in current_url:
+                            current_url = await self._handle_sso_provider_page(page)
+
                         # 登录后可能直接跳转回应用页面
                         if response and response.url.startswith(self.provider_config.origin):
+                            is_logged_in = True
+                            print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
+                        elif current_url.startswith(self.provider_config.origin):
                             is_logged_in = True
                             print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
                         else:
@@ -290,7 +394,11 @@ class LinuxDoSignIn:
                                     f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization"
                                 )
                             else:
-                                print(f"ℹ️ {self.account_name}: Cache session expired, need to login again")
+                                if "linux.do/session/sso_provider" in current_url or "connect.linux.do" in current_url:
+                                    print(f"ℹ️ {self.account_name}: Cache session reached Linux.do SSO flow, proceeding to authorization")
+                                    is_logged_in = True
+                                else:
+                                    print(f"ℹ️ {self.account_name}: Cache session expired, need to login again")
                     except Exception as e:
                         print(f"⚠️ {self.account_name}: Failed to check login status: {e}")
 
@@ -428,7 +536,11 @@ class LinuxDoSignIn:
                     # 登录后访问授权页面
                     try:
                         print(f"ℹ️ {self.account_name}: Navigating to authorization page: {oauth_url}")
-                        await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                        try:
+                            await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
+                        except Exception:
+                            await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                            await page.wait_for_timeout(3000)
                     except Exception as e:
                         print(f"❌ {self.account_name}: Failed to navigate to authorization page: {e}")
                         await take_screenshot(page, "auth_page_navigation_failed_bypass", self.account_name)
@@ -445,6 +557,9 @@ class LinuxDoSignIn:
 
                 # 统一处理授权逻辑（无论是否通过缓存登录）
                 try:
+                    if "linux.do/session/sso_provider" in page.url:
+                        await self._handle_sso_provider_page(page)
+
                     if "linux.do/login" in page.url:
                         guard = await detect_linuxdo_page_guard(page)
                         if guard.get("human_verification"):

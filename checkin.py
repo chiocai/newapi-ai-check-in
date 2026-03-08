@@ -213,7 +213,7 @@ class CheckIn:
                         cookie_name = cookie.get("name")
                         cookie_value = cookie.get("value")
                         print(f"  📚 Cookie: {cookie_name} (value: {cookie_value})")
-                        if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"] and cookie_value is not None:
+                        if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2", "cf_clearance", "__cf_bm"] and cookie_value is not None:
                             waf_cookies[cookie_name] = cookie_value
 
                     print(f"ℹ️ {self.account_name}: Got {len(waf_cookies)} WAF cookies after step 1")
