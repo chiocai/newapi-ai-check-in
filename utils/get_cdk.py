@@ -1038,6 +1038,7 @@ async def _get_x666_checkin_async(account_config: "AccountConfig") -> str | None
 async def _x666_browser_login_impl(account_config: "AccountConfig", username: str, password: str) -> dict | None:
     """x666 浏览器登录实现"""
     import hashlib
+    import json
     import os
 
     from camoufox.async_api import AsyncCamoufox
@@ -1071,8 +1072,77 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
             humanize=True,
             locale="en-US",
         ) as browser:
-            # 优先恢复 x666 自己的缓存，没有则复用 LinuxDo 已预热 session
-            storage_state = x666_cache_file_path if os.path.exists(x666_cache_file_path) else cache_file_path
+            def load_storage_state(path: str) -> dict | None:
+                if not path or not os.path.exists(path):
+                    return None
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except Exception as load_err:
+                    print(f"⚠️ {account_name}: Failed to load storage state {path}: {load_err}")
+                    return None
+
+            def merge_storage_states(shared_path: str, x666_path: str) -> dict | str | None:
+                shared_state = load_storage_state(shared_path)
+                x666_state = load_storage_state(x666_path)
+
+                if shared_state and x666_state:
+                    merged_state = {
+                        'cookies': [],
+                        'origins': [],
+                    }
+
+                    cookie_map = {}
+                    for state in [x666_state, shared_state]:
+                        for cookie in state.get('cookies', []):
+                            cookie_key = (
+                                cookie.get('name', ''),
+                                cookie.get('domain', ''),
+                                cookie.get('path', '/'),
+                            )
+                            cookie_map[cookie_key] = cookie
+                    merged_state['cookies'] = list(cookie_map.values())
+
+                    origin_map = {}
+                    for state in [shared_state, x666_state]:
+                        for origin_item in state.get('origins', []):
+                            origin = origin_item.get('origin')
+                            if not origin:
+                                continue
+
+                            local_storage_map = {
+                                item.get('name'): item
+                                for item in origin_map.get(origin, {}).get('localStorage', [])
+                                if item.get('name')
+                            }
+                            for item in origin_item.get('localStorage', []):
+                                item_name = item.get('name')
+                                if not item_name:
+                                    continue
+                                if item_name not in local_storage_map or state is shared_state:
+                                    local_storage_map[item_name] = item
+
+                            origin_map[origin] = {
+                                'origin': origin,
+                                'localStorage': list(local_storage_map.values()),
+                            }
+
+                    merged_state['origins'] = list(origin_map.values())
+                    print(f"ℹ️ {account_name}: Merged shared Linux.do state with x666 cache state")
+                    return merged_state
+
+                if shared_state:
+                    return shared_state
+                if x666_state:
+                    return x666_state
+                if shared_path and os.path.exists(shared_path):
+                    return shared_path
+                if x666_path and os.path.exists(x666_path):
+                    return x666_path
+                return None
+
+            # 共享 Linux.do 会话必须优先级更高，避免旧 x666 缓存覆盖新会话
+            storage_state = merge_storage_states(cache_file_path, x666_cache_file_path)
             if storage_state:
                 print(f"ℹ️ {account_name}: Found cache file, restoring storage state")
             else:
@@ -1238,6 +1308,9 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                             await page.wait_for_timeout(3000)
                         current_url = page.url
                         print(f"ℹ️ {account_name}: URL after sso_provider wait: {current_url}")
+                        if 'linux.do/session/sso_provider' in current_url:
+                            await save_page_content_to_file(page, 'x666_sso_provider_stuck', account_name, prefix='x666')
+                            await take_screenshot(page, 'x666_sso_provider_stuck', account_name)
 
                     if 'connect.linux.do' in current_url and 'oauth2/authorize' in current_url:
                         print(f"ℹ️ {account_name}: At x666 OAuth authorization page, waiting for approve button")
