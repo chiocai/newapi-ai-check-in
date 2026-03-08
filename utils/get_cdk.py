@@ -1042,7 +1042,14 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
 
     from camoufox.async_api import AsyncCamoufox
 
-    from utils.browser_utils import save_page_content_to_file, take_screenshot
+    from utils.browser_utils import (
+        attempt_linuxdo_human_verification,
+        detect_linuxdo_page_guard,
+        has_linuxdo_human_verification,
+        save_page_content_to_file,
+        take_screenshot,
+        wait_for_linuxdo_login_ready,
+    )
     from utils.linuxdo_session import LinuxDoSessionManager
 
     account_name = account_config.get_display_name()
@@ -1075,90 +1082,197 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
             page = await context.new_page()
 
             try:
-                # 如果有缓存，先尝试直接访问 up.x666.me 检查是否已登录
-                if os.path.exists(x666_cache_file_path):
-                    print(f"ℹ️ {account_name}: Checking login status on up.x666.me")
-                    await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                    await page.wait_for_timeout(2000)
-
-                    # 检查是否已登录（从 localStorage 获取 token）
+                async def get_valid_token_from_page() -> str | None:
                     token = await page.evaluate("() => localStorage.getItem('userToken')")
-                    if token:
-                        print(f"ℹ️ {account_name}: Found cached token, verifying...")
-                        result = await _execute_x666_checkin_with_token(account_name, token, None)
-                        if result:
-                            print(f"✅ {account_name}: Token from cache is valid")
-                            await context.storage_state(path=x666_cache_file_path)
-                            return result
-                        print(f"ℹ️ {account_name}: Cached token expired, need to re-login")
-                print(f"ℹ️ {account_name}: Shared Linux.do session is ready, continue OAuth on up.x666.me")
+                    if not token:
+                        return None
 
-                # 登录成功后，访问 up.x666.me 触发 OAuth 获取 token
-                print(f"ℹ️ {account_name}: Navigating to up.x666.me to get token")
-                await page.goto("https://up.x666.me", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                await page.wait_for_timeout(2000)
+                    print(f"ℹ️ {account_name}: Found token in page localStorage, validating on current host")
+                    if await _verify_token_in_browser(page, token):
+                        return token
 
-                # 检查是否需要点击登录按钮
-                current_url = page.url
-                print(f"ℹ️ {account_name}: Current URL: {current_url}")
+                    print(f"⚠️ {account_name}: Browser token validation failed, clearing stale localStorage token")
+                    await page.evaluate(
+                        """() => {
+                            localStorage.removeItem('userToken');
+                            sessionStorage.removeItem('userToken');
+                        }"""
+                    )
+                    return None
 
-                # 检查是否已有 token
-                token = await page.evaluate("() => localStorage.getItem('userToken')")
-                if token:
-                    print(f"✅ {account_name}: Got token from up.x666.me")
-                    await context.storage_state(path=x666_cache_file_path)
-                    result = await _execute_x666_checkin_with_token(account_name, token, None)
-                    return result
-
-                # 如果没有 token，点击登录按钮触发 OAuth
-                login_btn = await page.query_selector('button:has-text("登录")')
-                if login_btn:
-                    print(f"ℹ️ {account_name}: Clicking login button on up.x666.me")
-                    await login_btn.click()
-                    # 等待跳转到 OAuth 页面
+                async def get_auth_url() -> str | None:
                     try:
-                        await page.wait_for_url("**connect.linux.do**", timeout=10000)
+                        auth_data = await page.evaluate("""async () => {
+                            const response = await fetch('/api/auth/login', {
+                                headers: { 'Accept': 'application/json' }
+                            });
+                            return await response.json();
+                        }""")
+                    except Exception as auth_err:
+                        print(f"⚠️ {account_name}: Failed to fetch x666 auth_url in browser: {auth_err}")
+                        return None
+
+                    auth_url = auth_data.get('auth_url') if isinstance(auth_data, dict) else None
+                    if auth_url:
+                        print(f"ℹ️ {account_name}: Got auth_url for x666 OAuth")
+                    else:
+                        print(f"⚠️ {account_name}: x666 auth_url missing from response: {auth_data}")
+                    return auth_url
+
+                async def ensure_linuxdo_login() -> bool:
+                    print(f"ℹ️ {account_name}: Navigating to linux.do/login for x666 fallback")
+                    await page.goto('https://linux.do/login', wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
+
+                    current_url = page.url
+                    if 'linux.do/login' not in current_url and 'linux.do' in current_url:
+                        print(f"✅ {account_name}: Shared Linux.do session already logged in ({current_url})")
+                        return True
+
+                    try:
+                        await wait_for_linuxdo_login_ready(page, account_name, timeout=TIMEOUT_ELEMENT_WAIT)
+                    except Exception as ready_err:
+                        guard = await detect_linuxdo_page_guard(page)
+                        print(f"⚠️ {account_name}: Linux.do login form not ready: {ready_err}")
+                        if guard.get('human_verification'):
+                            solved = await attempt_linuxdo_human_verification(page, account_name)
+                            if not solved:
+                                await save_page_content_to_file(
+                                    page,
+                                    'x666_linuxdo_hcaptcha_before_login_ready',
+                                    account_name,
+                                    prefix='x666'
+                                )
+                                await take_screenshot(page, 'x666_linuxdo_hcaptcha_before_login_ready', account_name)
+                                return False
+                        elif guard.get('cloudflare_challenge'):
+                            await page.wait_for_timeout(3000)
+                        else:
+                            await page.wait_for_timeout(2000)
+                        await wait_for_linuxdo_login_ready(page, account_name, timeout=TIMEOUT_ELEMENT_WAIT)
+
+                    await page.fill('#login-account-name', username, timeout=TIMEOUT_FILL)
+                    await page.wait_for_timeout(500)
+                    await page.fill('#login-account-password', password, timeout=TIMEOUT_FILL)
+                    await page.wait_for_timeout(500)
+
+                    if await has_linuxdo_human_verification(page):
+                        solved = await attempt_linuxdo_human_verification(page, account_name)
+                        if not solved:
+                            await save_page_content_to_file(page, 'x666_linuxdo_hcaptcha_detected', account_name, prefix='x666')
+                            await take_screenshot(page, 'x666_linuxdo_hcaptcha_detected', account_name)
+                            return False
+
+                    await page.click('#login-button', timeout=TIMEOUT_CLICK)
+                    try:
+                        await page.wait_for_selector('.current-user', timeout=15000)
                     except Exception:
+                        await page.wait_for_timeout(3000)
+
+                    post_login_guard = await detect_linuxdo_page_guard(page)
+                    if 'linux.do/login' in page.url and post_login_guard.get('human_verification'):
+                        solved = await attempt_linuxdo_human_verification(page, account_name)
+                        if solved:
+                            print(f"ℹ️ {account_name}: Human Verification solved after submit, retrying Linux.do login once")
+                            await page.click('#login-button', timeout=TIMEOUT_CLICK)
+                            await page.wait_for_timeout(5000)
+                            post_login_guard = await detect_linuxdo_page_guard(page)
+
+                        if 'linux.do/login' in page.url and post_login_guard.get('human_verification'):
+                            await save_page_content_to_file(
+                                page,
+                                'x666_linuxdo_hcaptcha_after_login_click',
+                                account_name,
+                                prefix='x666'
+                            )
+                            await take_screenshot(page, 'x666_linuxdo_hcaptcha_after_login_click', account_name)
+                            return False
+
+                    current_url = page.url
+                    if 'linux.do/login' in current_url:
+                        print(f"❌ {account_name}: Linux.do login still not completed, current url: {current_url}")
+                        await save_page_content_to_file(page, 'x666_linuxdo_login_failed', account_name, prefix='x666')
+                        await take_screenshot(page, 'x666_linuxdo_login_failed', account_name)
+                        return False
+
+                    print(f"✅ {account_name}: Linux.do login ready for x666 OAuth")
+                    return True
+
+                print(f"ℹ️ {account_name}: Checking x666 token state on up.x666.me")
+                await page.goto('https://up.x666.me', wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
+                await page.wait_for_timeout(1500)
+
+                token = await get_valid_token_from_page()
+                if token:
+                    print(f"✅ {account_name}: Reusing valid token from x666 page cache")
+                    await context.storage_state(path=x666_cache_file_path)
+                    return await _execute_x666_checkin_with_token(account_name, token, None)
+
+                print(f"ℹ️ {account_name}: Shared Linux.do session is ready, starting x666 OAuth")
+                auth_url = await get_auth_url()
+                if not auth_url:
+                    await save_page_content_to_file(page, 'x666_auth_url_missing', account_name, prefix='x666')
+                    await take_screenshot(page, 'x666_auth_url_missing', account_name)
+                    return None
+
+                for flow_round in range(1, 5):
+                    if flow_round > 1:
+                        print(f"ℹ️ {account_name}: Continuing x666 OAuth flow round {flow_round}")
+
+                    await page.goto(auth_url, wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
+                    await page.wait_for_timeout(1500)
+                    current_url = page.url
+                    print(f"ℹ️ {account_name}: x666 OAuth current URL: {current_url}")
+
+                    if 'linux.do/login' in current_url:
+                        print(f"ℹ️ {account_name}: x666 OAuth redirected to Linux.do login")
+                        login_ok = await ensure_linuxdo_login()
+                        if not login_ok:
+                            return None
+                        continue
+
+                    if 'linux.do/session/sso_provider' in current_url:
+                        print(f"ℹ️ {account_name}: x666 OAuth reached linux.do/session/sso_provider, waiting for redirect")
+                        try:
+                            await page.wait_for_url('**connect.linux.do/**', timeout=15000)
+                        except Exception:
+                            await page.wait_for_timeout(3000)
+                        current_url = page.url
+                        print(f"ℹ️ {account_name}: URL after sso_provider wait: {current_url}")
+
+                    if 'connect.linux.do' in current_url and 'oauth2/authorize' in current_url:
+                        print(f"ℹ️ {account_name}: At x666 OAuth authorization page, waiting for approve button")
+                        try:
+                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
+                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                            if allow_btn:
+                                print(f"ℹ️ {account_name}: Clicking x666 authorize button")
+                                await allow_btn.click()
+                                await page.wait_for_timeout(2000)
+                        except Exception as approve_err:
+                            print(f"⚠️ {account_name}: x666 OAuth approve failed: {approve_err}")
+                            await save_page_content_to_file(page, 'x666_oauth_approve_failed', account_name, prefix='x666')
+                            await take_screenshot(page, 'x666_oauth_approve_failed', account_name)
+
+                    try:
+                        await page.wait_for_url('**up.x666.me/**', timeout=TIMEOUT_NAVIGATION)
+                    except Exception:
+                        await page.wait_for_timeout(1500)
+
+                    current_url = page.url
+                    print(f"ℹ️ {account_name}: x666 OAuth final URL: {current_url}")
+
+                    if 'token=' in current_url:
                         await page.wait_for_timeout(2000)
 
-                # 检查是否在 OAuth 授权页面
-                current_url = page.url
-                print(f"ℹ️ {account_name}: URL after login click: {current_url}")
+                    token = await get_valid_token_from_page()
+                    if token:
+                        print(f"✅ {account_name}: Successfully got valid token via x666 browser login")
+                        await context.storage_state(path=x666_cache_file_path)
+                        return await _execute_x666_checkin_with_token(account_name, token, None)
 
-                if "connect.linux.do" in current_url and "oauth2/authorize" in current_url:
-                    print(f"ℹ️ {account_name}: At OAuth authorization page, waiting for approve button...")
-                    try:
-                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
-                        allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
-                        if allow_btn:
-                            print(f"ℹ️ {account_name}: Clicking authorize button...")
-                            await allow_btn.click()
-                            await page.wait_for_timeout(2000)
-                    except Exception as e:
-                        print(f"⚠️ {account_name}: OAuth approve failed: {e}")
-                        await save_page_content_to_file(page, "x666_oauth_approve_failed", account_name, prefix="x666")
-                        await take_screenshot(page, "x666_oauth_approve_failed", account_name)
-
-                # 等待回调完成
-                await page.wait_for_timeout(1500)
-                current_url = page.url
-                print(f"ℹ️ {account_name}: Final URL: {current_url}")
-
-                # 检查 URL 是否包含 token 参数
-                if "token=" in current_url:
-                    await page.wait_for_timeout(2000)
-
-                # 从 localStorage 获取 token
-                token = await page.evaluate("() => localStorage.getItem('userToken')")
-                if token:
-                    print(f"✅ {account_name}: Successfully got token via browser login")
-                    await context.storage_state(path=x666_cache_file_path)
-                    result = await _execute_x666_checkin_with_token(account_name, token, None)
-                    return result
-
-                print(f"❌ {account_name}: Failed to get token after login")
-                await save_page_content_to_file(page, "x666_login_failed", account_name, prefix="x666")
-                await take_screenshot(page, "x666_login_failed", account_name)
+                print(f"❌ {account_name}: Failed to get valid token after x666 OAuth flow")
+                await save_page_content_to_file(page, 'x666_login_failed', account_name, prefix='x666')
+                await take_screenshot(page, 'x666_login_failed', account_name)
                 return None
 
             except Exception as e:
@@ -1198,61 +1312,81 @@ async def _execute_x666_checkin_with_token(account_name: str, token: str, http_p
     """
     print(f"ℹ️ {account_name}: Executing x666 checkin with token")
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Origin": "https://qd.x666.me",
-        "Referer": "https://qd.x666.me/",
-    }
-
     try:
         client = httpx.Client(http2=True, timeout=30.0)
         try:
-            # 先检查签到状态
-            status_resp = client.get("https://qd.x666.me/api/checkin/status", headers=headers)
+            x666_origins = [
+                'https://up.x666.me',
+                'https://qd.x666.me',
+            ]
 
-            if status_resp.status_code == 200:
-                status_data = response_resolve(status_resp, "get_checkin_status", account_name)
-                if status_data and status_data.get("success"):
-                    if not status_data.get("can_spin"):
-                        # 今日已签到，奖励已直接到账
-                        today_record = status_data.get("today_record", {})
-                        quota = today_record.get("quota_amount", 0) if today_record else 0
-                        balance = status_data.get("balance", 0)
-                        print(f"✅ {account_name}: Already checked in today, quota: {quota}, balance: {balance}")
-                        return {"type": "checkin_success", "quota": quota, "balance": balance}
-                elif status_data:
-                    error_msg = status_data.get("message", "Unknown error")
-                    # Token 无效
-                    if "token" in error_msg.lower() or "unauthorized" in error_msg.lower():
-                        print(f"⚠️ {account_name}: Token invalid: {error_msg}")
-                        return None
-                    print(f"❌ {account_name}: Failed to get checkin status: {error_msg}")
-                    return None
+            for origin in x666_origins:
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                    'Origin': origin,
+                    'Referer': f'{origin}/',
+                }
+                status_url = f'{origin}/api/checkin/status'
+                spin_url = f'{origin}/api/checkin/spin'
 
-            # 执行签到
-            spin_resp = client.post("https://qd.x666.me/api/checkin/spin", headers=headers)
+                print(f"ℹ️ {account_name}: Trying x666 checkin endpoint on {origin}")
+                status_resp = client.get(status_url, headers=headers)
 
-            if spin_resp.status_code == 200:
-                spin_data = response_resolve(spin_resp, "execute_checkin_spin", account_name)
-                if spin_data and spin_data.get("success"):
-                    quota = spin_data.get("quota", 0)
-                    label = spin_data.get("label", "")
-                    new_balance = spin_data.get("new_balance", 0)
-                    message = spin_data.get("message", f"获得 {label}")
-                    print(f"✅ {account_name}: Checkin successful! {message}, new balance: {new_balance}")
-                    return {"type": "checkin_success", "quota": quota, "balance": new_balance}
-                elif spin_data:
-                    error_msg = spin_data.get("message", "Unknown error")
-                    # 检查是否是已签到
-                    if "已签到" in error_msg or "already" in error_msg.lower():
-                        print(f"✅ {account_name}: Already checked in today")
-                        return {"type": "checkin_success", "quota": 0, "balance": 0}
-                    print(f"❌ {account_name}: Checkin failed: {error_msg}")
-                    return None
+                if status_resp.status_code == 401:
+                    print(f"⚠️ {account_name}: Token unauthorized on {origin}, trying next x666 origin")
+                    continue
 
-            print(f"❌ {account_name}: Checkin request failed with status {spin_resp.status_code}")
+                if status_resp.status_code == 200:
+                    status_data = response_resolve(status_resp, 'get_checkin_status', account_name)
+                    if status_data and status_data.get('success'):
+                        if not status_data.get('can_spin'):
+                            today_record = status_data.get('today_record', {})
+                            quota = today_record.get('quota_amount', 0) if today_record else 0
+                            balance = status_data.get('balance', 0)
+                            print(f"✅ {account_name}: Already checked in today on {origin}, quota: {quota}, balance: {balance}")
+                            return {'type': 'checkin_success', 'quota': quota, 'balance': balance}
+                    elif status_data:
+                        error_msg = status_data.get('message', 'Unknown error')
+                        if 'token' in error_msg.lower() or 'unauthorized' in error_msg.lower():
+                            print(f"⚠️ {account_name}: Token invalid on {origin}: {error_msg}")
+                            continue
+                        print(f"❌ {account_name}: Failed to get checkin status on {origin}: {error_msg}")
+                        continue
+                else:
+                    print(f"⚠️ {account_name}: Checkin status request failed on {origin} with status {status_resp.status_code}")
+                    continue
+
+                spin_resp = client.post(spin_url, headers=headers)
+
+                if spin_resp.status_code == 401:
+                    print(f"⚠️ {account_name}: Spin request unauthorized on {origin}, trying next x666 origin")
+                    continue
+
+                if spin_resp.status_code == 200:
+                    spin_data = response_resolve(spin_resp, 'execute_checkin_spin', account_name)
+                    if spin_data and spin_data.get('success'):
+                        quota = spin_data.get('quota', 0)
+                        label = spin_data.get('label', '')
+                        new_balance = spin_data.get('new_balance', 0)
+                        message = spin_data.get('message', f'获得 {label}')
+                        print(f"✅ {account_name}: Checkin successful on {origin}! {message}, new balance: {new_balance}")
+                        return {'type': 'checkin_success', 'quota': quota, 'balance': new_balance}
+                    elif spin_data:
+                        error_msg = spin_data.get('message', 'Unknown error')
+                        if '已签到' in error_msg or 'already' in error_msg.lower():
+                            print(f"✅ {account_name}: Already checked in today on {origin}")
+                            return {'type': 'checkin_success', 'quota': 0, 'balance': 0}
+                        if 'token' in error_msg.lower() or 'unauthorized' in error_msg.lower():
+                            print(f"⚠️ {account_name}: Token invalid during spin on {origin}: {error_msg}")
+                            continue
+                        print(f"❌ {account_name}: Checkin failed on {origin}: {error_msg}")
+                        continue
+
+                print(f"⚠️ {account_name}: Checkin spin request failed on {origin} with status {spin_resp.status_code}")
+
+            print(f"❌ {account_name}: All x666 checkin endpoints rejected the token")
             return None
 
         finally:

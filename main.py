@@ -29,6 +29,7 @@ MAX_CONCURRENT_ACCOUNTS = 10  # 最大并发账号数
 MAX_CONCURRENT_RUNTIME_DISCOVERY = 10  # 运行时自动发现最大并发数
 MAX_CONCURRENT_LINUXDO_PRELOGIN = 2  # LinuxDo 预登录最大并发数
 MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
+LINUXDO_BACKOFF_RETRY_DELAYS = (20, 60)  # Linux.do 高负载/Cloudflare 退避重试延迟（秒）
 
 
 def generate_balance_hash(balances: dict) -> str:
@@ -44,6 +45,60 @@ def generate_balance_hash(balances: dict) -> str:
 
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(balance_json.encode("utf-8")).hexdigest()[:16]
+
+
+def get_error_label(
+    error_type: str | None = None,
+    error_summary: str | None = None,
+    error_detail: str | None = None,
+    error: str | None = None,
+) -> str | None:
+    """将结构化错误映射为更短的通知标签"""
+    normalized_summary = (error_summary or '').lower()
+    normalized_detail = (error_detail or error or '').lower()
+
+    linuxdo_error_labels = {
+        'linuxdo_hcaptcha_login': '🧩 hCaptcha',
+        'linuxdo_hcaptcha_authorize': '🧩 hCaptcha',
+        'linuxdo_cloudflare_challenge': '☁️ Cloudflare',
+        'linuxdo_high_load': '🔥 高负载',
+        'linuxdo_redirect_login': '🔑 会话失效',
+        'linuxdo_client_id_failed': '🆔 client_id',
+        'linuxdo_allow_button_not_found': '🚫 未找到允许按钮',
+        'linuxdo_authorization_navigation_failed': '🧭 授权页打开失败',
+        'linuxdo_authorization_failed': '🚪 授权失败',
+        'linuxdo_page_navigation_error': '🧭 页面异常',
+        'linuxdo_signin_error': '⚠️ 登录异常',
+        'linuxdo_signin_failed': '❌ 登录失败',
+        'linuxdo_oauth_no_code': '🧾 OAuth 无 code',
+    }
+    if error_type in linuxdo_error_labels:
+        return linuxdo_error_labels[error_type]
+
+    if error_type == 'linuxdo_auth_state_failed':
+        if '403' in normalized_summary or '403' in normalized_detail:
+            return '🚧 auth state 403'
+        if 'html' in normalized_summary or 'html' in normalized_detail:
+            return '📄 auth state HTML'
+        if 'cloudflare' in normalized_summary or 'cloudflare' in normalized_detail:
+            return '☁️ auth state CF'
+        if 'timeout' in normalized_summary or 'timeout' in normalized_detail:
+            return '⏱️ auth state 超时'
+        return '⚠️ auth state 失败'
+
+    fallback_text = ' '.join(value for value in [error_summary, error_detail, error] if value).lower()
+    if 'human verification' in fallback_text or 'hcaptcha' in fallback_text or 'h-captcha' in fallback_text:
+        return '🧩 hCaptcha'
+    if 'cloudflare' in fallback_text or 'challenge' in fallback_text:
+        return '☁️ Cloudflare'
+    if 'high load' in fallback_text or '请稍后重试' in fallback_text:
+        return '🔥 高负载'
+    if 'auth state' in fallback_text and '403' in fallback_text:
+        return '🚧 auth state 403'
+    if 'auth state' in fallback_text and 'html' in fallback_text:
+        return '📄 auth state HTML'
+
+    return error_summary or error_detail or error
 
 
 async def process_single_account(
@@ -83,6 +138,9 @@ async def process_single_account(
             "failed_methods": [],
             "error_summary": None,
             "success_detail": None,
+            "error_type": None,
+            "error_label": None,
+            "error_detail": None,
             "error": None,
         }
 
@@ -122,6 +180,9 @@ async def process_single_account(
             successful_methods = []
             failed_methods = []
             failed_details = []
+            failed_error_type = None
+            failed_error_label = None
+            failed_error_detail = None
             this_account_balances = {}
 
             # 构建单行结果
@@ -179,9 +240,23 @@ async def process_single_account(
                         line_parts.append("签到成功")
                 else:
                     failed_methods.append(auth_method)
-                    error_msg = user_info.get("error", "未知错误") if user_info else "未知错误"
-                    failed_details.append(str(error_msg)[:60])
-                    line_parts.append(str(error_msg)[:60])
+                    error_msg = (
+                        user_info.get("error_summary")
+                        or user_info.get("error", "未知错误")
+                    ) if user_info else "未知错误"
+                    if failed_error_type is None and user_info:
+                        failed_error_type = user_info.get("error_type")
+                    if failed_error_label is None and user_info:
+                        failed_error_label = get_error_label(
+                            user_info.get("error_type"),
+                            user_info.get("error_summary"),
+                            user_info.get("error_detail"),
+                            user_info.get("error"),
+                        )
+                    if failed_error_detail is None and user_info:
+                        failed_error_detail = user_info.get("error_detail") or user_info.get("error")
+                    failed_details.append(str(failed_error_label or error_msg)[:80])
+                    line_parts.append(str(failed_error_label or error_msg)[:80])
 
             # 生成单行通知
             if account_success:
@@ -198,13 +273,16 @@ async def process_single_account(
             result["failed_methods"] = failed_methods
             result["error_summary"] = failed_details[0] if failed_details else None
             result["success_detail"] = line_parts[0] if account_success and line_parts else None
+            result["error_type"] = failed_error_type
+            result["error_label"] = failed_error_label
+            result["error_detail"] = failed_error_detail
             if account_success and failed_methods:
                 result["status"] = "partial"
             elif account_success:
                 result["status"] = "success"
             else:
                 result["status"] = "failed"
-                result["error"] = result["error_summary"] or result["error"]
+                result["error"] = result["error_detail"] or result["error_summary"] or result["error"]
 
             # 如果所有认证方式都失败，需要通知
             if not account_success and results:
@@ -236,6 +314,117 @@ def collect_failed_account_indices(account_results: list) -> list[int]:
         if isinstance(result, dict) and not result.get("success"):
             failed_indices.append(index)
     return failed_indices
+
+
+def should_enable_linuxdo_backoff_retry(result: dict) -> bool:
+    """判断失败结果是否值得做延迟退避重试"""
+    if not isinstance(result, dict) or result.get("success"):
+        return False
+
+    error_type = result.get("error_type", "")
+    if error_type in {"linuxdo_high_load", "linuxdo_cloudflare_challenge"}:
+        return True
+
+    error_text = " ".join(
+        str(value)
+        for value in [result.get("error_summary"), result.get("error_detail"), result.get("error")]
+        if value
+    ).lower()
+    retry_indicators = [
+        "high load",
+        "cloudflare",
+        "挑战页",
+        "高负载",
+    ]
+    return any(indicator in error_text for indicator in retry_indicators)
+
+
+def collect_linuxdo_backoff_retry_indices(account_results: list) -> list[int]:
+    """收集适合做 Linux.do 延迟退避重试的账号索引"""
+    retry_indices = []
+    for index, result in enumerate(account_results):
+        if should_enable_linuxdo_backoff_retry(result):
+            retry_indices.append(index)
+    return retry_indices
+
+
+async def prewarm_linuxdo_sessions(
+    accounts: list,
+    global_proxy: dict | None = None,
+    account_indices: list[int] | None = None,
+    reason: str = "Pre-logging in",
+) -> dict:
+    """预热指定账号范围内的 Linux.do 会话"""
+    selected_accounts = accounts if account_indices is None else [
+        accounts[index]
+        for index in account_indices
+        if 0 <= index < len(accounts)
+    ]
+
+    linuxdo_credentials = {}
+    for account_config in selected_accounts:
+        if not account_config.linux_do:
+            continue
+
+        username = account_config.linux_do.get("username")
+        password = account_config.linux_do.get("password")
+        if not username or not password or username in linuxdo_credentials:
+            continue
+
+        linuxdo_credentials[username] = {
+            "password": password,
+            "proxy": account_config.proxy or global_proxy,
+        }
+
+    if not linuxdo_credentials:
+        print(f"ℹ️ {reason}: no Linux.do accounts need warm-up")
+        return {"attempted": 0, "successful": 0, "failed": 0}
+
+    print(f"\n🔐 {reason} {len(linuxdo_credentials)} unique Linux.do account(s)...")
+    prelogin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_PRELOGIN)
+
+    async def prelogin_one(username: str, password: str, proxy):
+        async with prelogin_semaphore:
+            try:
+                session = await LinuxDoSessionManager.get_session(
+                    username,
+                    password,
+                    proxy=proxy,
+                    auto_login=True,
+                )
+                return username, bool(getattr(session, "is_logged_in", False)), None
+            except Exception as e:
+                return username, False, str(e)
+
+    prelogin_results = await asyncio.gather(
+        *(
+            prelogin_one(username, config["password"], config["proxy"])
+            for username, config in linuxdo_credentials.items()
+        )
+    )
+
+    success_count = 0
+    failed_count = 0
+    for username, success, error_msg in prelogin_results:
+        if success:
+            success_count += 1
+        else:
+            failed_count += 1
+            if error_msg:
+                print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {error_msg}")
+            else:
+                print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: login not confirmed")
+
+    print(
+        f"✅ {reason} completed, "
+        f"{success_count}/{len(linuxdo_credentials)} session(s) ready, "
+        f"{LinuxDoSessionManager.get_session_count()} cached\n"
+    )
+    return {
+        "attempted": len(linuxdo_credentials),
+        "successful": success_count,
+        "failed": failed_count,
+    }
 
 
 def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
@@ -296,15 +485,37 @@ def apply_waf_runtime_overrides_for_failed_accounts(account_results: list, app_c
 async def rerun_failed_accounts_once(account_results: list, app_config, semaphore: asyncio.Semaphore) -> list:
     """对失败账号补跑一轮，并用补跑结果覆盖原结果"""
     failed_indices = collect_failed_account_indices(account_results)
+    return await rerun_selected_accounts(
+        account_results,
+        app_config,
+        semaphore,
+        failed_indices,
+        retry_reason="Retrying failed account(s) once",
+    )
+
+
+async def rerun_selected_accounts(
+    account_results: list,
+    app_config,
+    semaphore: asyncio.Semaphore,
+    failed_indices: list[int],
+    retry_reason: str,
+) -> list:
+    """对指定账号索引补跑一轮，并用补跑结果覆盖原结果"""
     if not failed_indices:
-        print("ℹ️ No failed accounts to retry")
+        print(f"ℹ️ {retry_reason}: no accounts to retry")
         return account_results
 
-    updated_providers = apply_waf_runtime_overrides_for_failed_accounts(account_results, app_config)
+    selected_results = [
+        account_results[index]
+        for index in failed_indices
+        if index < len(account_results) and isinstance(account_results[index], dict)
+    ]
+    updated_providers = apply_waf_runtime_overrides_for_failed_accounts(selected_results, app_config)
     if updated_providers:
         print(f"⚙️ Runtime WAF overrides applied for {len(updated_providers)} provider(s): {updated_providers}")
 
-    print(f"\n🔁 Retrying {len(failed_indices)} failed account(s) once...")
+    print(f"\n🔁 {retry_reason}: retrying {len(failed_indices)} account(s)...")
     retry_tasks = [
         process_single_account(index, app_config.accounts[index], app_config, semaphore)
         for index in failed_indices
@@ -325,7 +536,7 @@ async def rerun_failed_accounts_once(account_results: list, app_config, semaphor
         ):
             recovered_count += 1
 
-    print(f"✅ Retry round finished, recovered {recovered_count}/{len(failed_indices)} failed account(s)")
+    print(f"✅ {retry_reason} finished, recovered {recovered_count}/{len(failed_indices)} account(s)")
     return account_results
 
 
@@ -354,12 +565,16 @@ def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
         for item in site_results:
             status = item.get("status")
             if status == "failed":
-                reason = item.get("error_summary") or item.get("error") or "未知错误"
+                reason = item.get("error_label") or item.get("error_summary") or item.get("error") or "未知错误"
                 detail_parts.append(f"{item['account_name']}: {str(reason)[:40]}")
             elif status == "partial":
                 failed_methods = ", ".join(item.get("failed_methods") or [])
+                failed_reason = item.get("error_label") or item.get("error_summary")
                 if failed_methods:
-                    detail_parts.append(f"{item['account_name']}: 部分失败({failed_methods})")
+                    if failed_reason:
+                        detail_parts.append(f"{item['account_name']}: 部分失败({failed_methods}, {failed_reason})")
+                    else:
+                        detail_parts.append(f"{item['account_name']}: 部分失败({failed_methods})")
                 else:
                     detail_parts.append(f"{item['account_name']}: 部分失败")
             elif item.get("success_detail") and provider in {"x666", "anyrouter"}:
@@ -418,42 +633,11 @@ async def main():
     if discovered_runtime_overrides:
         print(f"⚙️ Runtime site overrides updated for {len(discovered_runtime_overrides)} site(s)")
 
-    # 预登录所有 Linux.do 账号（会话共享优化）
-    linuxdo_usernames = set()
-    for account_config in app_config.accounts:
-        if account_config.linux_do:
-            username = account_config.linux_do.get("username")
-            if username:
-                linuxdo_usernames.add(username)
-
-    if linuxdo_usernames:
-        print(f"\n🔐 Pre-logging in {len(linuxdo_usernames)} unique Linux.do account(s)...")
-        linuxdo_credentials = {}
-        for account_config in app_config.accounts:
-            if account_config.linux_do:
-                username = account_config.linux_do.get("username")
-                if username and username not in linuxdo_credentials:
-                    linuxdo_credentials[username] = {
-                        "password": account_config.linux_do.get("password"),
-                        "proxy": account_config.proxy or app_config.global_proxy,
-                    }
-
-        prelogin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_PRELOGIN)
-
-        async def prelogin_one(username: str, password: str, proxy):
-            async with prelogin_semaphore:
-                try:
-                    await LinuxDoSessionManager.get_session(username, password, proxy)
-                except Exception as e:
-                    print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {e}")
-
-        await asyncio.gather(
-            *(
-                prelogin_one(username, config["password"], config["proxy"])
-                for username, config in linuxdo_credentials.items()
-            )
-        )
-        print(f"✅ Linux.do pre-login completed, {LinuxDoSessionManager.get_session_count()} session(s) cached\n")
+    await prewarm_linuxdo_sessions(
+        app_config.accounts,
+        app_config.global_proxy,
+        reason="Pre-logging in",
+    )
 
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
@@ -470,6 +654,30 @@ async def main():
 
     # 并行执行所有任务
     account_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for backoff_round, delay_seconds in enumerate(LINUXDO_BACKOFF_RETRY_DELAYS, start=1):
+        retry_indices = collect_linuxdo_backoff_retry_indices(account_results)
+        if not retry_indices:
+            break
+
+        print(
+            f"⏳ Linux.do backoff retry round {backoff_round}/{len(LINUXDO_BACKOFF_RETRY_DELAYS)}: "
+            f"{len(retry_indices)} account(s) will retry after {delay_seconds}s"
+        )
+        await prewarm_linuxdo_sessions(
+            app_config.accounts,
+            app_config.global_proxy,
+            account_indices=retry_indices,
+            reason=f"Linux.do warm-up before backoff retry round {backoff_round}",
+        )
+        await asyncio.sleep(delay_seconds)
+        account_results = await rerun_selected_accounts(
+            account_results,
+            app_config,
+            semaphore,
+            retry_indices,
+            retry_reason=f"Linux.do backoff retry round {backoff_round}",
+        )
 
     for retry_round in range(MAX_FAILED_RETRY_ROUNDS):
         failed_indices = collect_failed_account_indices(account_results)

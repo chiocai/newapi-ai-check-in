@@ -469,6 +469,14 @@ def detect_linuxdo_page_guard_from_text(text: str) -> dict:
                 'challenge-platform',
             ]
         ),
+        'high_load': any(
+            keyword in normalized
+            for keyword in [
+                'server is currently experiencing high load',
+                'please try again later',
+                'server is too busy',
+            ]
+        ),
     }
 
 

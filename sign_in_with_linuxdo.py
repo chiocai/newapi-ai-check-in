@@ -38,6 +38,67 @@ MAX_RETRIES = 3  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
 
 
+def _build_linuxdo_error(error_type: str, error_summary: str, error_detail: str | None = None, **extra) -> dict:
+    """构造结构化 Linux.do 错误信息"""
+    payload = {
+        'error_type': error_type,
+        'error_summary': error_summary,
+        'error_detail': error_detail or error_summary,
+        'error': error_detail or error_summary,
+    }
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+async def _diagnose_linuxdo_page_issue(page) -> dict | None:
+    """根据当前页面状态诊断 Linux.do 失败原因"""
+    guard = await detect_linuxdo_page_guard(page)
+    current_url = page.url
+    current_url_lower = current_url.lower()
+    sitekey = guard.get('human_verification_sitekey')
+    suffix = f', sitekey={sitekey}' if sitekey else ''
+
+    if guard.get('high_load'):
+        return _build_linuxdo_error(
+            'linuxdo_high_load',
+            'Linux.do 授权页高负载，请稍后重试',
+            f'Linux.do authorization page is under high load at {current_url}',
+        )
+
+    if guard.get('human_verification'):
+        if 'linux.do/login' in current_url_lower:
+            return _build_linuxdo_error(
+                'linuxdo_hcaptcha_login',
+                'Linux.do 登录页人机验证(hCaptcha)',
+                f'Linux.do login is blocked by Human Verification at {current_url}{suffix}',
+                sitekey=sitekey,
+            )
+        return _build_linuxdo_error(
+            'linuxdo_hcaptcha_authorize',
+            'Linux.do 授权页人机验证(hCaptcha)',
+            f'Linux.do authorization is blocked by Human Verification at {current_url}{suffix}',
+            sitekey=sitekey,
+        )
+
+    if guard.get('cloudflare_challenge'):
+        return _build_linuxdo_error(
+            'linuxdo_cloudflare_challenge',
+            'Linux.do Cloudflare 挑战页',
+            f'Linux.do Cloudflare challenge is blocking the flow at {current_url}',
+        )
+
+    if 'linux.do/login' in current_url_lower:
+        return _build_linuxdo_error(
+            'linuxdo_redirect_login',
+            'Linux.do 会话失效，被重定向回登录页',
+            f'Linux.do authorization redirected back to login page: {current_url}',
+        )
+
+    return None
+
+
 class LinuxDoSignIn:
     """使用 Linux.do 登录授权类"""
 
@@ -83,6 +144,8 @@ class LinuxDoSignIn:
             (成功标志, 用户信息字典)
         """
         last_error = None
+        last_error_summary = None
+        last_result_payload = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 if attempt > 1:
@@ -93,26 +156,43 @@ class LinuxDoSignIn:
                 if result[0]:  # 成功
                     return result
                 else:
-                    last_error = result[1].get("error", "Unknown error")
+                    last_result_payload = result[1] or {}
+                    last_error = last_result_payload.get("error", "Unknown error")
+                    last_error_summary = last_result_payload.get("error_summary", last_error)
                     # 某些错误不需要重试
+                    non_retry_error_types = {
+                        'linuxdo_hcaptcha_login',
+                        'linuxdo_hcaptcha_authorize',
+                        'linuxdo_cloudflare_challenge',
+                        'linuxdo_high_load',
+                    }
                     non_retry_keywords = [
                         "not found",
                         "human verification",
                         "hcaptcha",
                         "h-captcha",
                         "cloudflare challenge",
+                        "high load",
                     ]
-                    if any(keyword in str(last_error).lower() for keyword in non_retry_keywords):
-                        print(f"❌ {self.account_name}: Non-retryable error: {last_error}")
+                    if last_result_payload.get('error_type') in non_retry_error_types or any(
+                        keyword in str(last_error).lower() for keyword in non_retry_keywords
+                    ):
+                        print(f"❌ {self.account_name}: Non-retryable error: {last_error_summary}")
                         return result
-                    print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error}")
+                    print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error_summary}")
 
             except Exception as e:
                 last_error = str(e)
+                last_error_summary = last_error
                 print(f"⚠️ {self.account_name}: Attempt {attempt} exception: {e}")
 
         print(f"❌ {self.account_name}: All {MAX_RETRIES} attempts failed. Last error: {last_error}")
-        return False, {"error": f"All {MAX_RETRIES} attempts failed: {last_error}"}
+        payload = dict(last_result_payload or {})
+        payload["error"] = f"All {MAX_RETRIES} attempts failed: {last_error}"
+        payload.setdefault("error_summary", last_error_summary or last_error)
+        payload.setdefault("error_detail", last_error)
+        payload.setdefault("error_type", "linuxdo_signin_failed")
+        return False, payload
 
     async def _signin_impl(
         self,
@@ -170,7 +250,7 @@ class LinuxDoSignIn:
                     f"response_type=code&client_id={client_id}&state={auth_state}"
                 )
 
-                if os.path.exists(cache_file_path):
+                if storage_state:
                     try:
                         print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
                         # 直接访问授权页面检查是否已登录
@@ -229,11 +309,22 @@ class LinuxDoSignIn:
                             if guard.get("human_verification"):
                                 await save_page_content_to_file(page, "linuxdo_hcaptcha_before_login_ready", self.account_name, prefix="linuxdo")
                                 await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", self.account_name)
-                                return False, {"error": "LinuxDo login blocked by Human Verification before form ready"}
+                                sitekey = guard.get("human_verification_sitekey")
+                                suffix = f", sitekey={sitekey}" if sitekey else ""
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_hcaptcha_login",
+                                    "Linux.do 登录前需要人机验证(hCaptcha)",
+                                    f"LinuxDo login blocked by Human Verification before form ready{suffix}",
+                                    sitekey=sitekey,
+                                )
                             if guard.get("cloudflare_challenge"):
                                 await save_page_content_to_file(page, "linuxdo_cloudflare_before_login_ready", self.account_name, prefix="linuxdo")
                                 await take_screenshot(page, "linuxdo_cloudflare_before_login_ready", self.account_name)
-                                return False, {"error": "LinuxDo login blocked by Cloudflare challenge before form ready"}
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_cloudflare_challenge",
+                                    "Linux.do 登录前被 Cloudflare 挑战页拦截",
+                                    "LinuxDo login blocked by Cloudflare challenge before form ready",
+                                )
                             await page.wait_for_timeout(2000)
                             await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
 
@@ -250,12 +341,15 @@ class LinuxDoSignIn:
                                 await take_screenshot(page, "linuxdo_hcaptcha_detected", self.account_name)
                                 sitekey = guard.get("human_verification_sitekey")
                                 suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, {
-                                    "error": (
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_hcaptcha_login",
+                                    "Linux.do 登录前需要人机验证(hCaptcha)",
+                                    (
                                         f"LinuxDo login requires Human Verification (hCaptcha){suffix}. "
                                         "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                                    )
-                                }
+                                    ),
+                                    sitekey=sitekey,
+                                )
 
                         await page.click("#login-button", timeout=TIMEOUT_CLICK)
                         # 等待登录完成：检测用户元素出现或 URL 变化
@@ -299,12 +393,15 @@ class LinuxDoSignIn:
                                 await take_screenshot(page, "linuxdo_hcaptcha_after_login_click", self.account_name)
                                 sitekey = post_login_guard.get("human_verification_sitekey")
                                 suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, {
-                                    "error": (
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_hcaptcha_login",
+                                    "Linux.do 提交登录后仍需人机验证(hCaptcha)",
+                                    (
                                         f"LinuxDo login still requires Human Verification after submit{suffix}. "
                                         "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                                    )
-                                }
+                                    ),
+                                    sitekey=sitekey,
+                                )
 
                         current_url = page.url
                         current_user = await page.query_selector(".current-user")
@@ -317,7 +414,16 @@ class LinuxDoSignIn:
                     except Exception as e:
                         print(f"❌ {self.account_name}: Error occurred while signing in linux.do: {e}")
                         await take_screenshot(page, "signin_bypass_error", self.account_name)
-                        return False, {"error": "Linux.do sign-in error"}
+                        diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed:
+                            diagnosed["error_detail"] = f"{diagnosed['error_detail']}; original exception: {e}"
+                            diagnosed["error"] = diagnosed["error_detail"]
+                            return False, diagnosed
+                        return False, _build_linuxdo_error(
+                            "linuxdo_signin_error",
+                            "Linux.do 登录流程异常",
+                            f"Linux.do sign-in error: {e}",
+                        )
 
                     # 登录后访问授权页面
                     try:
@@ -326,7 +432,16 @@ class LinuxDoSignIn:
                     except Exception as e:
                         print(f"❌ {self.account_name}: Failed to navigate to authorization page: {e}")
                         await take_screenshot(page, "auth_page_navigation_failed_bypass", self.account_name)
-                        return False, {"error": "Linux.do authorization page navigation failed"}
+                        diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed:
+                            diagnosed["error_detail"] = f"{diagnosed['error_detail']}; navigate exception: {e}"
+                            diagnosed["error"] = diagnosed["error_detail"]
+                            return False, diagnosed
+                        return False, _build_linuxdo_error(
+                            "linuxdo_authorization_navigation_failed",
+                            "Linux.do 授权页打开失败",
+                            f"Linux.do authorization page navigation failed: {e}",
+                        )
 
                 # 统一处理授权逻辑（无论是否通过缓存登录）
                 try:
@@ -342,17 +457,24 @@ class LinuxDoSignIn:
                                 await take_screenshot(page, "linuxdo_authorize_hcaptcha", self.account_name)
                                 sitekey = guard.get("human_verification_sitekey")
                                 suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, {"error": f"LinuxDo authorization blocked by Human Verification (hCaptcha){suffix}"}
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_hcaptcha_authorize",
+                                    "Linux.do 授权页人机验证(hCaptcha)",
+                                    f"LinuxDo authorization blocked by Human Verification (hCaptcha){suffix}",
+                                    sitekey=sitekey,
+                                )
 
                         print(f"❌ {self.account_name}: Redirected back to LinuxDo login page before authorization")
                         await save_page_content_to_file(page, "linuxdo_authorize_redirect_login", self.account_name, prefix="linuxdo")
                         await take_screenshot(page, "linuxdo_authorize_redirect_login", self.account_name)
-                        return False, {
-                            "error": (
+                        return False, _build_linuxdo_error(
+                            "linuxdo_redirect_login",
+                            "Linux.do 授权前被重定向回登录页",
+                            (
                                 "LinuxDo authorization redirected back to login page. "
                                 "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                            )
-                        }
+                            ),
+                        )
 
                     # 等待授权按钮出现
                     print(f"ℹ️ {self.account_name}: Waiting for authorization button...")
@@ -411,18 +533,27 @@ class LinuxDoSignIn:
                             query_params = parse_qs(parsed_url.query)
 
                             # 如果 query 中包含 code，说明 OAuth 回调成功
-                            if "code" in query_params:
-                                print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
-                                return True, query_params
-                            else:
-                                print(f"❌ {self.account_name}: OAuth failed, no code in callback")
-                                return False, {
-                                    "error": "Linux.do OAuth failed - no code in callback",
-                                }
+                        if "code" in query_params:
+                            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+                            return True, query_params
+                        else:
+                            print(f"❌ {self.account_name}: OAuth failed, no code in callback")
+                            return False, _build_linuxdo_error(
+                                "linuxdo_oauth_no_code",
+                                "Linux.do OAuth 回调缺少 code",
+                                "Linux.do OAuth failed - no code in callback",
+                            )
                     else:
                         print(f"❌ {self.account_name}: Approve button not found")
                         await take_screenshot(page, "approve_button_not_found_bypass", self.account_name)
-                        return False, {"error": "Linux.do allow button not found"}
+                        diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed:
+                            return False, diagnosed
+                        return False, _build_linuxdo_error(
+                            "linuxdo_allow_button_not_found",
+                            "Linux.do 授权页未找到允许按钮",
+                            "Linux.do allow button not found",
+                        )
 
                 except Exception as e:
                     print(
@@ -430,12 +561,30 @@ class LinuxDoSignIn:
                         f"Current page is: {page.url}"
                     )
                     await take_screenshot(page, "authorization_failed_bypass", self.account_name)
-                    return False, {"error": "Linux.do authorization failed"}
+                    diagnosed = await _diagnose_linuxdo_page_issue(page)
+                    if diagnosed:
+                        diagnosed["error_detail"] = f"{diagnosed['error_detail']}; authorization exception: {e}"
+                        diagnosed["error"] = diagnosed["error_detail"]
+                        return False, diagnosed
+                    return False, _build_linuxdo_error(
+                        "linuxdo_authorization_failed",
+                        "Linux.do 授权流程异常",
+                        f"Linux.do authorization failed: {e}",
+                    )
 
             except Exception as e:
                 print(f"❌ {self.account_name}: Error occurred while processing linux.do page: {e}")
                 await take_screenshot(page, "page_navigation_error_bypass", self.account_name)
-                return False, {"error": "Linux.do page navigation error"}
+                diagnosed = await _diagnose_linuxdo_page_issue(page)
+                if diagnosed:
+                    diagnosed["error_detail"] = f"{diagnosed['error_detail']}; page processing exception: {e}"
+                    diagnosed["error"] = diagnosed["error_detail"]
+                    return False, diagnosed
+                return False, _build_linuxdo_error(
+                    "linuxdo_page_navigation_error",
+                    "Linux.do 页面导航异常",
+                    f"Linux.do page navigation error: {e}",
+                )
             finally:
                 await page.close()
                 await context.close()

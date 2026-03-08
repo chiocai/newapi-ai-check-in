@@ -1,17 +1,23 @@
+import asyncio
 import sys
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import should_rebuild_provider_cache
+from checkin import should_rebuild_provider_cache, summarize_linuxdo_auth_state_error
 from main import (
 	apply_waf_runtime_overrides_for_failed_accounts,
 	build_site_notification_groups,
 	collect_failed_account_indices,
+	collect_linuxdo_backoff_retry_indices,
+	get_error_label,
+	prewarm_linuxdo_sessions,
 	rerun_failed_accounts_once,
+	should_enable_linuxdo_backoff_retry,
 	should_enable_waf_retry,
 )
+from utils.config import AccountConfig
 
 
 def test_build_site_notification_groups_merges_same_site_without_amounts():
@@ -104,6 +110,45 @@ def test_build_site_notification_groups_shows_success_detail_for_x666_and_anyrou
 	assert 'x666-2: 🎰 +$1800.0 | $0' in groups[0]['line']
 
 
+def test_build_site_notification_groups_prefers_structured_error_summary():
+	sorted_results = [
+		{
+			'provider': 'wong',
+			'site_origin': 'https://wzw.pp.ua',
+			'account_name': 'wong-2',
+			'success': False,
+			'status': 'failed',
+			'failed_methods': ['linux.do'],
+			'error_label': '🔥 高负载',
+			'error_summary': 'Linux.do 授权页高负载，请稍后重试',
+			'error': 'All 3 attempts failed: Linux.do authorization failed',
+		},
+	]
+
+	groups = build_site_notification_groups(sorted_results)
+
+	assert 'wong-2: 🔥 高负载' in groups[0]['line']
+	assert 'All 3 attempts failed' not in groups[0]['line']
+
+
+def test_build_site_notification_groups_uses_partial_error_label():
+	sorted_results = [
+		{
+			'provider': 'beta',
+			'site_origin': 'https://beta.example.com',
+			'account_name': 'beta-1',
+			'success': True,
+			'status': 'partial',
+			'failed_methods': ['linux.do'],
+			'error_label': '🧩 hCaptcha',
+		},
+	]
+
+	groups = build_site_notification_groups(sorted_results)
+
+	assert 'beta-1: 部分失败(linux.do, 🧩 hCaptcha)' in groups[0]['line']
+
+
 def test_collect_failed_account_indices():
 	account_results = [
 		{'success': True},
@@ -113,6 +158,41 @@ def test_collect_failed_account_indices():
 	]
 
 	assert collect_failed_account_indices(account_results) == [1, 2]
+
+
+def test_should_enable_linuxdo_backoff_retry():
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_high_load',
+		'error_summary': 'Linux.do 授权页高负载，请稍后重试',
+	}) is True
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_cloudflare_challenge',
+		'error_summary': 'Linux.do Cloudflare 挑战页',
+	}) is True
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_hcaptcha_login',
+		'error_summary': 'Linux.do 登录页人机验证(hCaptcha)',
+	}) is False
+
+
+def test_get_error_label():
+	assert get_error_label('linuxdo_hcaptcha_login', 'Linux.do 登录页人机验证(hCaptcha)') == '🧩 hCaptcha'
+	assert get_error_label('linuxdo_high_load', 'Linux.do 授权页高负载，请稍后重试') == '🔥 高负载'
+	assert get_error_label('linuxdo_auth_state_failed', '站点 auth state 403/疑似 WAF 拦截') == '🚧 auth state 403'
+
+
+def test_collect_linuxdo_backoff_retry_indices():
+	account_results = [
+		{'success': False, 'error_type': 'linuxdo_high_load', 'error_summary': 'Linux.do 授权页高负载，请稍后重试'},
+		{'success': False, 'error_type': 'linuxdo_hcaptcha_login', 'error_summary': 'Linux.do 登录页人机验证(hCaptcha)'},
+		{'success': True},
+		{'success': False, 'error_summary': 'Linux.do Cloudflare 挑战页'},
+	]
+
+	assert collect_linuxdo_backoff_retry_indices(account_results) == [0, 3]
 
 
 def test_rerun_failed_accounts_once_replaces_failed_results(monkeypatch):
@@ -136,6 +216,46 @@ def test_rerun_failed_accounts_once_replaces_failed_results(monkeypatch):
 	assert result[0]['success'] is True
 	assert result[1]['success'] is True
 	assert result[2]['success'] is True
+
+
+def test_prewarm_linuxdo_sessions_deduplicates_accounts(monkeypatch):
+	class DummySession:
+		def __init__(self, is_logged_in):
+			self.is_logged_in = is_logged_in
+
+	async def fake_get_session(username, password, proxy=None, auto_login=True):
+		calls.append((username, password, proxy, auto_login))
+		return DummySession(True)
+
+	monkeypatch.setattr('main.LinuxDoSessionManager.get_session', fake_get_session)
+	monkeypatch.setattr('main.LinuxDoSessionManager.get_session_count', lambda: 1)
+
+	calls = []
+	accounts = [
+		AccountConfig.from_dict({
+			'name': 'acc-1',
+			'provider': 'alpha',
+			'linux.do': {'username': 'user-a', 'password': 'pass-a'},
+		}, 0),
+		AccountConfig.from_dict({
+			'name': 'acc-2',
+			'provider': 'beta',
+			'linux.do': {'username': 'user-a', 'password': 'pass-a'},
+		}, 1),
+		AccountConfig.from_dict({
+			'name': 'acc-3',
+			'provider': 'gamma',
+			'linux.do': {'username': 'user-b', 'password': 'pass-b'},
+		}, 2),
+	]
+
+	result = asyncio.run(prewarm_linuxdo_sessions(accounts, None, reason='test warm-up'))
+
+	assert result == {'attempted': 2, 'successful': 2, 'failed': 0}
+	assert calls == [
+		('user-a', 'pass-a', None, True),
+		('user-b', 'pass-b', None, True),
+	]
 
 
 def test_should_enable_waf_retry_for_403_error():
@@ -192,3 +312,8 @@ def test_should_rebuild_provider_cache_for_anyrouter_html_like_error():
 	assert should_rebuild_provider_cache('anyrouter', 'Failed to get user info: Invalid response type') is True
 	assert should_rebuild_provider_cache('anyrouter', 'Failed to get user info: HTTP 403') is True
 	assert should_rebuild_provider_cache('aipm', 'other random error') is False
+
+
+def test_summarize_linuxdo_auth_state_error():
+	assert summarize_linuxdo_auth_state_error('Failed to get auth state: HTTP 403') == '站点 auth state 403/疑似 WAF 拦截'
+	assert summarize_linuxdo_auth_state_error('Failed to get auth state: Invalid response type') == '站点 auth state 返回 HTML'

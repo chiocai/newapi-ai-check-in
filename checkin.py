@@ -117,6 +117,26 @@ def should_rebuild_provider_cache(provider_name: str, error_msg: str) -> bool:
     return False
 
 
+def summarize_linuxdo_auth_state_error(error_msg: str) -> str:
+    """归纳 Linux.do auth state 失败原因，便于通知摘要展示"""
+    normalized = (error_msg or "").lower()
+
+    if "http 403" in normalized or normalized.strip() == "403":
+        return "站点 auth state 403/疑似 WAF 拦截"
+    if "invalid response type" in normalized or "text/html" in normalized or "html" in normalized:
+        return "站点 auth state 返回 HTML"
+    if "cloudflare" in normalized:
+        return "站点 auth state 被 Cloudflare 拦截"
+    if "timeout" in normalized:
+        return "站点 auth state 请求超时"
+    if "failed to get state" in normalized:
+        return "站点 auth state 浏览器获取失败"
+    if "failed to get auth state" in normalized:
+        return "站点 auth state 获取失败"
+
+    return f"站点 auth state 异常: {error_msg}"
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -1486,7 +1506,12 @@ class CheckIn:
                 else:
                     error_msg = client_id_result.get("error", "Unknown error")
                     print(f"❌ {self.account_name}: {error_msg}")
-                    return False, {"error": "Failed to get Linux.do client ID"}
+                    return False, {
+                        "error_type": "linuxdo_client_id_failed",
+                        "error_summary": "站点 Linux.do client_id 获取失败",
+                        "error_detail": error_msg,
+                        "error": f"Failed to get Linux.do client ID: {error_msg}",
+                    }
 
             # 获取 OAuth 认证状态
             # 如果需要绕过 WAF，使用浏览器获取 auth state
@@ -1503,7 +1528,12 @@ class CheckIn:
             else:
                 error_msg = auth_state_result.get("error", "Unknown error")
                 print(f"❌ {self.account_name}: {error_msg}")
-                return False, {"error": "Failed to get Linux.do auth state"}
+                return False, {
+                    "error_type": "linuxdo_auth_state_failed",
+                    "error_summary": summarize_linuxdo_auth_state_error(error_msg),
+                    "error_detail": error_msg,
+                    "error": f"Failed to get Linux.do auth state: {error_msg}",
+                }
 
             # 生成 Linux.do storage state 缓存文件路径
             cache_file_path = f"{self.storage_state_dir}/linuxdo_{username_hash}_storage_state.json"
@@ -1731,8 +1761,11 @@ class CheckIn:
                             cdk_results.extend(cdks)
                             raw_results.append(raw_result)
 
-                        if cdk_results:
-                            print(f"✅ {self.account_name}: get_cdk completed with {len(cdk_results)} result(s)")
+                        if raw_results:
+                            if cdk_results:
+                                print(f"✅ {self.account_name}: get_cdk completed with {len(cdk_results)} result(s)")
+                            else:
+                                print(f"✅ {self.account_name}: get_cdk completed with {len(raw_results)} raw result(s)")
 
                             # 如果需要 topup（有 topup_path 和 linuxdo_client_id），执行 CDK 兑换
                             if self.provider_config.needs_manual_topup() and self.provider_config.linuxdo_client_id and cdk_results:
@@ -1820,8 +1853,8 @@ class CheckIn:
 
                             results.append(("linux.do", True, {"success": True, "cdk_results": raw_results}))
                         else:
-                            print(f"ℹ️ {self.account_name}: get_cdk completed (no CDK returned, may be normal)")
-                            results.append(("linux.do", True, {"success": True, "message": "get_cdk completed", "cdk_results": raw_results}))
+                            print(f"❌ {self.account_name}: get_cdk returned no result")
+                            results.append(("linux.do", False, {"error": "get_cdk returned no result"}))
                     except Exception as cdk_err:
                         print(f"❌ {self.account_name}: get_cdk failed: {cdk_err}")
                         results.append(("linux.do", False, {"error": f"get_cdk failed: {cdk_err}"}))
