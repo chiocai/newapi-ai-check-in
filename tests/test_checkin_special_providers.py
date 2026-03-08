@@ -3,6 +3,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -92,3 +93,74 @@ def test_load_provider_session_cache_returns_stale_cache(tmp_path):
 	assert cache['cookies'] == {'session': 'abc'}
 	assert cache['api_user'] == '123'
 	assert cache['_stale'] is True
+
+
+def test_execute_check_in_short_circuits_when_status_checked_in(monkeypatch):
+	account_config = build_account('wong')
+	provider_config = ProviderConfig(
+		name='wong',
+		origin='https://wzw.pp.ua',
+		sign_in_path='/api/user/checkin',
+	)
+	checkin = CheckIn('wong-1', account_config, provider_config)
+
+	class DummyClient:
+		def get(self, url, headers=None, timeout=None):
+			return SimpleNamespace(status_code=200, text='{}')
+
+		def post(self, url, headers=None, timeout=None):
+			raise AssertionError('POST should not be called when status already checked_in')
+
+	monkeypatch.setattr('checkin.response_resolve', lambda response, *_args: {'success': True, 'data': {'checked_in': True}})
+
+	success, error_msg = checkin.execute_check_in(DummyClient(), {'New-API-User': '1'}, 1)
+
+	assert success is True
+	assert error_msg == ''
+
+
+def test_check_in_with_cookies_falls_back_to_browser_manual_checkin(monkeypatch):
+	account_config = build_account('wong')
+	provider_config = ProviderConfig(
+		name='wong',
+		origin='https://wzw.pp.ua',
+		sign_in_path='/api/user/checkin',
+		user_info_path='/api/user/self',
+	)
+	checkin = CheckIn('wong-1', account_config, provider_config)
+
+	class DummyClient:
+		def __init__(self, *args, **kwargs):
+			self.cookies = SimpleNamespace(update=lambda *_args, **_kwargs: None)
+
+		def close(self):
+			return None
+
+	monkeypatch.setattr('checkin.httpx.Client', DummyClient)
+	manual_calls = []
+	monkeypatch.setattr(checkin, 'execute_check_in', lambda *_args, **_kwargs: manual_calls.append(True) or (False, 'HTTP 401'))
+	monkeypatch.setattr(
+		checkin,
+		'execute_check_in_with_browser',
+		lambda *_args, **_kwargs: asyncio.sleep(0, result=(True, '')),
+	)
+	monkeypatch.setattr(
+		checkin,
+		'get_user_info',
+		lambda *_args, **_kwargs: asyncio.sleep(
+			0,
+			result={
+				'success': True,
+				'quota': 1,
+				'used_quota': 0,
+				'bonus_quota': 0,
+				'display': 'ok',
+			},
+		),
+	)
+
+	success, user_info = asyncio.run(checkin.check_in_with_cookies({'session': 'abc'}, 1))
+
+	assert manual_calls == [True]
+	assert success is True
+	assert user_info['success'] is True

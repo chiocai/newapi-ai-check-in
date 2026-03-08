@@ -959,10 +959,28 @@ class CheckIn:
         """
         print(f"🌐 {self.account_name}: Executing check-in")
 
+        sign_in_url = self.provider_config.get_sign_in_url(api_user)
         checkin_headers = headers.copy()
         checkin_headers.update({"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"})
+        if sign_in_url and sign_in_url.endswith("/api/user/checkin"):
+            checkin_headers["Referer"] = f"{self.provider_config.origin}/console/topup"
 
-        response = client.post(self.provider_config.get_sign_in_url(api_user), headers=checkin_headers, timeout=30)
+        # 某些非标准站点（如 wong）前端会先 GET /api/user/checkin 获取 checked_in 状态
+        if sign_in_url and sign_in_url.endswith("/api/user/checkin"):
+            try:
+                status_response = client.get(sign_in_url, headers=checkin_headers, timeout=30)
+                print(f"📨 {self.account_name}: Check-in status response code {status_response.status_code}")
+                if status_response.status_code in [200, 400]:
+                    status_json = response_resolve(status_response, "execute_check_in_status", self.account_name)
+                    if status_json and status_json.get("success"):
+                        status_data = status_json.get("data", {})
+                        if isinstance(status_data, dict) and status_data.get("checked_in"):
+                            print(f"ℹ️ {self.account_name}: Already checked in according to /api/user/checkin status")
+                            return True, ""
+            except Exception as status_err:
+                print(f"⚠️ {self.account_name}: Failed to get check-in status before POST: {status_err}")
+
+        response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
 
         print(f"📨 {self.account_name}: Response status code {response.status_code}")
 
@@ -996,6 +1014,100 @@ class CheckIn:
         else:
             print(f"❌ {self.account_name}: Check-in failed - HTTP {response.status_code}")
             return False, f"HTTP {response.status_code}"
+
+    def should_use_browser_manual_check_in(self, api_user: str | int) -> bool:
+        """判断是否应优先使用浏览器版手动签到"""
+        return False
+
+    async def execute_check_in_with_browser(
+        self,
+        auth_cookies: list[dict],
+        api_user: str | int,
+        page_path: str = "/console/topup",
+    ) -> tuple[bool, str]:
+        """使用浏览器页面上下文执行手动签到，更贴近前端实际行为"""
+        print(
+            f"ℹ️ {self.account_name}: Executing browser-based manual check-in at {page_path} "
+            f"(using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
+        )
+
+        sign_in_url = self.provider_config.get_sign_in_url(api_user)
+        if not sign_in_url:
+            return False, "No sign-in URL configured"
+
+        with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_manual_checkin_") as tmp_dir:
+            async with AsyncCamoufox(
+                user_data_dir=tmp_dir,
+                persistent_context=True,
+                headless=True,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.camoufox_proxy_config else False,
+                proxy=self.camoufox_proxy_config,
+            ) as browser:
+                page = await browser.new_page()
+
+                if auth_cookies:
+                    await browser.add_cookies(auth_cookies)
+
+                try:
+                    await page.goto(f"{self.provider_config.origin}{page_path}", wait_until="networkidle", timeout=60000)
+                    await page.wait_for_timeout(2000)
+
+                    result = await page.evaluate(
+                        f"""async () => {{
+                            const headers = {{
+                                'Content-Type': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                '{self.provider_config.api_user_key}': '{api_user}',
+                            }};
+
+                            try {{
+                                const statusResp = await fetch('{sign_in_url}', {{
+                                    method: 'GET',
+                                    headers,
+                                    credentials: 'include'
+                                }});
+                                const statusData = await statusResp.json().catch(() => null);
+                                if (statusData && statusData.success && statusData.data && statusData.data.checked_in) {{
+                                    return {{ success: true, already_checked: true, message: '今天已经签到过啦' }};
+                                }}
+                            }} catch (e) {{
+                                // ignore status failure, continue POST
+                            }}
+
+                            try {{
+                                const resp = await fetch('{sign_in_url}', {{
+                                    method: 'POST',
+                                    headers,
+                                    credentials: 'include'
+                                }});
+                                const data = await resp.json().catch(() => null);
+                                return {{
+                                    success: !!(data && (data.success || data.ret === 1 || data.code === 0)),
+                                    message: data ? (data.message || data.msg || '') : `HTTP ${{resp.status}}`,
+                                    raw: data,
+                                    status: resp.status
+                                }};
+                            }} catch (e) {{
+                                return {{ success: false, message: e.message }};
+                            }}
+                        }}"""
+                    )
+
+                    message = result.get("message", "")
+                    if result.get("success") or "已签到" in message or "今天已经签到" in message:
+                        print(f"✅ {self.account_name}: Browser manual check-in successful - {message}")
+                        return True, ""
+
+                    print(f"❌ {self.account_name}: Browser manual check-in failed - {message}")
+                    return False, message or "Browser manual check-in failed"
+                except Exception as e:
+                    print(f"❌ {self.account_name}: Browser manual check-in error: {e}")
+                    await take_screenshot(page, "manual_checkin_browser_error", self.account_name)
+                    return False, f"Browser manual check-in error: {e}"
+                finally:
+                    await page.close()
 
     async def execute_topup(
         self,
@@ -1134,9 +1246,48 @@ class CheckIn:
             }
 
             if self.provider_config.needs_manual_check_in():
-                success, error_msg = self.execute_check_in(client, headers, api_user)
-                if not success:
-                    return False, {"error": error_msg or "Check-in failed"}
+                sign_in_url = self.provider_config.get_sign_in_url(api_user) or ""
+                if self.should_use_browser_manual_check_in(api_user):
+                    print(f"ℹ️ {self.account_name}: Using browser manual check-in flow")
+                    auth_cookies_list = []
+                    parsed_domain = urlparse(self.provider_config.origin).netloc
+                    for name, value in cookies.items():
+                        auth_cookies_list.append({
+                            "name": name,
+                            "value": value,
+                            "domain": parsed_domain,
+                            "path": "/",
+                        })
+                    browser_success, browser_error = await self.execute_check_in_with_browser(
+                        auth_cookies_list,
+                        api_user,
+                        page_path="/console/topup",
+                    )
+                    if not browser_success:
+                        return False, {"error": browser_error or "Check-in failed"}
+                else:
+                    success, error_msg = self.execute_check_in(client, headers, api_user)
+                    if not success:
+                        if sign_in_url.endswith("/api/user/checkin"):
+                            print(f"⚠️ {self.account_name}: HTTP manual check-in failed, trying browser manual check-in fallback")
+                            auth_cookies_list = []
+                            parsed_domain = urlparse(self.provider_config.origin).netloc
+                            for name, value in cookies.items():
+                                auth_cookies_list.append({
+                                    "name": name,
+                                    "value": value,
+                                    "domain": parsed_domain,
+                                    "path": "/",
+                                })
+                            browser_success, browser_error = await self.execute_check_in_with_browser(
+                                auth_cookies_list,
+                                api_user,
+                                page_path="/console/topup",
+                            )
+                            if not browser_success:
+                                return False, {"error": browser_error or error_msg or "Check-in failed"}
+                        else:
+                            return False, {"error": error_msg or "Check-in failed"}
             else:
                 print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
 
