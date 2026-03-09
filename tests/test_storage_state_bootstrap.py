@@ -8,6 +8,7 @@ sys.path.insert(0, str(project_root))
 from bootstrap_storage_states import (
 	bootstrap_storage_states_from_accounts_env,
 	load_storage_states_payload,
+	purge_prewarmed_linuxdo_storage_states,
 	restore_storage_states,
 )
 from export_storage_states_secret import collect_storage_state_files
@@ -78,7 +79,53 @@ def test_bootstrap_storage_states_from_accounts_env(monkeypatch, tmp_path):
 		),
 	)
 
-	written, skipped = bootstrap_storage_states_from_accounts_env(storage_dir=str(tmp_path))
+	deleted, written, skipped = bootstrap_storage_states_from_accounts_env(storage_dir=str(tmp_path))
 
+	assert deleted == []
 	assert written == ['linuxdo_demo_storage_state.json']
 	assert skipped == []
+
+
+def test_bootstrap_storage_states_from_accounts_env_purges_existing(monkeypatch, tmp_path):
+	(tmp_path / 'linuxdo_old_storage_state.json').write_text(
+		json.dumps({'cookies': [{'name': 'old'}], 'origins': []}),
+		encoding='utf-8',
+	)
+	monkeypatch.setenv(
+		'ACCOUNTS',
+		json.dumps(
+			{
+				'linux.do': [],
+				'accounts': [],
+				'linuxdo_storage_states': {
+					'linuxdo_demo_storage_state.json': {
+						'cookies': [],
+						'origins': [],
+					}
+				},
+			},
+			ensure_ascii=False,
+		),
+	)
+
+	deleted, written, skipped = bootstrap_storage_states_from_accounts_env(
+		storage_dir=str(tmp_path),
+		overwrite=True,
+		purge_existing=True,
+	)
+
+	assert deleted == ['linuxdo_old_storage_state.json']
+	assert written == ['linuxdo_demo_storage_state.json']
+	assert skipped == []
+	assert not (tmp_path / 'linuxdo_old_storage_state.json').exists()
+
+
+def test_purge_prewarmed_linuxdo_storage_states_only_removes_linuxdo_prefix(tmp_path):
+	(tmp_path / 'linuxdo_demo_storage_state.json').write_text('{}', encoding='utf-8')
+	(tmp_path / 'provider_anyrouter_demo_session.json').write_text('{}', encoding='utf-8')
+
+	deleted = purge_prewarmed_linuxdo_storage_states(str(tmp_path))
+
+	assert deleted == ['linuxdo_demo_storage_state.json']
+	assert not (tmp_path / 'linuxdo_demo_storage_state.json').exists()
+	assert (tmp_path / 'provider_anyrouter_demo_session.json').exists()

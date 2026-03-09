@@ -14,6 +14,7 @@ DEFAULT_ENV_NAME = 'PREWARMED_STORAGE_STATES'
 DEFAULT_B64_ENV_NAME = 'PREWARMED_STORAGE_STATES_B64'
 DEFAULT_ACCOUNTS_ENV_NAME = 'ACCOUNTS'
 DEFAULT_ACCOUNTS_KEY = 'linuxdo_storage_states'
+PREWARMED_LINUXDO_GLOB = 'linuxdo_*_storage_state.json'
 
 
 def load_storage_states_payload(raw_payload: str | None = None, raw_payload_b64: str | None = None) -> dict:
@@ -66,6 +67,19 @@ def restore_storage_states(payload: dict, storage_dir: str = DEFAULT_STORAGE_DIR
 	return written, skipped
 
 
+def purge_prewarmed_linuxdo_storage_states(storage_dir: str = DEFAULT_STORAGE_DIR) -> list[str]:
+	"""删除当前环境中已有的 LinuxDo 预热 storage state 文件"""
+	storage_path = Path(storage_dir)
+	if not storage_path.exists():
+		return []
+
+	deleted = []
+	for path in sorted(storage_path.glob(PREWARMED_LINUXDO_GLOB)):
+		path.unlink(missing_ok=True)
+		deleted.append(path.name)
+	return deleted
+
+
 def load_storage_states_from_accounts(accounts_payload: str | None, accounts_key: str = DEFAULT_ACCOUNTS_KEY) -> dict:
 	"""从 ACCOUNTS 顶层字段提取预热 storage states"""
 	if not accounts_payload:
@@ -87,13 +101,17 @@ def bootstrap_storage_states_from_accounts_env(
 	accounts_key: str = DEFAULT_ACCOUNTS_KEY,
 	storage_dir: str = DEFAULT_STORAGE_DIR,
 	overwrite: bool = False,
-) -> tuple[list[str], list[str]]:
+	purge_existing: bool = False,
+) -> tuple[list[str], list[str], list[str]]:
 	"""从 ACCOUNTS 环境变量恢复预热 storage states"""
 	accounts_payload = os.getenv(accounts_env)
 	payload = load_storage_states_from_accounts(accounts_payload, accounts_key=accounts_key)
 	if not payload:
-		return [], []
-	return restore_storage_states(payload, storage_dir=storage_dir, overwrite=overwrite)
+		return [], [], []
+
+	deleted = purge_prewarmed_linuxdo_storage_states(storage_dir=storage_dir) if purge_existing else []
+	written, skipped = restore_storage_states(payload, storage_dir=storage_dir, overwrite=overwrite)
+	return deleted, written, skipped
 
 
 def main() -> int:

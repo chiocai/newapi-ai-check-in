@@ -23,7 +23,12 @@ from utils.notify import notify
 from utils.site_discovery import ensure_runtime_site_overrides, update_runtime_site_override
 
 load_dotenv(override=True)
-restored_from_accounts, skipped_from_accounts = bootstrap_storage_states_from_accounts_env()
+deleted_from_accounts, restored_from_accounts, skipped_from_accounts = bootstrap_storage_states_from_accounts_env(
+    overwrite=True,
+    purge_existing=True,
+)
+if deleted_from_accounts:
+    print(f"🧹 Deleted {len(deleted_from_accounts)} existing LinuxDo prewarmed file(s) before restore")
 if restored_from_accounts:
     print(f"✅ Restored {len(restored_from_accounts)} prewarmed storage state file(s) from ACCOUNTS")
 elif skipped_from_accounts:
