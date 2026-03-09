@@ -93,6 +93,10 @@ Neb公益站 | https://ai.zzhdsgsss.xyz | newapi
 赶紧蹬 | https://bus.042999.xyz | newapi
 42API | https://api.42w.shop | newapi-waf
 431128hys | https://newapi.431128hys.site | newapi-waf
-光速API | https://chat.gsyun.cloud | newapi
+光速API | https://chat.gsyun.cloud | newapi-waf
 CM-API | https://api.chengmo.cc.cd | newapi
 你好API | https://nih.cc | newapi
+Nouz | https://new.nouz.cn | newapi
+大可乐 | https://bigkele.us.ci | newapi
+Mihoyo | https://api.mihoyo.bio | newapi
+lsAPI | https://callxyq.xyz | newapi
