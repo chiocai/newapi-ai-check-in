@@ -182,12 +182,19 @@ def test_should_enable_linuxdo_backoff_retry():
 		'error_type': 'linuxdo_hcaptcha_login',
 		'error_summary': 'Linux.do 登录页人机验证(hCaptcha)',
 	}) is False
+	assert should_enable_linuxdo_backoff_retry({
+		'success': False,
+		'error_type': 'linuxdo_prewarmed_state_invalid',
+		'error_summary': 'Linux.do 预热会话已失效，请重新预热',
+	}) is False
 
 
 def test_get_error_label():
 	assert get_error_label('linuxdo_hcaptcha_login', 'Linux.do 登录页人机验证(hCaptcha)') == '🧩 hCaptcha'
 	assert get_error_label('linuxdo_high_load', 'Linux.do 授权页高负载，请稍后重试') == '🔥 高负载'
 	assert get_error_label('linuxdo_sso_provider_stuck', 'Linux.do SSO 中转页卡住') == '🔄 SSO 卡住'
+	assert get_error_label('linuxdo_prewarmed_state_missing', 'Linux.do 预热会话不存在，请先重新预热') == '🗂️ 缺少预热态'
+	assert get_error_label('linuxdo_prewarmed_state_invalid', 'Linux.do 预热会话已失效，请重新预热') == '♻️ 预热态失效'
 	assert get_error_label('linuxdo_circuit_open', 'Linux.do OAuth 已熔断，本轮跳过') == '⛔ OAuth 熔断'
 	assert get_error_label('linuxdo_auth_state_failed', '站点 auth state 403/疑似 WAF 拦截') == '🚧 auth state 403'
 	assert get_error_label(None, None, 'Linux.do SSO provider page is stuck at https://linux.do/session/sso_provider') == '🔄 SSO 卡住'
@@ -226,6 +233,11 @@ def test_should_skip_failed_retry():
 		'error_type': 'linuxdo_hcaptcha_login',
 		'error_label': '🧩 hCaptcha',
 	}) is False
+	assert should_skip_failed_retry({
+		'success': False,
+		'error_type': 'linuxdo_prewarmed_state_missing',
+		'error_label': '🗂️ 缺少预热态',
+	}) is True
 
 
 def test_rerun_failed_accounts_once_replaces_failed_results(monkeypatch):

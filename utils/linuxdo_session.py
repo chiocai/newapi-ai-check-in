@@ -69,19 +69,13 @@ class LinuxDoSession:
             if is_valid:
                 self.is_logged_in = True
                 return True
-            print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache expired, need to re-login")
-
-        # 执行登录
-        print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Starting login...")
-        success = await self._do_login()
-        if success:
-            self.is_logged_in = True
-            print(f"✅ LinuxDoSession [{self.username_hash}]: Login successful")
-        else:
             self.invalidate()
-            print(f"❌ LinuxDoSession [{self.username_hash}]: Login failed")
+            print(f"❌ LinuxDoSession [{self.username_hash}]: Cache invalid, manual warm-up is required")
+            return False
 
-        return success
+        print(f"❌ LinuxDoSession [{self.username_hash}]: No prewarmed cache file found")
+        self.invalidate()
+        return False
 
     async def _verify_cached_session(self) -> bool:
         """验证缓存的会话是否有效
@@ -125,38 +119,11 @@ class LinuxDoSession:
                     if "linux.do/login" in current_url:
                         return False
 
-                    # 主页状态不明确时，再访问 connect.linux.do 做一次更接近 OAuth 的校验
-                    # 仅在模糊状态下追加，避免每次预热都额外打授权链路
+                    # 预热模式下只要主页没有回到登录页，也没有出现登录按钮，就优先信任这份缓存。
+                    # 真实是否可用于 OAuth 交给后续站点授权流程判断，避免在预检阶段误杀可用会话。
                     print(
-                        f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session is ambiguous on homepage, "
-                        "verifying via connect.linux.do"
+                        f"✅ LinuxDoSession [{self.username_hash}]: Cache session looks reusable from linux.do homepage"
                     )
-                    await page.goto("https://connect.linux.do", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(1000)
-
-                    current_url = page.url.lower()
-                    if "login" in current_url:
-                        print(
-                            f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session expired "
-                            "(redirected to login from connect.linux.do)"
-                        )
-                        return False
-
-                    guard = await detect_linuxdo_page_guard(page)
-                    if guard.get("human_verification") or guard.get("cloudflare_challenge"):
-                        print(
-                            f"⚠️ LinuxDoSession [{self.username_hash}]: Cache session hit verification challenge during connect check"
-                        )
-                        return False
-
-                    if "linux.do/session/sso_provider" in current_url:
-                        print(
-                            f"⚠️ LinuxDoSession [{self.username_hash}]: Cache session stalled at Linux.do SSO provider page "
-                            "during connect check"
-                        )
-                        return False
-
-                    print(f"✅ LinuxDoSession [{self.username_hash}]: Cache session verified via connect.linux.do")
                     self._storage_state = await context.storage_state()
                     return True
 

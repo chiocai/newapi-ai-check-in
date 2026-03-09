@@ -12,13 +12,10 @@ from urllib.parse import parse_qs
 from camoufox.async_api import AsyncCamoufox
 
 from utils.browser_utils import (
-    attempt_linuxdo_human_verification,
     detect_linuxdo_page_guard,
     filter_cookies,
-    has_linuxdo_human_verification,
     save_page_content_to_file,
     take_screenshot,
-    wait_for_linuxdo_login_ready,
 )
 from utils.config import ProviderConfig
 
@@ -29,8 +26,6 @@ if TYPE_CHECKING:
 TIMEOUT_PAGE_LOAD = 60000  # 页面加载超时
 TIMEOUT_ELEMENT_WAIT = 45000  # 元素等待超时
 TIMEOUT_CLOUDFLARE = 90000  # Cloudflare 验证超时
-TIMEOUT_FILL = 30000  # 填写表单超时
-TIMEOUT_CLICK = 30000  # 点击超时
 TIMEOUT_NAVIGATION = 45000  # 导航超时
 
 # 重试配置
@@ -168,24 +163,12 @@ class LinuxDoSignIn:
         last_error = None
         last_error_summary = None
         last_result_payload = None
-        pending_force_fresh_login = False
-        fresh_login_retry_used = False
-        recoverable_session_error_types = {
-            'linuxdo_sso_provider_stuck',
-            'linuxdo_redirect_login',
-        }
-        has_cached_state_hint = bool(self.shared_session) or bool(cache_file_path and os.path.exists(cache_file_path))
 
         for attempt in range(1, MAX_RETRIES + 1):
-            force_fresh_login = pending_force_fresh_login
-            pending_force_fresh_login = False
             try:
                 if attempt > 1:
-                    if force_fresh_login:
-                        print(f"ℹ️ {self.account_name}: Retrying once with fresh Linux.do login")
-                    else:
-                        print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
-                        await asyncio.sleep(RETRY_DELAY)
+                    print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
+                    await asyncio.sleep(RETRY_DELAY)
 
                 async with get_linuxdo_signin_semaphore():
                     result = await self._signin_impl(
@@ -193,7 +176,6 @@ class LinuxDoSignIn:
                         auth_state,
                         auth_cookies,
                         cache_file_path,
-                        force_fresh_login=force_fresh_login,
                     )
                 if result[0]:
                     return result
@@ -203,28 +185,15 @@ class LinuxDoSignIn:
                 last_error_summary = last_result_payload.get('error_summary', last_error)
                 error_type = last_result_payload.get('error_type')
 
-                if (
-                    not force_fresh_login
-                    and not fresh_login_retry_used
-                    and has_cached_state_hint
-                    and error_type in recoverable_session_error_types
-                ):
-                    fresh_login_retry_used = True
-                    pending_force_fresh_login = True
-                    print(
-                        f"⚠️ {self.account_name}: Cached Linux.do session failed with {error_type}, "
-                        "retrying once with fresh login"
-                    )
-                    if self.shared_session:
-                        self.shared_session.invalidate()
-                    continue
-
                 non_retry_error_types = {
                     'linuxdo_hcaptcha_login',
                     'linuxdo_hcaptcha_authorize',
                     'linuxdo_cloudflare_challenge',
                     'linuxdo_high_load',
-                    *recoverable_session_error_types,
+                    'linuxdo_sso_provider_stuck',
+                    'linuxdo_redirect_login',
+                    'linuxdo_prewarmed_state_missing',
+                    'linuxdo_prewarmed_state_invalid',
                 }
                 non_retry_keywords = [
                     'not found',
@@ -235,6 +204,7 @@ class LinuxDoSignIn:
                     'high load',
                     'sso provider page is stuck',
                     'redirected back to login page',
+                    'prewarmed linuxdo storage state',
                 ]
                 if error_type in non_retry_error_types or any(
                     keyword in str(last_error).lower() for keyword in non_retry_keywords
@@ -337,14 +307,8 @@ class LinuxDoSignIn:
             await take_screenshot(page, "linuxdo_sso_provider_stuck", self.account_name)
         return current_url
 
-    async def _resolve_storage_state(self, cache_file_path: str = '', force_fresh_login: bool = False):
+    async def _resolve_storage_state(self, cache_file_path: str = ''):
         """解析当前登录流程应使用的 storage state"""
-        storage_state = None
-        if force_fresh_login:
-            print(f"ℹ️ {self.account_name}: Force fresh Linux.do login, skipping cached storage state")
-            return None
-
-        skip_cache_file = False
         if self.shared_session:
             if getattr(self.shared_session, 'is_logged_in', False):
                 shared_state = await self.shared_session.get_storage_state()
@@ -352,22 +316,16 @@ class LinuxDoSignIn:
                     print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
                     return shared_state
 
-                shared_state_path = self.shared_session.get_storage_state_path()
-                if os.path.exists(shared_state_path):
-                    print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
-                    return shared_state_path
-            else:
-                skip_cache_file = True
-                print(
-                    f"ℹ️ {self.account_name}: Shared Linux.do session is not logged in for this run, "
-                    "skip cached storage state"
-                )
+            shared_state_path = self.shared_session.get_storage_state_path()
+            if os.path.exists(shared_state_path):
+                print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
+                return shared_state_path
 
-        if not skip_cache_file and cache_file_path and os.path.exists(cache_file_path):
+        if cache_file_path and os.path.exists(cache_file_path):
             print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
             return cache_file_path
 
-        return storage_state
+        return None
 
     async def _signin_impl(
         self,
@@ -375,7 +333,6 @@ class LinuxDoSignIn:
         auth_state: str,
         auth_cookies: list,
         cache_file_path: str = "",
-        force_fresh_login: bool = False,
     ) -> tuple[bool, dict]:
         """实际的登录实现"""
         print(f"ℹ️ {self.account_name}: Executing sign-in with Linux.do")
@@ -384,10 +341,14 @@ class LinuxDoSignIn:
         )
 
         # 确定 storage_state 来源：优先使用共享会话
-        storage_state = await self._resolve_storage_state(cache_file_path, force_fresh_login=force_fresh_login)
+        storage_state = await self._resolve_storage_state(cache_file_path)
 
         if not storage_state:
-            print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
+            return False, _build_linuxdo_error(
+                'linuxdo_prewarmed_state_missing',
+                'Linux.do 预热会话不存在，请先重新预热',
+                'No prewarmed LinuxDo storage state is available for this account',
+            )
 
         # 使用 Camoufox 启动浏览器
         async with AsyncCamoufox(
@@ -481,165 +442,22 @@ class LinuxDoSignIn:
                                 elif "connect.linux.do" in current_url:
                                     print(
                                         f"⚠️ {self.account_name}: Cache session reached connect.linux.do but approve button is missing, "
-                                        "fallback to fresh Linux.do login"
+                                        "mark it as invalid prewarmed session"
                                     )
                                 else:
-                                    print(f"ℹ️ {self.account_name}: Cache session expired, need to login again")
+                                    print(f"⚠️ {self.account_name}: Cache session is not reusable for OAuth")
                     except Exception as e:
                         print(f"⚠️ {self.account_name}: Failed to check login status: {e}")
 
-                # 如果未登录，则执行登录流程
                 if not is_logged_in:
-                    try:
-                        print(f"ℹ️ {self.account_name}: Starting to sign in linux.do")
-
-                        await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-
-                        try:
-                            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
-                        except Exception as ready_err:
-                            guard = await detect_linuxdo_page_guard(page)
-                            print(f"⚠️ {self.account_name}: Login form not ready: {ready_err}")
-                            if guard.get("human_verification"):
-                                await save_page_content_to_file(page, "linuxdo_hcaptcha_before_login_ready", self.account_name, prefix="linuxdo")
-                                await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", self.account_name)
-                                sitekey = guard.get("human_verification_sitekey")
-                                suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, _build_linuxdo_error(
-                                    "linuxdo_hcaptcha_login",
-                                    "Linux.do 登录前需要人机验证(hCaptcha)",
-                                    f"LinuxDo login blocked by Human Verification before form ready{suffix}",
-                                    sitekey=sitekey,
-                                )
-                            if guard.get("cloudflare_challenge"):
-                                await save_page_content_to_file(page, "linuxdo_cloudflare_before_login_ready", self.account_name, prefix="linuxdo")
-                                await take_screenshot(page, "linuxdo_cloudflare_before_login_ready", self.account_name)
-                                return False, _build_linuxdo_error(
-                                    "linuxdo_cloudflare_challenge",
-                                    "Linux.do 登录前被 Cloudflare 挑战页拦截",
-                                    "LinuxDo login blocked by Cloudflare challenge before form ready",
-                                )
-                            await page.wait_for_timeout(2000)
-                            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
-
-                        await page.fill("#login-account-name", self.username, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(500)
-                        await page.fill("#login-account-password", self.password, timeout=TIMEOUT_FILL)
-                        await page.wait_for_timeout(500)
-
-                        if await has_linuxdo_human_verification(page):
-                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
-                            if not solved:
-                                guard = await detect_linuxdo_page_guard(page)
-                                await save_page_content_to_file(page, "linuxdo_hcaptcha_detected", self.account_name, prefix="linuxdo")
-                                await take_screenshot(page, "linuxdo_hcaptcha_detected", self.account_name)
-                                sitekey = guard.get("human_verification_sitekey")
-                                suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, _build_linuxdo_error(
-                                    "linuxdo_hcaptcha_login",
-                                    "Linux.do 登录前需要人机验证(hCaptcha)",
-                                    (
-                                        f"LinuxDo login requires Human Verification (hCaptcha){suffix}. "
-                                        "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                                    ),
-                                    sitekey=sitekey,
-                                )
-
-                        await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                        # 等待登录完成：检测用户元素出现或 URL 变化
-                        try:
-                            await page.wait_for_selector(".current-user", timeout=15000)
-                        except Exception:
-                            await page.wait_for_timeout(3000)
-
-                        await save_page_content_to_file(page, "sign_in_result", self.account_name, prefix="linuxdo")
-
-                        try:
-                            current_url = page.url
-                            print(f"ℹ️ {self.account_name}: Current page url is {current_url}")
-                            if "linux.do/challenge" in current_url:
-                                print(
-                                    f"⚠️ {self.account_name}: Cloudflare challenge detected, "
-                                    "Camoufox should bypass it automatically. Waiting..."
-                                )
-                                # 等待 Cloudflare 验证完成
-                                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_CLOUDFLARE)
-                                print(f"✅ {self.account_name}: Cloudflare challenge bypassed successfully")
-
-                        except Exception as e:
-                            print(f"⚠️ {self.account_name}: Possible Cloudflare challenge: {e}")
-                            # 即使超时，也尝试继续
-                            pass
-
-                        post_login_guard = await detect_linuxdo_page_guard(page)
-                        if "linux.do/login" in page.url and post_login_guard.get("human_verification"):
-                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
-                            if solved:
-                                print(f"ℹ️ {self.account_name}: Human Verification solved after login submit, retrying login once")
-                                await page.click("#login-button", timeout=TIMEOUT_CLICK)
-                                await page.wait_for_timeout(5000)
-                                post_login_guard = await detect_linuxdo_page_guard(page)
-
-                            if "linux.do/login" in page.url and post_login_guard.get("human_verification"):
-                                await save_page_content_to_file(
-                                    page, "linuxdo_hcaptcha_after_login_click", self.account_name, prefix="linuxdo"
-                                )
-                                await take_screenshot(page, "linuxdo_hcaptcha_after_login_click", self.account_name)
-                                sitekey = post_login_guard.get("human_verification_sitekey")
-                                suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, _build_linuxdo_error(
-                                    "linuxdo_hcaptcha_login",
-                                    "Linux.do 提交登录后仍需人机验证(hCaptcha)",
-                                    (
-                                        f"LinuxDo login still requires Human Verification after submit{suffix}. "
-                                        "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                                    ),
-                                    sitekey=sitekey,
-                                )
-
-                        current_url = page.url
-                        current_user = await page.query_selector(".current-user")
-                        if current_user or "linux.do/login" not in current_url:
-                            await context.storage_state(path=cache_file_path)
-                            print(f"✅ {self.account_name}: Storage state saved to cache file")
-                        else:
-                            print(f"⚠️ {self.account_name}: Login not confirmed, skip overwriting LinuxDo cache file")
-
-                    except Exception as e:
-                        print(f"❌ {self.account_name}: Error occurred while signing in linux.do: {e}")
-                        await take_screenshot(page, "signin_bypass_error", self.account_name)
-                        diagnosed = await _diagnose_linuxdo_page_issue(page)
-                        if diagnosed:
-                            diagnosed["error_detail"] = f"{diagnosed['error_detail']}; original exception: {e}"
-                            diagnosed["error"] = diagnosed["error_detail"]
-                            return False, diagnosed
-                        return False, _build_linuxdo_error(
-                            "linuxdo_signin_error",
-                            "Linux.do 登录流程异常",
-                            f"Linux.do sign-in error: {e}",
-                        )
-
-                    # 登录后访问授权页面
-                    try:
-                        print(f"ℹ️ {self.account_name}: Navigating to authorization page: {oauth_url}")
-                        try:
-                            await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
-                        except Exception:
-                            await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                            await page.wait_for_timeout(3000)
-                    except Exception as e:
-                        print(f"❌ {self.account_name}: Failed to navigate to authorization page: {e}")
-                        await take_screenshot(page, "auth_page_navigation_failed_bypass", self.account_name)
-                        diagnosed = await _diagnose_linuxdo_page_issue(page)
-                        if diagnosed:
-                            diagnosed["error_detail"] = f"{diagnosed['error_detail']}; navigate exception: {e}"
-                            diagnosed["error"] = diagnosed["error_detail"]
-                            return False, diagnosed
-                        return False, _build_linuxdo_error(
-                            "linuxdo_authorization_navigation_failed",
-                            "Linux.do 授权页打开失败",
-                            f"Linux.do authorization page navigation failed: {e}",
-                        )
+                    diagnosed = await _diagnose_linuxdo_page_issue(page)
+                    if diagnosed:
+                        return False, diagnosed
+                    return False, _build_linuxdo_error(
+                        "linuxdo_prewarmed_state_invalid",
+                        "Linux.do 预热会话已失效，请重新预热",
+                        f"Prewarmed LinuxDo storage state is not reusable for OAuth: {page.url}",
+                    )
 
                 # 统一处理授权逻辑（无论是否通过缓存登录）
                 try:
@@ -656,24 +474,6 @@ class LinuxDoSignIn:
                             )
 
                     if "linux.do/login" in page.url:
-                        guard = await detect_linuxdo_page_guard(page)
-                        if guard.get("human_verification"):
-                            solved = await attempt_linuxdo_human_verification(page, self.account_name)
-                            if not solved:
-                                print(f"❌ {self.account_name}: Redirected back to LinuxDo login with Human Verification")
-                                await save_page_content_to_file(
-                                    page, "linuxdo_authorize_hcaptcha", self.account_name, prefix="linuxdo"
-                                )
-                                await take_screenshot(page, "linuxdo_authorize_hcaptcha", self.account_name)
-                                sitekey = guard.get("human_verification_sitekey")
-                                suffix = f", sitekey={sitekey}" if sitekey else ""
-                                return False, _build_linuxdo_error(
-                                    "linuxdo_hcaptcha_authorize",
-                                    "Linux.do 授权页人机验证(hCaptcha)",
-                                    f"LinuxDo authorization blocked by Human Verification (hCaptcha){suffix}",
-                                    sitekey=sitekey,
-                                )
-
                         print(f"❌ {self.account_name}: Redirected back to LinuxDo login page before authorization")
                         await save_page_content_to_file(page, "linuxdo_authorize_redirect_login", self.account_name, prefix="linuxdo")
                         await take_screenshot(page, "linuxdo_authorize_redirect_login", self.account_name)

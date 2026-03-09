@@ -75,6 +75,8 @@ def get_error_label(
         'linuxdo_high_load': '🔥 高负载',
         'linuxdo_sso_provider_stuck': '🔄 SSO 卡住',
         'linuxdo_redirect_login': '🔑 会话失效',
+        'linuxdo_prewarmed_state_missing': '🗂️ 缺少预热态',
+        'linuxdo_prewarmed_state_invalid': '♻️ 预热态失效',
         'linuxdo_circuit_open': '⛔ OAuth 熔断',
         'linuxdo_client_id_failed': '🆔 client_id',
         'linuxdo_allow_button_not_found': '🚫 未找到允许按钮',
@@ -341,7 +343,14 @@ def should_skip_failed_retry(result: dict) -> bool:
         return False
 
     error_type = result.get("error_type", "")
-    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login", "linuxdo_circuit_open"}:
+    if error_type in {
+        "linuxdo_high_load",
+        "linuxdo_sso_provider_stuck",
+        "linuxdo_redirect_login",
+        "linuxdo_prewarmed_state_missing",
+        "linuxdo_prewarmed_state_invalid",
+        "linuxdo_circuit_open",
+    }:
         return True
 
     error_text = " ".join(
@@ -364,7 +373,14 @@ def should_enable_linuxdo_backoff_retry(result: dict) -> bool:
         return False
 
     error_type = result.get("error_type", "")
-    if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login", "linuxdo_circuit_open"}:
+    if error_type in {
+        "linuxdo_high_load",
+        "linuxdo_sso_provider_stuck",
+        "linuxdo_redirect_login",
+        "linuxdo_prewarmed_state_missing",
+        "linuxdo_prewarmed_state_invalid",
+        "linuxdo_circuit_open",
+    }:
         return False
     if error_type in {"linuxdo_cloudflare_challenge"}:
         return True

@@ -1730,7 +1730,13 @@ class CheckIn:
 
             if not success and isinstance(result_data, dict):
                 error_type = result_data.get("error_type", "")
-                if error_type in {"linuxdo_high_load", "linuxdo_sso_provider_stuck", "linuxdo_redirect_login"}:
+                if error_type in {
+                    "linuxdo_high_load",
+                    "linuxdo_sso_provider_stuck",
+                    "linuxdo_redirect_login",
+                    "linuxdo_prewarmed_state_missing",
+                    "linuxdo_prewarmed_state_invalid",
+                }:
                     LinuxDoSessionManager.trip_circuit(
                         username,
                         result_data.get("error_detail") or result_data.get("error_summary") or error_type,

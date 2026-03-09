@@ -7,6 +7,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from sign_in_with_linuxdo import LinuxDoSignIn, _diagnose_linuxdo_page_issue
+from utils.linuxdo_session import LinuxDoSession
 
 
 def test_diagnose_linuxdo_page_issue_prefers_sso_provider_over_high_load(monkeypatch):
@@ -29,7 +30,7 @@ def test_diagnose_linuxdo_page_issue_prefers_sso_provider_over_high_load(monkeyp
 	assert result['error_summary'] == 'Linux.do SSO 中转页卡住'
 
 
-def test_linuxdo_signin_retries_once_with_fresh_login_after_sso_provider_stuck(tmp_path):
+def test_linuxdo_signin_does_not_retry_with_fresh_login_after_sso_provider_stuck(tmp_path):
 	provider = SimpleNamespace(origin='https://anyrouter.top')
 	signin = LinuxDoSignIn('anyrouter-1', provider, 'user', 'pass')
 	call_force_fresh_login = []
@@ -38,22 +39,20 @@ def test_linuxdo_signin_retries_once_with_fresh_login_after_sso_provider_stuck(t
 
 	async def fake_signin_impl(client_id, auth_state, auth_cookies, cache_file_path='', force_fresh_login=False):
 		call_force_fresh_login.append(force_fresh_login)
-		if not force_fresh_login:
-			return False, {
-				'error_type': 'linuxdo_sso_provider_stuck',
-				'error_summary': 'Linux.do SSO 中转页卡住',
-				'error_detail': 'Linux.do SSO provider page is stuck after cache restore',
-				'error': 'Linux.do SSO provider page is stuck after cache restore',
-			}
-		return True, {'cookies': [], 'api_user': '123'}
+		return False, {
+			'error_type': 'linuxdo_sso_provider_stuck',
+			'error_summary': 'Linux.do SSO 中转页卡住',
+			'error_detail': 'Linux.do SSO provider page is stuck after cache restore',
+			'error': 'Linux.do SSO provider page is stuck after cache restore',
+		}
 
 	signin._signin_impl = fake_signin_impl
 
 	success, payload = asyncio.run(signin.signin('client-id', 'state-1', [], str(cache_file)))
 
-	assert success is True
-	assert payload == {'cookies': [], 'api_user': '123'}
-	assert call_force_fresh_login == [False, True]
+	assert success is False
+	assert payload['error_type'] == 'linuxdo_sso_provider_stuck'
+	assert call_force_fresh_login == [False]
 
 
 def test_resolve_storage_state_skips_shared_cache_when_session_not_logged_in(tmp_path):
@@ -76,5 +75,23 @@ def test_resolve_storage_state_skips_shared_cache_when_session_not_logged_in(tmp
 
 	result = asyncio.run(signin._resolve_storage_state(str(cache_file)))
 
-	assert result is None
+	assert result == str(cache_file)
 	assert shared_state_calls == []
+
+
+def test_linuxdo_session_ensure_logged_in_does_not_auto_login_without_prewarmed_cache(monkeypatch, tmp_path):
+	session = LinuxDoSession('user', 'pass')
+	session.storage_state_path = str(tmp_path / 'missing.json')
+	login_calls = []
+
+	async def fake_do_login():
+		login_calls.append('called')
+		return True
+
+	monkeypatch.setattr(session, '_do_login', fake_do_login)
+
+	result = asyncio.run(session.ensure_logged_in())
+
+	assert result is False
+	assert session.is_logged_in is False
+	assert login_calls == []
