@@ -198,6 +198,73 @@ lemonapi | https://justdoitme.me | turnstile
 }
 ```
 
+#### 可选：把 LinuxDo 预热态放进 `ACCOUNTS` 配置
+
+如果你的 GitHub workflow 已经会注入 `ACCOUNTS`，最省事的方式是把本地预热好的
+`LinuxDo storage state` 放到 `ACCOUNTS` 顶层字段 `linuxdo_storage_states` 中。
+
+本地导出可直接粘贴的 payload：
+
+```bash
+uv run python export_storage_states_secret.py
+```
+
+然后把输出内容放进 `ACCOUNTS` 顶层，例如：
+
+```json
+{
+  "linux.do": [
+    {
+      "username": "your-linuxdo-user",
+      "password": "your-linuxdo-pass"
+    }
+  ],
+  "linuxdo_storage_states": {
+    "linuxdo_9e845f04_storage_state.json": {
+      "cookies": [],
+      "origins": []
+    },
+    "linuxdo_a0598ad1_storage_state.json": {
+      "cookies": [],
+      "origins": []
+    }
+  },
+  "accounts": []
+}
+```
+
+运行时会自动把这些文件恢复到 `storage-states/`，无需提交到仓库。
+
+#### 可选：单独放进 GitHub Secrets
+
+如果你已经在本地完成过 `LinuxDo` 可见浏览器预热，不要把 `storage-states/*.json` 直接提交进仓库。  
+更安全的做法是把它们放进 GitHub `Environment secrets`：
+
+- `PREWARMED_STORAGE_STATES`
+- 或 `PREWARMED_STORAGE_STATES_B64`
+
+本地导出 Secret 内容：
+
+```bash
+uv run python export_storage_states_secret.py
+```
+
+如果还想一起带上运行时站点自动发现结果：
+
+```bash
+uv run python export_storage_states_secret.py --include-runtime
+```
+
+将输出内容复制到 GitHub `Settings -> Environments -> production -> Environment secrets` 中的
+`PREWARMED_STORAGE_STATES` 即可。
+
+说明：
+
+- 更推荐直接放进 `ACCOUNTS.linuxdo_storage_states`
+- 只建议放 `linuxdo_*_storage_state.json`
+- 这些内容本质上仍是敏感登录态，请只存到 `Secrets`，不要提交到仓库
+- 首次成功运行后，GitHub Actions 还会继续用缓存机制保留并更新这些文件
+
 
 #### 如何获取 cookies 与 api_user 的值。
 

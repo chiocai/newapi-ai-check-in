@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from bootstrap_storage_states import bootstrap_storage_states_from_accounts_env
 from checkin import CheckIn
 from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
@@ -22,6 +23,11 @@ from utils.notify import notify
 from utils.site_discovery import ensure_runtime_site_overrides, update_runtime_site_override
 
 load_dotenv(override=True)
+restored_from_accounts, skipped_from_accounts = bootstrap_storage_states_from_accounts_env()
+if restored_from_accounts:
+    print(f"✅ Restored {len(restored_from_accounts)} prewarmed storage state file(s) from ACCOUNTS")
+elif skipped_from_accounts:
+    print(f"ℹ️ Prewarmed storage states already exist locally, skipped {len(skipped_from_accounts)} file(s)")
 
 BALANCE_HASH_FILE = "balance_hash.txt"
 

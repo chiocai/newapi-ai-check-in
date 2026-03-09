@@ -7,12 +7,15 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import random
+import sys
 from datetime import datetime
-from dotenv import load_dotenv
+
 from camoufox.async_api import AsyncCamoufox
-from utils.browser_utils import take_screenshot, save_page_content_to_file
+from dotenv import load_dotenv
+
+from bootstrap_storage_states import bootstrap_storage_states_from_accounts_env
+from utils.browser_utils import save_page_content_to_file, take_screenshot
 from utils.notify import notify
 
 # 默认缓存目录，与 checkin.py 保持一致
@@ -464,6 +467,11 @@ def load_linuxdo_accounts() -> list[dict]:
 async def main():
     """主函数"""
     load_dotenv(override=True)
+    restored_from_accounts, skipped_from_accounts = bootstrap_storage_states_from_accounts_env()
+    if restored_from_accounts:
+        print(f"✅ Restored {len(restored_from_accounts)} prewarmed storage state file(s) from ACCOUNTS")
+    elif skipped_from_accounts:
+        print(f"ℹ️ Prewarmed storage states already exist locally, skipped {len(skipped_from_accounts)} file(s)")
 
     print("🚀 Linux.do read posts script started")
     print(f'🕒 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
