@@ -337,6 +337,38 @@ class LinuxDoSignIn:
             await take_screenshot(page, "linuxdo_sso_provider_stuck", self.account_name)
         return current_url
 
+    async def _resolve_storage_state(self, cache_file_path: str = '', force_fresh_login: bool = False):
+        """解析当前登录流程应使用的 storage state"""
+        storage_state = None
+        if force_fresh_login:
+            print(f"ℹ️ {self.account_name}: Force fresh Linux.do login, skipping cached storage state")
+            return None
+
+        skip_cache_file = False
+        if self.shared_session:
+            if getattr(self.shared_session, 'is_logged_in', False):
+                shared_state = await self.shared_session.get_storage_state()
+                if shared_state:
+                    print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
+                    return shared_state
+
+                shared_state_path = self.shared_session.get_storage_state_path()
+                if os.path.exists(shared_state_path):
+                    print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
+                    return shared_state_path
+            else:
+                skip_cache_file = True
+                print(
+                    f"ℹ️ {self.account_name}: Shared Linux.do session is not logged in for this run, "
+                    "skip cached storage state"
+                )
+
+        if not skip_cache_file and cache_file_path and os.path.exists(cache_file_path):
+            print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
+            return cache_file_path
+
+        return storage_state
+
     async def _signin_impl(
         self,
         client_id: str,
@@ -352,24 +384,7 @@ class LinuxDoSignIn:
         )
 
         # 确定 storage_state 来源：优先使用共享会话
-        storage_state = None
-        if force_fresh_login:
-            print(f"ℹ️ {self.account_name}: Force fresh Linux.do login, skipping cached storage state")
-        else:
-            if self.shared_session:
-                shared_state = await self.shared_session.get_storage_state()
-                if shared_state:
-                    storage_state = shared_state
-                    print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
-                else:
-                    shared_state_path = self.shared_session.get_storage_state_path()
-                    if os.path.exists(shared_state_path):
-                        storage_state = shared_state_path
-                        print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
-
-            if not storage_state and cache_file_path and os.path.exists(cache_file_path):
-                storage_state = cache_file_path
-                print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
+        storage_state = await self._resolve_storage_state(cache_file_path, force_fresh_login=force_fresh_login)
 
         if not storage_state:
             print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")

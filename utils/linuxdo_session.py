@@ -78,6 +78,7 @@ class LinuxDoSession:
             self.is_logged_in = True
             print(f"✅ LinuxDoSession [{self.username_hash}]: Login successful")
         else:
+            self.invalidate()
             print(f"❌ LinuxDoSession [{self.username_hash}]: Login failed")
 
         return success
@@ -336,6 +337,9 @@ class LinuxDoSession:
         Returns:
             dict | None: storage state 字典，如果未登录则返回 None
         """
+        if not self.is_logged_in:
+            return None
+
         if self._storage_state:
             return self._storage_state
 

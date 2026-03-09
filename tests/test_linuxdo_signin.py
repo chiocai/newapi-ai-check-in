@@ -29,10 +29,12 @@ def test_diagnose_linuxdo_page_issue_prefers_sso_provider_over_high_load(monkeyp
 	assert result['error_summary'] == 'Linux.do SSO 中转页卡住'
 
 
-def test_linuxdo_signin_retries_once_with_fresh_login_after_sso_provider_stuck():
+def test_linuxdo_signin_retries_once_with_fresh_login_after_sso_provider_stuck(tmp_path):
 	provider = SimpleNamespace(origin='https://anyrouter.top')
 	signin = LinuxDoSignIn('anyrouter-1', provider, 'user', 'pass')
 	call_force_fresh_login = []
+	cache_file = tmp_path / 'storage.json'
+	cache_file.write_text('{}')
 
 	async def fake_signin_impl(client_id, auth_state, auth_cookies, cache_file_path='', force_fresh_login=False):
 		call_force_fresh_login.append(force_fresh_login)
@@ -47,8 +49,32 @@ def test_linuxdo_signin_retries_once_with_fresh_login_after_sso_provider_stuck()
 
 	signin._signin_impl = fake_signin_impl
 
-	success, payload = asyncio.run(signin.signin('client-id', 'state-1', [], 'storage.json'))
+	success, payload = asyncio.run(signin.signin('client-id', 'state-1', [], str(cache_file)))
 
 	assert success is True
 	assert payload == {'cookies': [], 'api_user': '123'}
 	assert call_force_fresh_login == [False, True]
+
+
+def test_resolve_storage_state_skips_shared_cache_when_session_not_logged_in(tmp_path):
+	provider = SimpleNamespace(origin='https://anyrouter.top')
+	cache_file = tmp_path / 'linuxdo_cache.json'
+	cache_file.write_text('{}')
+	shared_state_calls = []
+
+	class DummySharedSession:
+		is_logged_in = False
+
+		async def get_storage_state(self):
+			shared_state_calls.append('get_storage_state')
+			return {'cookies': []}
+
+		def get_storage_state_path(self):
+			return str(cache_file)
+
+	signin = LinuxDoSignIn('anyrouter-1', provider, 'user', 'pass', shared_session=DummySharedSession())
+
+	result = asyncio.run(signin._resolve_storage_state(str(cache_file)))
+
+	assert result is None
+	assert shared_state_calls == []
