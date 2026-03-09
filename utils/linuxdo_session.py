@@ -120,15 +120,13 @@ class LinuxDoSession:
                         print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session expired (login button found)")
                         return False
 
-                    # 不确定状态，尝试访问 connect.linux.do 验证
-                    await page.goto("https://connect.linux.do", wait_until="domcontentloaded")
-                    await page.wait_for_timeout(1000)
-
-                    # 如果被重定向到登录页，说明未登录
-                    if "login" in page.url.lower():
+                    current_url = page.url.lower()
+                    if "linux.do/login" in current_url:
                         return False
 
-                    # 加载 storage state 到内存
+                    # 主页已不是登录页，且没有登录按钮，优先视为可复用
+                    # 避免预热阶段额外访问 connect.linux.do 导致 OAuth 限流
+                    print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session looks valid from linux.do homepage")
                     self._storage_state = await context.storage_state()
                     return True
 
