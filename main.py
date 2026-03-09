@@ -96,7 +96,13 @@ def get_error_label(
     fallback_text = ' '.join(value for value in [error_summary, error_detail, error] if value).lower()
     if 'human verification' in fallback_text or 'hcaptcha' in fallback_text or 'h-captcha' in fallback_text:
         return '🧩 hCaptcha'
+    if 'sso provider page is stuck' in fallback_text or 'sso 中转页卡住' in fallback_text or 'sso_provider' in fallback_text:
+        return '🔄 SSO 卡住'
+    if 'redirected back to login page' in fallback_text or '会话失效' in fallback_text:
+        return '🔑 会话失效'
     if 'cloudflare' in fallback_text or 'challenge' in fallback_text:
+        return '☁️ Cloudflare'
+    if 'turnstile' in fallback_text:
         return '☁️ Cloudflare'
     if 'high load' in fallback_text or '请稍后重试' in fallback_text:
         return '🔥 高负载'

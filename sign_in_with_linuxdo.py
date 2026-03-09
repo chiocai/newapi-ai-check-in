@@ -74,13 +74,6 @@ async def _diagnose_linuxdo_page_issue(page) -> dict | None:
     sitekey = guard.get('human_verification_sitekey')
     suffix = f', sitekey={sitekey}' if sitekey else ''
 
-    if guard.get('high_load'):
-        return _build_linuxdo_error(
-            'linuxdo_high_load',
-            'Linux.do 授权页高负载，请稍后重试',
-            f'Linux.do authorization page is under high load at {current_url}',
-        )
-
     if guard.get('human_verification'):
         if 'linux.do/login' in current_url_lower:
             return _build_linuxdo_error(
@@ -103,6 +96,7 @@ async def _diagnose_linuxdo_page_issue(page) -> dict | None:
             f'Linux.do Cloudflare challenge is blocking the flow at {current_url}',
         )
 
+    # URL 级别状态优先于正文关键字，避免 sso_provider/login 页面被误报为高负载
     if 'linux.do/session/sso_provider' in current_url_lower:
         return _build_linuxdo_error(
             'linuxdo_sso_provider_stuck',
@@ -115,6 +109,13 @@ async def _diagnose_linuxdo_page_issue(page) -> dict | None:
             'linuxdo_redirect_login',
             'Linux.do 会话失效，被重定向回登录页',
             f'Linux.do authorization redirected back to login page: {current_url}',
+        )
+
+    if guard.get('high_load'):
+        return _build_linuxdo_error(
+            'linuxdo_high_load',
+            'Linux.do 授权页高负载，请稍后重试',
+            f'Linux.do authorization page is under high load at {current_url}',
         )
 
     return None
@@ -151,7 +152,7 @@ class LinuxDoSignIn:
         client_id: str,
         auth_state: str,
         auth_cookies: list,
-        cache_file_path: str = "",
+        cache_file_path: str = '',
     ) -> tuple[bool, dict]:
         """使用 Linux.do 账号执行登录授权（带重试机制）
 
@@ -167,41 +168,80 @@ class LinuxDoSignIn:
         last_error = None
         last_error_summary = None
         last_result_payload = None
+        pending_force_fresh_login = False
+        fresh_login_retry_used = False
+        recoverable_session_error_types = {
+            'linuxdo_sso_provider_stuck',
+            'linuxdo_redirect_login',
+        }
+        has_cached_state_hint = bool(self.shared_session) or bool(cache_file_path and os.path.exists(cache_file_path))
+
         for attempt in range(1, MAX_RETRIES + 1):
+            force_fresh_login = pending_force_fresh_login
+            pending_force_fresh_login = False
             try:
                 if attempt > 1:
-                    print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
-                    await asyncio.sleep(RETRY_DELAY)
+                    if force_fresh_login:
+                        print(f"ℹ️ {self.account_name}: Retrying once with fresh Linux.do login")
+                    else:
+                        print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
+                        await asyncio.sleep(RETRY_DELAY)
 
                 async with get_linuxdo_signin_semaphore():
-                    result = await self._signin_impl(client_id, auth_state, auth_cookies, cache_file_path)
-                if result[0]:  # 成功
+                    result = await self._signin_impl(
+                        client_id,
+                        auth_state,
+                        auth_cookies,
+                        cache_file_path,
+                        force_fresh_login=force_fresh_login,
+                    )
+                if result[0]:
                     return result
-                else:
-                    last_result_payload = result[1] or {}
-                    last_error = last_result_payload.get("error", "Unknown error")
-                    last_error_summary = last_result_payload.get("error_summary", last_error)
-                    # 某些错误不需要重试
-                    non_retry_error_types = {
-                        'linuxdo_hcaptcha_login',
-                        'linuxdo_hcaptcha_authorize',
-                        'linuxdo_cloudflare_challenge',
-                        'linuxdo_high_load',
-                    }
-                    non_retry_keywords = [
-                        "not found",
-                        "human verification",
-                        "hcaptcha",
-                        "h-captcha",
-                        "cloudflare challenge",
-                        "high load",
-                    ]
-                    if last_result_payload.get('error_type') in non_retry_error_types or any(
-                        keyword in str(last_error).lower() for keyword in non_retry_keywords
-                    ):
-                        print(f"❌ {self.account_name}: Non-retryable error: {last_error_summary}")
-                        return result
-                    print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error_summary}")
+
+                last_result_payload = result[1] or {}
+                last_error = last_result_payload.get('error', 'Unknown error')
+                last_error_summary = last_result_payload.get('error_summary', last_error)
+                error_type = last_result_payload.get('error_type')
+
+                if (
+                    not force_fresh_login
+                    and not fresh_login_retry_used
+                    and has_cached_state_hint
+                    and error_type in recoverable_session_error_types
+                ):
+                    fresh_login_retry_used = True
+                    pending_force_fresh_login = True
+                    print(
+                        f"⚠️ {self.account_name}: Cached Linux.do session failed with {error_type}, "
+                        "retrying once with fresh login"
+                    )
+                    if self.shared_session:
+                        self.shared_session.invalidate()
+                    continue
+
+                non_retry_error_types = {
+                    'linuxdo_hcaptcha_login',
+                    'linuxdo_hcaptcha_authorize',
+                    'linuxdo_cloudflare_challenge',
+                    'linuxdo_high_load',
+                    *recoverable_session_error_types,
+                }
+                non_retry_keywords = [
+                    'not found',
+                    'human verification',
+                    'hcaptcha',
+                    'h-captcha',
+                    'cloudflare challenge',
+                    'high load',
+                    'sso provider page is stuck',
+                    'redirected back to login page',
+                ]
+                if error_type in non_retry_error_types or any(
+                    keyword in str(last_error).lower() for keyword in non_retry_keywords
+                ):
+                    print(f"❌ {self.account_name}: Non-retryable error: {last_error_summary}")
+                    return result
+                print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error_summary}")
 
             except Exception as e:
                 last_error = str(e)
@@ -303,6 +343,7 @@ class LinuxDoSignIn:
         auth_state: str,
         auth_cookies: list,
         cache_file_path: str = "",
+        force_fresh_login: bool = False,
     ) -> tuple[bool, dict]:
         """实际的登录实现"""
         print(f"ℹ️ {self.account_name}: Executing sign-in with Linux.do")
@@ -312,20 +353,23 @@ class LinuxDoSignIn:
 
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = None
-        if self.shared_session:
-            shared_state = await self.shared_session.get_storage_state()
-            if shared_state:
-                storage_state = shared_state
-                print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
-            else:
-                shared_state_path = self.shared_session.get_storage_state_path()
-                if os.path.exists(shared_state_path):
-                    storage_state = shared_state_path
-                    print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
+        if force_fresh_login:
+            print(f"ℹ️ {self.account_name}: Force fresh Linux.do login, skipping cached storage state")
+        else:
+            if self.shared_session:
+                shared_state = await self.shared_session.get_storage_state()
+                if shared_state:
+                    storage_state = shared_state
+                    print(f"ℹ️ {self.account_name}: Using shared session storage state from memory")
+                else:
+                    shared_state_path = self.shared_session.get_storage_state_path()
+                    if os.path.exists(shared_state_path):
+                        storage_state = shared_state_path
+                        print(f"ℹ️ {self.account_name}: Using shared session storage state from file")
 
-        if not storage_state and cache_file_path and os.path.exists(cache_file_path):
-            storage_state = cache_file_path
-            print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
+            if not storage_state and cache_file_path and os.path.exists(cache_file_path):
+                storage_state = cache_file_path
+                print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
 
         if not storage_state:
             print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")

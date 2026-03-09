@@ -124,9 +124,38 @@ class LinuxDoSession:
                     if "linux.do/login" in current_url:
                         return False
 
-                    # 主页已不是登录页，且没有登录按钮，优先视为可复用
-                    # 避免预热阶段额外访问 connect.linux.do 导致 OAuth 限流
-                    print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session looks valid from linux.do homepage")
+                    # 主页状态不明确时，再访问 connect.linux.do 做一次更接近 OAuth 的校验
+                    # 仅在模糊状态下追加，避免每次预热都额外打授权链路
+                    print(
+                        f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session is ambiguous on homepage, "
+                        "verifying via connect.linux.do"
+                    )
+                    await page.goto("https://connect.linux.do", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(1000)
+
+                    current_url = page.url.lower()
+                    if "login" in current_url:
+                        print(
+                            f"ℹ️ LinuxDoSession [{self.username_hash}]: Cache session expired "
+                            "(redirected to login from connect.linux.do)"
+                        )
+                        return False
+
+                    guard = await detect_linuxdo_page_guard(page)
+                    if guard.get("human_verification") or guard.get("cloudflare_challenge"):
+                        print(
+                            f"⚠️ LinuxDoSession [{self.username_hash}]: Cache session hit verification challenge during connect check"
+                        )
+                        return False
+
+                    if "linux.do/session/sso_provider" in current_url:
+                        print(
+                            f"⚠️ LinuxDoSession [{self.username_hash}]: Cache session stalled at Linux.do SSO provider page "
+                            "during connect check"
+                        )
+                        return False
+
+                    print(f"✅ LinuxDoSession [{self.username_hash}]: Cache session verified via connect.linux.do")
                     self._storage_state = await context.storage_state()
                     return True
 

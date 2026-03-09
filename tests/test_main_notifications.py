@@ -190,6 +190,8 @@ def test_get_error_label():
 	assert get_error_label('linuxdo_sso_provider_stuck', 'Linux.do SSO 中转页卡住') == '🔄 SSO 卡住'
 	assert get_error_label('linuxdo_circuit_open', 'Linux.do OAuth 已熔断，本轮跳过') == '⛔ OAuth 熔断'
 	assert get_error_label('linuxdo_auth_state_failed', '站点 auth state 403/疑似 WAF 拦截') == '🚧 auth state 403'
+	assert get_error_label(None, None, 'Linux.do SSO provider page is stuck at https://linux.do/session/sso_provider') == '🔄 SSO 卡住'
+	assert get_error_label(None, None, 'Linux.do authorization redirected back to login page: https://linux.do/login') == '🔑 会话失效'
 
 
 def test_collect_linuxdo_backoff_retry_indices():
