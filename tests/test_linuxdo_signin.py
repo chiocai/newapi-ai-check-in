@@ -6,7 +6,11 @@ from types import SimpleNamespace
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from sign_in_with_linuxdo import LinuxDoSignIn, _diagnose_linuxdo_page_issue
+from sign_in_with_linuxdo import (
+	LinuxDoSignIn,
+	_diagnose_linuxdo_page_issue,
+	_extract_sso_provider_redirect_candidates,
+)
 from utils.linuxdo_session import LinuxDoSession
 
 
@@ -77,6 +81,40 @@ def test_resolve_storage_state_skips_shared_cache_when_session_not_logged_in(tmp
 
 	assert result == str(cache_file)
 	assert shared_state_calls == []
+
+
+def test_extract_sso_provider_redirect_candidates_from_script():
+	html = """
+	<html>
+	<script>
+	window.location.href = "https://connect.linux.do/discourse/sso_callback?sso=abc&sig=def";
+	</script>
+	</html>
+	"""
+
+	result = _extract_sso_provider_redirect_candidates(
+		html,
+		'https://linux.do/session/sso_provider?sig=x&sso=y',
+		'https://anyrouter.top',
+	)
+
+	assert result == ['https://connect.linux.do/discourse/sso_callback?sso=abc&sig=def']
+
+
+def test_extract_sso_provider_redirect_candidates_from_meta_refresh():
+	html = """
+	<html>
+	<meta http-equiv="refresh" content="0;url=/oauth2/authorize?foo=bar">
+	</html>
+	"""
+
+	result = _extract_sso_provider_redirect_candidates(
+		html,
+		'https://connect.linux.do/discourse/sso_callback',
+		'https://anyrouter.top',
+	)
+
+	assert result == ['https://connect.linux.do/oauth2/authorize?foo=bar']
 
 
 def test_linuxdo_session_ensure_logged_in_does_not_auto_login_without_prewarmed_cache(monkeypatch, tmp_path):

@@ -6,8 +6,10 @@
 import asyncio
 import json
 import os
+import re
+from html import unescape
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from camoufox.async_api import AsyncCamoufox
 
@@ -37,6 +39,16 @@ MAX_CONCURRENT_LINUXDO_OAUTH = max(
 )  # Linux.do OAuth 浏览器流程最大并发数
 
 _linuxdo_signin_semaphore: asyncio.Semaphore | None = None
+REDIRECT_ASSIGN_RE = re.compile(
+    r"""(?:window\.)?location(?:\.href|\.assign|\.replace)?\s*(?:=|\()\s*['"]([^'"]+)['"]""",
+    re.IGNORECASE,
+)
+META_REFRESH_RE = re.compile(
+    r"""<meta[^>]+http-equiv=['"]refresh['"][^>]+content=['"][^'"]*url=([^;'"]+)""",
+    re.IGNORECASE,
+)
+HREF_ACTION_RE = re.compile(r"""(?:href|action)=['"]([^'"]+)['"]""", re.IGNORECASE)
+ABS_URL_RE = re.compile(r"""https?://[^\s"'<>]+""", re.IGNORECASE)
 
 
 def get_linuxdo_signin_semaphore() -> asyncio.Semaphore:
@@ -59,6 +71,44 @@ def _build_linuxdo_error(error_type: str, error_summary: str, error_detail: str 
         if value is not None:
             payload[key] = value
     return payload
+
+
+def _extract_sso_provider_redirect_candidates(html: str, current_url: str, provider_origin: str) -> list[str]:
+    """从 sso_provider 页面 HTML 中提取可能的跳转目标"""
+    normalized_html = unescape(html or '')
+    provider_netloc = urlparse(provider_origin).netloc
+    current_url_lower = current_url.lower()
+
+    raw_candidates = []
+    raw_candidates.extend(META_REFRESH_RE.findall(normalized_html))
+    raw_candidates.extend(REDIRECT_ASSIGN_RE.findall(normalized_html))
+    raw_candidates.extend(HREF_ACTION_RE.findall(normalized_html))
+    raw_candidates.extend(ABS_URL_RE.findall(normalized_html))
+
+    candidates = []
+    seen = set()
+    for raw_candidate in raw_candidates:
+        candidate = urljoin(current_url, raw_candidate.strip())
+        if not candidate or candidate.lower() == current_url_lower:
+            continue
+
+        parsed = urlparse(candidate)
+        is_relevant = parsed.netloc in {'connect.linux.do', provider_netloc} or any(
+            token in candidate.lower()
+            for token in [
+                '/discourse/sso_callback',
+                '/oauth2/authorize',
+                '/session/sso_login',
+                '/session/sso_provider',
+            ]
+        )
+        if not is_relevant or candidate in seen:
+            continue
+
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    return candidates
 
 
 async def _diagnose_linuxdo_page_issue(page) -> dict | None:
@@ -289,6 +339,30 @@ class LinuxDoSignIn:
                 print(f"ℹ️ {self.account_name}: Linux.do sso_provider fetch POST result: {post_result}")
             except Exception as fetch_err:
                 print(f"⚠️ {self.account_name}: Linux.do sso_provider fetch POST failed: {fetch_err}")
+
+            try:
+                html = await page.content()
+                redirect_candidates = _extract_sso_provider_redirect_candidates(
+                    html,
+                    page.url,
+                    self.provider_config.origin,
+                )
+                if redirect_candidates:
+                    print(
+                        f"ℹ️ {self.account_name}: Linux.do sso_provider extracted redirect candidates: "
+                        f"{redirect_candidates[:3]}"
+                    )
+                for redirect_target in redirect_candidates[:3]:
+                    try:
+                        print(f"ℹ️ {self.account_name}: Trying extracted redirect target: {redirect_target}")
+                        await page.goto(redirect_target, wait_until="domcontentloaded", timeout=TIMEOUT_NAVIGATION)
+                        await page.wait_for_timeout(1500)
+                        if "linux.do/session/sso_provider" not in page.url:
+                            break
+                    except Exception as redirect_err:
+                        print(f"⚠️ {self.account_name}: Extracted redirect target failed: {redirect_err}")
+            except Exception as html_err:
+                print(f"⚠️ {self.account_name}: Failed to inspect sso_provider HTML: {html_err}")
 
         try:
             await page.wait_for_url("**connect.linux.do/**", timeout=12000)
