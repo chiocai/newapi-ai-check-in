@@ -11,7 +11,6 @@ Keep docs in `docs/`, example screenshots in `assets/`, and GitHub Actions workf
 - `uv run python -u main.py` — run the primary multi-account check-in entrypoint locally.
 - `uv run python -u checkin_996/main.py` — run the separate 996 provider flow.
 - `uv run pytest tests/` — run focused unit tests.
-- `uv run pytest test_b4u_topup.py` — run a targeted regression test file.
 - `uv run ruff check .` / `uv run ruff format .` — lint and format the codebase.
 
 ## Coding Style & Naming Conventions

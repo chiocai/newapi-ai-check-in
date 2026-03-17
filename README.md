@@ -61,7 +61,7 @@ Affs:
 
 只有下面这些情况，才通常需要额外写 `accounts`：
 
-- 你要启用 **特殊 provider**，例如 `special:x666`、`special:b4u`、`special:fuli_wheel`
+- 你要启用 **特殊 provider**，例如 `special:x666`、`special:fuli_wheel`
 - 某个账号需要 **额外字段**，例如 `x666` 的 `access_token`
 - 某个账号要用 **单独代理**
 - 某个账号要用 **cookies / github** 登录，而不是全局 `linux.do`

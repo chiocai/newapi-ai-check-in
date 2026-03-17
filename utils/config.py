@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import AsyncGenerator, Callable, Dict, List, Literal
 
 from utils.get_cdk import (
-	get_b4u_cdk,
 	get_fuli_wheel_cdk,
 	get_x666_cdk,
 )
@@ -369,25 +368,6 @@ class AppConfig:
 				aliyun_captcha=False,
 				bypass_method=None,
 			),
-			'b4u': ProviderConfig(
-				name='b4u',
-				origin='https://b4u.qzz.io',
-				login_path='/login',
-				console_personal_path='/console/personal',
-				status_path='/api/status',
-				auth_state_path='/api/oauth/state',
-				sign_in_path=None,
-				user_info_path='/api/user/self',
-				topup_path='/api/user/topup',
-				get_cdk=get_b4u_cdk,
-				api_user_key='new-api-user',
-				github_client_id=None,
-				github_auth_path=None,
-				linuxdo_client_id='Cf3PtT3ecj4kzJrMvOGM48FrHFKYXusb',
-				linuxdo_auth_path='/api/oauth/linuxdo',
-				aliyun_captcha=False,
-				bypass_method='waf_cookies',
-			),
 			'fuli_wheel': ProviderConfig(
 				name='fuli_wheel',
 				origin='https://fuli.hxi.me',
@@ -583,11 +563,6 @@ class AppConfig:
 				access_token = cls._normalize_optional_value(options.get('access_token'), None)
 				if access_token:
 					account_defaults['access_token'] = access_token
-			elif special_name == 'b4u':
-				provider_data['sign_in_path'] = None
-				provider_data['topup_path'] = '/api/user/topup'
-				provider_data['get_cdk'] = get_b4u_cdk
-				provider_data['bypass_method'] = 'waf_cookies'
 			elif special_name == 'fuli_wheel':
 				provider_data['status_path'] = '/api/wheel/status'
 				provider_data['auth_state_path'] = None

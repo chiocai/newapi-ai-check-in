@@ -116,7 +116,12 @@ def update_runtime_site_override(runtime_sites_file: str | Path, site_name: str,
 	payload = load_runtime_sites_payload(runtime_sites_file)
 	sites = payload.setdefault('sites', {})
 	entry = sites.setdefault(site_name, {})
-	entry.update({key: value for key, value in overrides.items() if value})
+	for key, value in overrides.items():
+		if key.startswith('_'):
+			continue
+		if value == '':
+			continue
+		entry[key] = value
 	entry['_updated_at'] = datetime.now().isoformat(timespec='seconds')
 	save_runtime_sites_payload(runtime_sites_file, payload)
 	return payload

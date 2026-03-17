@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -164,3 +165,53 @@ def test_check_in_with_cookies_falls_back_to_browser_manual_checkin(monkeypatch)
 	assert manual_calls == [True]
 	assert success is True
 	assert user_info['success'] is True
+
+
+def test_check_in_with_linuxdo_login_only_reauths_when_provider_cache_invalid(monkeypatch, tmp_path):
+	account_config = build_account('alpha')
+	provider_config = ProviderConfig(
+		name='alpha',
+		origin='https://alpha.example.com',
+		sign_in_path=None,
+		linuxdo_client_id='client-id',
+	)
+	checkin = CheckIn('alpha-1', account_config, provider_config, storage_state_dir=str(tmp_path))
+
+	username = account_config.linux_do['username']
+	username_hash = hashlib.sha256(username.encode('utf-8')).hexdigest()[:8]
+	cache_path = tmp_path / f'provider_alpha_{username_hash}_session.json'
+	cache_path.write_text(json.dumps({
+		'cookies': {'session': 'cached'},
+		'api_user': '123',
+		'timestamp': time.time(),
+	}))
+
+	async def fake_validate_provider_session(_cookies, _api_user):
+		return {'success': False, 'error': 'Failed to get user info: HTTP 401'}
+
+	async def fake_get_auth_state(*_args, **_kwargs):
+		return {'success': True, 'state': 'state-1', 'cookies': []}
+
+	class DummyLinuxDoSignIn:
+		def __init__(self, *args, **kwargs):
+			return None
+
+		async def signin(self, **_kwargs):
+			return True, {'cookies': {'session': 'fresh'}, 'api_user': '456'}
+
+	monkeypatch.setattr(checkin, 'validate_provider_session', fake_validate_provider_session)
+	monkeypatch.setattr(checkin, 'get_auth_state', fake_get_auth_state)
+	monkeypatch.setattr('sign_in_with_linuxdo.LinuxDoSignIn', DummyLinuxDoSignIn)
+
+	success, login_result = asyncio.run(
+		checkin.check_in_with_linuxdo(
+			username,
+			account_config.linux_do['password'],
+			{},
+			login_only=True,
+		)
+	)
+
+	assert success is True
+	assert login_result == {'cookies': {'session': 'fresh'}, 'api_user': '456'}
+	assert json.loads(cache_path.read_text(encoding='utf-8'))['api_user'] == '456'

@@ -5,7 +5,6 @@
 #   auto                       登录后自动签到，无需额外签到请求
 #   auto-waf                   登录后自动签到 + 先过 CF/WAF
 #   signed:aiai_li             使用内置签名签到 URL
-#   special:b4u                b4u 特殊 CDK / topup 流程
 #   special:fuli_wheel         福利轮盘特殊流程
 #   manual:/api/user/checkin   非标准签到接口
 #   manual-waf:/api/user/sign_in  非标准签到接口 + 先过 CF/WAF
@@ -58,18 +57,13 @@ huan666 | https://ai.huan666.de | newapi
 jarvisapi | https://ai.ctacy.cc | newapi
 jiuuij | https://jiuuij.de5.net | newapi
 kfcapi | https://kfc-api.sxxe.net | newapi
-lemonapi | https://justdoitme.me | turnstile
 linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf
 moyu | https://clove.cc.cd | newapi
 pryapi | https://api.vip.crond.dev | newapi-waf
-runawaytime | https://runanytime.hxi.me | newapi
 sorai | https://newapi.sorai.me | newapi
 wong | https://wzw.pp.ua | manual:/api/user/checkin
 dev88 | https://api.dev88.tech | newapi
-kegui | https://www.kegui.net | newapi
-lividness | https://api.livedless.com | newapi-waf
 dgbmc | https://freeapi.dgbmc.top | newapi
-zapi | https://zapi.aicc0.com | newapi
 lxsummer | https://lx.lxsummer.cloud | newapi-waf
 codexmakeup | https://codex.makeup | newapi
 anthorpic | https://anthorpic.us.ci | newapi
@@ -79,14 +73,10 @@ LogosAPI | https://api.777114.xyz | newapi-waf
 小辣椒 | https://yyds.215.im | newapi
 云端api | https://cloudapi.wdyu.eu.cc | newapi
 左大臣api | https://zuodachen.zdc.mom | newapi
-小呆api | https://api.daiju.live | newapi-waf
-爱你api | https://x.ainiaini.xyz | newapi
-ibsgss | https://codex.ibsgss.uk | newapi
 xingyungept | https://ai.xingyungept.cn | newapi
 鱼汤公益站 | https://ai.zhansi.top | newapi
 溟如池鱼の公益站 | https://yiliya.shikinatsume.xyz | newapi
 Rosmontis | https://ai.rosmontis.de | newapi
-凉心の中转站 | https://open.lxcloud.dev | newapi
 NPCAPI | https://codex.hyw.me | newapi
 明天倒闭 | https://zmjjkk.us.ci | newapi
 Neb公益站 | https://ai.zzhdsgsss.xyz | newapi
@@ -96,7 +86,21 @@ Neb公益站 | https://ai.zzhdsgsss.xyz | newapi
 光速API | https://chat.gsyun.cloud | newapi-waf
 CM-API | https://api.chengmo.cc.cd | newapi
 你好API | https://nih.cc | newapi
-Nouz | https://new.nouz.cn | newapi
 大可乐 | https://bigkele.us.ci | newapi
 Mihoyo | https://api.mihoyo.bio | newapi
 lsAPI | https://callxyq.xyz | newapi
+Restrain | https://api.925214.xyz |newapi
+Apikey | https://welfare.apikey.cc|newapi
+Embedding | https://router.tumuer.me|newapi
+深夜小站| https://user.dd999.uk|newapi
+Lcodex | https://lc.zenscaleai.com|newapi
+高登 | https://huxiaonb.top|newapi
+有名字了| https://api.190269.xyz|newapi
+3w | https://aiapi.3w.cx|newapi
+Compute | https://computetoken.ai|newapi
+Ouuapi | https://api.ouu.ch|newapi
+代码花园 | https://api.missblog.net|newapi
+蒸蚌 | https://laoxi.ethan010203.online|newapi
+
+
+

@@ -61,6 +61,31 @@ def test_collect_storage_state_files_reads_linuxdo_files(tmp_path):
 	}
 
 
+def test_collect_storage_state_files_can_include_provider_sessions(tmp_path):
+	(tmp_path / 'linuxdo_demo_storage_state.json').write_text(
+		json.dumps({'cookies': [], 'origins': []}),
+		encoding='utf-8',
+	)
+	(tmp_path / 'provider_anyrouter_demo_session.json').write_text(
+		json.dumps({'cookies': {'session': 'abc'}, 'api_user': '1', 'timestamp': 123}),
+		encoding='utf-8',
+	)
+
+	payload = collect_storage_state_files(str(tmp_path), include_provider_sessions=True)
+
+	assert payload == {
+		'linuxdo_demo_storage_state.json': {
+			'cookies': [],
+			'origins': [],
+		},
+		'provider_anyrouter_demo_session.json': {
+			'cookies': {'session': 'abc'},
+			'api_user': '1',
+			'timestamp': 123,
+		},
+	}
+
+
 def test_bootstrap_storage_states_from_accounts_env(monkeypatch, tmp_path):
 	monkeypatch.setenv(
 		'ACCOUNTS',
@@ -118,6 +143,45 @@ def test_bootstrap_storage_states_from_accounts_env_purges_existing(monkeypatch,
 	assert written == ['linuxdo_demo_storage_state.json']
 	assert skipped == []
 	assert not (tmp_path / 'linuxdo_old_storage_state.json').exists()
+
+
+def test_bootstrap_storage_states_from_accounts_env_overwrites_provider_session(monkeypatch, tmp_path):
+	(tmp_path / 'provider_anyrouter_demo_session.json').write_text(
+		json.dumps({'cookies': {'session': 'old'}, 'api_user': '1', 'timestamp': 1}),
+		encoding='utf-8',
+	)
+	monkeypatch.setenv(
+		'ACCOUNTS',
+		json.dumps(
+			{
+				'linux.do': [],
+				'accounts': [],
+				'linuxdo_storage_states': {
+					'provider_anyrouter_demo_session.json': {
+						'cookies': {'session': 'new'},
+						'api_user': '2',
+						'timestamp': 2,
+					}
+				},
+			},
+			ensure_ascii=False,
+		),
+	)
+
+	deleted, written, skipped = bootstrap_storage_states_from_accounts_env(
+		storage_dir=str(tmp_path),
+		overwrite=True,
+		purge_existing=True,
+	)
+
+	assert deleted == []
+	assert written == ['provider_anyrouter_demo_session.json']
+	assert skipped == []
+	assert json.loads((tmp_path / 'provider_anyrouter_demo_session.json').read_text(encoding='utf-8')) == {
+		'cookies': {'session': 'new'},
+		'api_user': '2',
+		'timestamp': 2,
+	}
 
 
 def test_purge_prewarmed_linuxdo_storage_states_only_removes_linuxdo_prefix(tmp_path):

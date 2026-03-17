@@ -46,6 +46,11 @@ LINUXDO_BACKOFF_RETRY_DELAYS = tuple(
     for item in os.getenv("LINUXDO_BACKOFF_RETRY_DELAYS", "60,180").split(",")
     if item.strip()
 ) or (60, 180)  # Linux.do 高负载/Cloudflare 退避重试延迟（秒）
+LINUXDO_PREWARM_ALERT_ERROR_TYPES = {
+    "linuxdo_prewarmed_state_missing",
+    "linuxdo_prewarmed_state_invalid",
+    "linuxdo_redirect_login",
+}
 
 
 def generate_balance_hash(balances: dict) -> str:
@@ -125,6 +130,62 @@ def get_error_label(
         return '📄 auth state HTML'
 
     return error_summary or error_detail or error
+
+
+def mask_linuxdo_username(username: str) -> str:
+    """对 Linux.do 用户名做简单脱敏"""
+    if not username:
+        return "unknown"
+    if len(username) <= 2:
+        return f"{username[0]}***"
+    if len(username) <= 6:
+        return f"{username[:1]}***{username[-1:]}"
+    return f"{username[:3]}***{username[-2:]}"
+
+
+def build_linuxdo_prewarm_alert_lines(prewarm_summary: dict | None, account_results: list[dict]) -> list[str]:
+    """汇总 LinuxDo 预热态失效提醒，追加到最终通知中"""
+    alert_items = []
+    seen = set()
+
+    for issue in (prewarm_summary or {}).get("issues", []):
+        issue_type = issue.get("error_type") or ""
+        if issue_type not in LINUXDO_PREWARM_ALERT_ERROR_TYPES:
+            continue
+        username_hash = issue.get("username_hash", "")
+        issue_key = ("prewarm", username_hash, issue_type)
+        if issue_key in seen:
+            continue
+        seen.add(issue_key)
+        label = get_error_label(issue_type, issue.get("error_summary"), issue.get("error_detail"), issue.get("error"))
+        account_label = issue.get("username_mask") or username_hash or "unknown"
+        alert_items.append(f"{account_label}: {label or issue.get('error_summary', '预热态异常')}")
+
+    for result in account_results:
+        if not isinstance(result, dict):
+            continue
+        issue_type = result.get("error_type") or ""
+        if issue_type not in LINUXDO_PREWARM_ALERT_ERROR_TYPES:
+            continue
+        issue_key = ("result", result.get("account_name", ""), issue_type)
+        if issue_key in seen:
+            continue
+        seen.add(issue_key)
+        label = result.get("error_label") or get_error_label(
+            issue_type,
+            result.get("error_summary"),
+            result.get("error_detail"),
+            result.get("error"),
+        )
+        alert_items.append(f"{result.get('account_name', 'unknown')}: {label or issue_type}")
+
+    if not alert_items:
+        return []
+
+    summary = "；".join(alert_items[:3])
+    if len(alert_items) > 3:
+        summary += f"；其余 {len(alert_items) - 3} 个账号请重新预热"
+    return [f"⚠️ LinuxDo 预热态提醒: {summary}；可执行 `uv run python prepare_linuxdo_session.py` 重新预热"]
 
 
 async def process_single_account(
@@ -443,7 +504,7 @@ async def prewarm_linuxdo_sessions(
 
     if not linuxdo_credentials:
         print(f"ℹ️ {reason}: no Linux.do accounts need warm-up")
-        return {"attempted": 0, "successful": 0, "failed": 0}
+        return {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
 
     print(f"\n🔐 {reason} {len(linuxdo_credentials)} unique Linux.do account(s)...")
     prelogin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_PRELOGIN)
@@ -457,9 +518,20 @@ async def prewarm_linuxdo_sessions(
                     proxy=proxy,
                     auto_login=True,
                 )
-                return username, bool(getattr(session, "is_logged_in", False)), None
+                if getattr(session, "is_logged_in", False):
+                    return username, True, None, None
+
+                storage_state_path = getattr(session, "storage_state_path", "")
+                storage_exists = bool(storage_state_path and os.path.exists(storage_state_path))
+                issue_type = "linuxdo_prewarmed_state_invalid" if storage_exists else "linuxdo_prewarmed_state_missing"
+                issue_summary = (
+                    "Linux.do 预热会话已失效，请重新预热"
+                    if storage_exists
+                    else "Linux.do 预热会话不存在，请先重新预热"
+                )
+                return username, False, issue_summary, issue_type
             except Exception as e:
-                return username, False, str(e)
+                return username, False, str(e), "linuxdo_prewarmed_state_invalid"
 
     prelogin_results = await asyncio.gather(
         *(
@@ -470,15 +542,27 @@ async def prewarm_linuxdo_sessions(
 
     success_count = 0
     failed_count = 0
-    for username, success, error_msg in prelogin_results:
+    issues = []
+    for username, success, error_msg, issue_type in prelogin_results:
         if success:
             success_count += 1
         else:
             failed_count += 1
+            username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+            masked_username = mask_linuxdo_username(username)
+            issue_payload = {
+                "username_hash": username_hash,
+                "username_mask": masked_username,
+                "error_type": issue_type,
+                "error_summary": error_msg,
+                "error_detail": error_msg,
+                "error": error_msg,
+            }
+            issues.append(issue_payload)
             if error_msg:
-                print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: {error_msg}")
+                print(f"⚠️ LinuxDo prewarm issue [{masked_username}|{username_hash}]: {error_msg}")
             else:
-                print(f"⚠️ Failed to pre-login Linux.do account [{username[:4]}...]: login not confirmed")
+                print(f"⚠️ LinuxDo prewarm issue [{masked_username}|{username_hash}]: login not confirmed")
 
     print(
         f"✅ {reason} completed, "
@@ -489,31 +573,40 @@ async def prewarm_linuxdo_sessions(
         "attempted": len(linuxdo_credentials),
         "successful": success_count,
         "failed": failed_count,
+        "issues": issues,
     }
 
 
-def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
-    """判断失败结果是否应自动切换为 WAF 模式后重试"""
+def should_enable_bypass_toggle_retry(result: dict, app_config: AppConfig) -> bool:
+    """判断失败结果是否应切换当前 bypass 模式后重试"""
     provider_name = result.get("provider", "")
     provider = app_config.get_provider(provider_name)
     site_definition = app_config.site_definitions.get(provider_name)
     if not provider or not site_definition:
         return False
-    if provider.needs_waf_cookies():
-        return False
-    if site_definition.mode in {"turnstile", "special", "signed", "newapi-waf", "auto-waf", "manual-waf"}:
+    if site_definition.mode in {"turnstile", "special", "signed"}:
         return False
 
     error_type = result.get("error_type", "")
-    if error_type in {"linuxdo_redirect_login", "linuxdo_sso_provider_stuck"}:
+    if error_type in {
+        "linuxdo_redirect_login",
+        "linuxdo_sso_provider_stuck",
+        "linuxdo_cloudflare_challenge",
+        "linuxdo_auth_state_failed",
+    }:
         return True
 
     error_text = " ".join(
         str(value)
-        for value in [result.get("error_label"), result.get("error_summary"), result.get("error")]
+        for value in [
+            result.get("error_label"),
+            result.get("error_summary"),
+            result.get("error_detail"),
+            result.get("error"),
+        ]
         if value
     ).lower()
-    waf_indicators = [
+    bypass_indicators = [
         "http 403",
         "403",
         "无权进行此操作",
@@ -521,14 +614,34 @@ def should_enable_waf_retry(result: dict, app_config: AppConfig) -> bool:
         "without access token",
         "会话失效",
         "sso 卡住",
+        "cloudflare",
+        "challenge",
+        "auth state 403",
+        "auth state html",
+        "text/html",
+        "invalid response type",
     ]
-    return any(indicator in error_text for indicator in waf_indicators)
+    return any(indicator in error_text for indicator in bypass_indicators)
 
 
-def apply_waf_runtime_overrides_for_failed_accounts(account_results: list, app_config: AppConfig) -> list[str]:
-    """为触发 403 的失败站点自动写入 WAF 运行时覆盖"""
+def get_toggled_bypass_method(provider) -> str | None:
+    """基于当前 provider 返回切换后的 bypass 配置"""
+    return None if provider.needs_waf_cookies() else "waf_cookies"
+
+
+def get_bypass_mode_label(bypass_method: str | None) -> str:
+    """返回便于日志输出的 bypass 模式描述"""
+    return "WAF browser mode" if bypass_method == "waf_cookies" else "non-WAF HTTP mode"
+
+
+def apply_bypass_runtime_overrides_for_failed_accounts(account_results: list, app_config: AppConfig) -> list[str]:
+    """为失败站点自动切换 bypass 模式并写入运行时覆盖"""
     updated_providers = []
     seen = set()
+    toggled_providers = getattr(app_config, "bypass_toggle_retry_applied", None)
+    if toggled_providers is None:
+        toggled_providers = set()
+        setattr(app_config, "bypass_toggle_retry_applied", toggled_providers)
 
     for result in account_results:
         if not isinstance(result, dict) or result.get("success"):
@@ -536,19 +649,26 @@ def apply_waf_runtime_overrides_for_failed_accounts(account_results: list, app_c
         provider_name = result.get("provider", "")
         if not provider_name or provider_name in seen:
             continue
-        if not should_enable_waf_retry(result, app_config):
+        if provider_name in toggled_providers:
+            continue
+        if not should_enable_bypass_toggle_retry(result, app_config):
             continue
 
         provider = app_config.get_provider(provider_name)
         if not provider:
             continue
 
-        overrides = {"bypass_method": "waf_cookies"}
+        next_bypass_method = get_toggled_bypass_method(provider)
+        overrides = {"bypass_method": next_bypass_method}
         update_runtime_site_override(app_config.runtime_sites_file, provider_name, overrides)
         app_config.update_provider(provider_name, provider.apply_overrides(overrides))
         updated_providers.append(provider_name)
+        toggled_providers.add(provider_name)
         seen.add(provider_name)
-        print(f"🔧 Auto-adjusted {provider_name} to WAF browser mode due to 403-style failure")
+        print(
+            f"🔧 Auto-toggled {provider_name} to {get_bypass_mode_label(next_bypass_method)} "
+            "due to auth-style failure"
+        )
 
     return updated_providers
 
@@ -604,9 +724,9 @@ async def rerun_selected_accounts(
         for index in failed_indices
         if index < len(account_results) and isinstance(account_results[index], dict)
     ]
-    updated_providers = apply_waf_runtime_overrides_for_failed_accounts(selected_results, app_config)
+    updated_providers = apply_bypass_runtime_overrides_for_failed_accounts(selected_results, app_config)
     if updated_providers:
-        print(f"⚙️ Runtime WAF overrides applied for {len(updated_providers)} provider(s): {updated_providers}")
+        print(f"⚙️ Runtime bypass overrides applied for {len(updated_providers)} provider(s): {updated_providers}")
 
     print(f"\n🔁 {retry_reason}: retrying {len(failed_indices)} account(s)...")
     retry_tasks = [
@@ -715,6 +835,7 @@ async def main():
     LinuxDoSessionManager.clear_all_circuits()
 
     app_config = AppConfig.load_from_env()
+    setattr(app_config, "bypass_toggle_retry_applied", set())
     print(f"⚙️ Loaded {len(app_config.providers)} provider(s)")
 
     # 检查账号配置
@@ -728,7 +849,7 @@ async def main():
     if discovered_runtime_overrides:
         print(f"⚙️ Runtime site overrides updated for {len(discovered_runtime_overrides)} site(s)")
 
-    await prewarm_linuxdo_sessions(
+    prewarm_summary = await prewarm_linuxdo_sessions(
         app_config.accounts,
         app_config.global_proxy,
         reason="Pre-logging in",
@@ -802,6 +923,11 @@ async def main():
 
     grouped_notifications = build_site_notification_groups(sorted_results)
     notification_lines = [item["line"] for item in grouped_notifications]
+    linuxdo_prewarm_alert_lines = build_linuxdo_prewarm_alert_lines(prewarm_summary, sorted_results)
+    if linuxdo_prewarm_alert_lines:
+        need_notify = True
+        notification_lines.extend(linuxdo_prewarm_alert_lines)
+        print("\n".join(linuxdo_prewarm_alert_lines))
 
     # 处理异常结果
     for result in account_results:

@@ -7,15 +7,16 @@ sys.path.insert(0, str(project_root))
 
 from checkin import should_rebuild_provider_cache, summarize_linuxdo_auth_state_error
 from main import (
-	apply_waf_runtime_overrides_for_failed_accounts,
+	apply_bypass_runtime_overrides_for_failed_accounts,
+	build_linuxdo_prewarm_alert_lines,
 	build_site_notification_groups,
 	collect_failed_account_indices,
 	collect_linuxdo_backoff_retry_indices,
 	get_error_label,
 	prewarm_linuxdo_sessions,
 	rerun_failed_accounts_once,
+	should_enable_bypass_toggle_retry,
 	should_enable_linuxdo_backoff_retry,
-	should_enable_waf_retry,
 	should_skip_failed_retry,
 )
 from utils.config import AccountConfig
@@ -324,17 +325,81 @@ def test_prewarm_linuxdo_sessions_deduplicates_accounts(monkeypatch):
 
 	result = asyncio.run(prewarm_linuxdo_sessions(accounts, None, reason='test warm-up'))
 
-	assert result == {'attempted': 2, 'successful': 2, 'failed': 0}
+	assert result == {'attempted': 2, 'successful': 2, 'failed': 0, 'issues': []}
 	assert calls == [
 		('user-a', 'pass-a', None, True),
 		('user-b', 'pass-b', None, True),
 	]
 
 
-def test_should_enable_waf_retry_for_403_error():
+def test_prewarm_linuxdo_sessions_reports_invalid_issue(monkeypatch, tmp_path):
+	class DummySession:
+		def __init__(self, is_logged_in, storage_state_path):
+			self.is_logged_in = is_logged_in
+			self.storage_state_path = storage_state_path
+
+	invalid_state = tmp_path / 'linuxdo_invalid_storage_state.json'
+	invalid_state.write_text('{}', encoding='utf-8')
+
+	async def fake_get_session(username, password, proxy=None, auto_login=True):
+		return DummySession(False, str(invalid_state))
+
+	monkeypatch.setattr('main.LinuxDoSessionManager.get_session', fake_get_session)
+	monkeypatch.setattr('main.LinuxDoSessionManager.get_session_count', lambda: 0)
+
+	accounts = [
+		AccountConfig.from_dict({
+			'name': 'acc-1',
+			'provider': 'alpha',
+			'linux.do': {'username': 'user-a', 'password': 'pass-a'},
+		}, 0),
+	]
+
+	result = asyncio.run(prewarm_linuxdo_sessions(accounts, None, reason='test warm-up'))
+
+	assert result['attempted'] == 1
+	assert result['successful'] == 0
+	assert result['failed'] == 1
+	assert result['issues'][0]['error_type'] == 'linuxdo_prewarmed_state_invalid'
+	assert result['issues'][0]['username_mask'].startswith('u***')
+
+
+def test_build_linuxdo_prewarm_alert_lines():
+	prewarm_summary = {
+		'issues': [
+			{
+				'username_hash': 'abc12345',
+				'username_mask': 'use***-a',
+				'error_type': 'linuxdo_prewarmed_state_invalid',
+				'error_summary': 'Linux.do 预热会话已失效，请重新预热',
+				'error_detail': 'Linux.do 预热会话已失效，请重新预热',
+			}
+		]
+	}
+	account_results = [
+		{
+			'account_name': 'alpha-2',
+			'error_type': 'linuxdo_redirect_login',
+			'error_label': '🔑 会话失效',
+			'error_summary': 'Linux.do 会话失效，被重定向回登录页',
+		}
+	]
+
+	alert_lines = build_linuxdo_prewarm_alert_lines(prewarm_summary, account_results)
+
+	assert len(alert_lines) == 1
+	assert 'LinuxDo 预热态提醒' in alert_lines[0]
+	assert 'use***-a: ♻️ 预热态失效' in alert_lines[0]
+	assert 'alpha-2: 🔑 会话失效' in alert_lines[0]
+
+
+def test_should_enable_bypass_toggle_retry_for_403_error():
 	class DummyProvider:
+		def __init__(self, bypass_method=None):
+			self.bypass_method = bypass_method
+
 		def needs_waf_cookies(self):
-			return False
+			return self.bypass_method == 'waf_cookies'
 
 	class DummySite:
 		mode = 'newapi'
@@ -345,13 +410,16 @@ def test_should_enable_waf_retry_for_403_error():
 		site_definitions = {'alpha': DummySite()}
 
 	result = {'provider': 'alpha', 'error_summary': 'Failed to get user info: HTTP 403'}
-	assert should_enable_waf_retry(result, DummyApp()) is True
+	assert should_enable_bypass_toggle_retry(result, DummyApp()) is True
 
 
-def test_should_enable_waf_retry_for_linuxdo_session_expired():
+def test_should_enable_bypass_toggle_retry_for_linuxdo_session_expired():
 	class DummyProvider:
+		def __init__(self, bypass_method=None):
+			self.bypass_method = bypass_method
+
 		def needs_waf_cookies(self):
-			return False
+			return self.bypass_method == 'waf_cookies'
 
 	class DummySite:
 		mode = 'newapi'
@@ -362,13 +430,16 @@ def test_should_enable_waf_retry_for_linuxdo_session_expired():
 		site_definitions = {'alpha': DummySite()}
 
 	result = {'provider': 'alpha', 'error_type': 'linuxdo_redirect_login', 'error_label': '🔑 会话失效'}
-	assert should_enable_waf_retry(result, DummyApp()) is True
+	assert should_enable_bypass_toggle_retry(result, DummyApp()) is True
 
 
-def test_should_enable_waf_retry_for_linuxdo_sso_stuck():
+def test_should_enable_bypass_toggle_retry_for_linuxdo_sso_stuck():
 	class DummyProvider:
+		def __init__(self, bypass_method=None):
+			self.bypass_method = bypass_method
+
 		def needs_waf_cookies(self):
-			return False
+			return self.bypass_method == 'waf_cookies'
 
 	class DummySite:
 		mode = 'newapi'
@@ -379,19 +450,39 @@ def test_should_enable_waf_retry_for_linuxdo_sso_stuck():
 		site_definitions = {'alpha': DummySite()}
 
 	result = {'provider': 'alpha', 'error_type': 'linuxdo_sso_provider_stuck', 'error_label': '🔄 SSO 卡住'}
-	assert should_enable_waf_retry(result, DummyApp()) is True
+	assert should_enable_bypass_toggle_retry(result, DummyApp()) is True
 
 
-def test_apply_waf_runtime_overrides_for_failed_accounts(monkeypatch, tmp_path):
+def test_should_enable_bypass_toggle_retry_for_cloudflare_challenge():
 	class DummyProvider:
-		def __init__(self):
-			self.bypass_method = None
+		def __init__(self, bypass_method=None):
+			self.bypass_method = bypass_method
+
 		def needs_waf_cookies(self):
-			return False
+			return self.bypass_method == 'waf_cookies'
+
+	class DummySite:
+		mode = 'newapi-waf'
+
+	class DummyApp:
+		def get_provider(self, name):
+			return DummyProvider('waf_cookies')
+		site_definitions = {'alpha': DummySite()}
+
+	result = {'provider': 'alpha', 'error_type': 'linuxdo_cloudflare_challenge', 'error_label': '☁️ Cloudflare'}
+	assert should_enable_bypass_toggle_retry(result, DummyApp()) is True
+
+
+def test_apply_bypass_runtime_overrides_for_failed_accounts_enables_waf(monkeypatch, tmp_path):
+	class DummyProvider:
+		def __init__(self, bypass_method=None):
+			self.bypass_method = bypass_method
+
+		def needs_waf_cookies(self):
+			return self.bypass_method == 'waf_cookies'
+
 		def apply_overrides(self, overrides):
-			new_provider = DummyProvider()
-			new_provider.bypass_method = overrides.get('bypass_method')
-			return new_provider
+			return DummyProvider(overrides.get('bypass_method'))
 
 	class DummySite:
 		mode = 'newapi'
@@ -409,10 +500,46 @@ def test_apply_waf_runtime_overrides_for_failed_accounts(monkeypatch, tmp_path):
 	app = DummyApp()
 	account_results = [{'provider': 'alpha', 'success': False, 'error_summary': 'HTTP 403'}]
 
-	updated = apply_waf_runtime_overrides_for_failed_accounts(account_results, app)
+	updated = apply_bypass_runtime_overrides_for_failed_accounts(account_results, app)
 
 	assert updated == ['alpha']
 	assert app.provider.bypass_method == 'waf_cookies'
+
+
+def test_apply_bypass_runtime_overrides_for_failed_accounts_can_disable_waf(monkeypatch, tmp_path):
+	class DummyProvider:
+		def __init__(self, bypass_method='waf_cookies'):
+			self.bypass_method = bypass_method
+
+		def needs_waf_cookies(self):
+			return self.bypass_method == 'waf_cookies'
+
+		def apply_overrides(self, overrides):
+			return DummyProvider(overrides.get('bypass_method'))
+
+	class DummySite:
+		mode = 'newapi-waf'
+
+	class DummyApp:
+		def __init__(self):
+			self.provider = DummyProvider('waf_cookies')
+			self.site_definitions = {'alpha': DummySite()}
+			self.runtime_sites_file = str(tmp_path / 'runtime.json')
+		def get_provider(self, name):
+			return self.provider if name == 'alpha' else None
+		def update_provider(self, name, provider):
+			self.provider = provider
+
+	app = DummyApp()
+	account_results = [
+		{'provider': 'alpha', 'success': False, 'error_type': 'linuxdo_cloudflare_challenge', 'error_label': '☁️ Cloudflare'}
+	]
+
+	updated = apply_bypass_runtime_overrides_for_failed_accounts(account_results, app)
+
+	assert updated == ['alpha']
+	assert app.provider.bypass_method is None
+	assert '"bypass_method": null' in Path(app.runtime_sites_file).read_text(encoding='utf-8')
 
 
 def test_should_rebuild_provider_cache_for_anyrouter_html_like_error():

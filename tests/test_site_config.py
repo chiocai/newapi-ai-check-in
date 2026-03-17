@@ -86,7 +86,7 @@ def test_explicit_site_account_wins_over_auto_generated(tmp_path, monkeypatch):
 def test_runtime_overrides_are_applied_over_txt(tmp_path, monkeypatch):
 	sites_file = tmp_path / 'sites.txt'
 	sites_file.write_text(
-		'turn | https://turn.example.com | turnstile\nstd | https://std.example.com | newapi\n',
+		'turn | https://turn.example.com | turnstile\nstd | https://std.example.com | newapi\nwaf | https://waf.example.com | newapi-waf\n',
 		encoding='utf-8',
 	)
 	runtime_file = tmp_path / 'runtime.json'
@@ -100,6 +100,9 @@ def test_runtime_overrides_are_applied_over_txt(tmp_path, monkeypatch):
 					},
 					'std': {
 						'linuxdo_client_id': 'std-client-id',
+					},
+					'waf': {
+						'bypass_method': None,
 					},
 				}
 			}
@@ -126,6 +129,7 @@ def test_runtime_overrides_are_applied_over_txt(tmp_path, monkeypatch):
 	assert app_config.get_provider('turn').linuxdo_client_id == 'runtime-linuxdo'
 	assert app_config.get_provider('turn').turnstile_site_key == 'runtime-site-key'
 	assert app_config.get_provider('std').linuxdo_client_id == 'std-client-id'
+	assert app_config.get_provider('waf').bypass_method is None
 
 
 def test_special_sites_are_not_auto_expanded_from_global_linuxdo(tmp_path, monkeypatch):

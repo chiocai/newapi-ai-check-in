@@ -1221,6 +1221,70 @@ class CheckIn:
 
         return results
 
+    async def validate_provider_session(self, cookies: dict, api_user: str | int) -> dict:
+        """验证站点 session 缓存是否仍可用于已登录操作"""
+        print(f"ℹ️ {self.account_name}: Validating cached provider session before reuse")
+
+        client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
+        try:
+            client.cookies.update(cookies)
+
+            headers = {
+                "User-Agent": get_random_user_agent(),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Referer": self.provider_config.get_login_url(),
+                "Origin": self.provider_config.origin,
+                "Connection": "keep-alive",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                self.provider_config.api_user_key: f"{api_user}",
+            }
+
+            if self.provider_config.name == "anyrouter":
+                user_info = await self.get_user_info(client, headers)
+                if not (user_info and user_info.get("success")):
+                    print(f"⚠️ {self.account_name}: Cached anyrouter session HTTP validation failed, fallback to browser")
+                    auth_cookies_list = []
+                    parsed_domain = urlparse(self.provider_config.origin).netloc
+                    for name, value in cookies.items():
+                        auth_cookies_list.append({
+                            "name": name,
+                            "value": value,
+                            "domain": parsed_domain,
+                            "path": "/",
+                        })
+                    user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=False)
+            elif self.provider_config.needs_waf_cookies():
+                auth_cookies_list = []
+                parsed_domain = urlparse(self.provider_config.origin).netloc
+                for name, value in cookies.items():
+                    auth_cookies_list.append({
+                        "name": name,
+                        "value": value,
+                        "domain": parsed_domain,
+                        "path": "/",
+                    })
+                user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=False)
+            else:
+                user_info = await self.get_user_info(client, headers)
+
+            if user_info and user_info.get("success"):
+                print(f"✅ {self.account_name}: Cached provider session is reusable")
+                return {"success": True, "user_info": user_info}
+
+            error_msg = user_info.get("error", "Cached provider session validation failed") if user_info else "No user info available"
+            print(f"⚠️ {self.account_name}: Cached provider session is not reusable - {error_msg}")
+            return {"success": False, "error": error_msg}
+        except Exception as e:
+            error_msg = f"Cached provider session validation error: {e}"
+            print(f"⚠️ {self.account_name}: {error_msg}")
+            return {"success": False, "error": error_msg}
+        finally:
+            client.close()
+
     async def check_in_with_cookies(self, cookies: dict, api_user: str | int) -> tuple[bool, dict]:
         """使用已有 cookies 执行签到操作"""
         print(
@@ -1592,48 +1656,69 @@ class CheckIn:
             # 合并 WAF cookies 和缓存的 cookies
             merged_cookies = {**waf_cookies, **cached_cookies}
 
-            # 如果只需要登录信息，直接返回
             if login_only:
-                return True, {"cookies": merged_cookies, "api_user": cached_api_user}
+                validation_result = await self.validate_provider_session(merged_cookies, cached_api_user)
+                if validation_result.get("success"):
+                    if is_stale_cache:
+                        _save_provider_session_cache(provider_cache_path, cached_cookies, cached_api_user)
+                        print(f"✅ {self.account_name}: Stale provider session cache is still valid, timestamp refreshed")
+                    return True, {"cookies": merged_cookies, "api_user": cached_api_user}
 
-            # 使用缓存的 cookies 执行签到
-            success, result = await self.check_in_with_cookies(merged_cookies, cached_api_user)
-
-            # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
-            if not success and "error" in result:
-                error_msg = result.get("error", "").lower()
+                error_msg = validation_result.get("error", "Cached provider session validation failed")
                 if should_rebuild_provider_cache(self.provider_config.name, error_msg):
-                    print(f"⚠️ {self.account_name}: Cached session may be expired or WAF challenge, clearing cache and re-authenticating")
+                    print(
+                        f"⚠️ {self.account_name}: Cached provider session is invalid for login-only flow, "
+                        "clearing cache and re-authorizing with LinuxDo prewarmed session"
+                    )
                     try:
                         os.remove(provider_cache_path)
                     except Exception:
                         pass
-                    if self.provider_config.name == "anyrouter":
-                        from utils.linuxdo_session import LinuxDoSessionManager
-
-                        print(f"ℹ️ {self.account_name}: anyrouter cache invalid, forcing LinuxDo shared session rebuild")
-                        refreshed_session = await LinuxDoSessionManager.get_session(
-                            username,
-                            password,
-                            proxy=self.camoufox_proxy_config,
-                            auto_login=True,
-                        )
-                        if not getattr(refreshed_session, "is_logged_in", False):
-                            return False, {
-                                "error": (
-                                    "anyrouter provider cache invalid and LinuxDo shared session is not warmed. "
-                                    "Please run `uv run python prepare_linuxdo_session.py` first"
-                                )
-                            }
-                        self.linuxdo_session = refreshed_session
-                    # 继续执行下面的 OAuth 流程
                 else:
-                    return success, result
+                    return False, {"error": error_msg}
+
+            # 使用缓存的 cookies 执行签到
             else:
-                if success and is_stale_cache:
-                    _save_provider_session_cache(provider_cache_path, cached_cookies, cached_api_user)
-                    print(f"✅ {self.account_name}: Stale provider session cache is still valid, timestamp refreshed")
-                return success, result
+                success, result = await self.check_in_with_cookies(merged_cookies, cached_api_user)
+
+                # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
+                if not success and "error" in result:
+                    error_msg = result.get("error", "").lower()
+                    if should_rebuild_provider_cache(self.provider_config.name, error_msg):
+                        print(
+                            f"⚠️ {self.account_name}: Cached provider session may be expired or blocked, "
+                            "clearing cache and re-authorizing with LinuxDo prewarmed session"
+                        )
+                        try:
+                            os.remove(provider_cache_path)
+                        except Exception:
+                            pass
+                        if self.provider_config.name == "anyrouter":
+                            from utils.linuxdo_session import LinuxDoSessionManager
+
+                            print(f"ℹ️ {self.account_name}: anyrouter cache invalid, forcing LinuxDo shared session rebuild")
+                            refreshed_session = await LinuxDoSessionManager.get_session(
+                                username,
+                                password,
+                                proxy=self.camoufox_proxy_config,
+                                auto_login=True,
+                            )
+                            if not getattr(refreshed_session, "is_logged_in", False):
+                                return False, {
+                                    "error": (
+                                        "anyrouter provider cache invalid and LinuxDo shared session is not warmed. "
+                                        "Please run `uv run python prepare_linuxdo_session.py` first"
+                                    )
+                                }
+                            self.linuxdo_session = refreshed_session
+                        # 继续执行下面的 OAuth 流程
+                    else:
+                        return success, result
+                else:
+                    if success and is_stale_cache:
+                        _save_provider_session_cache(provider_cache_path, cached_cookies, cached_api_user)
+                        print(f"✅ {self.account_name}: Stale provider session cache is still valid, timestamp refreshed")
+                    return success, result
 
         from utils.linuxdo_session import LinuxDoSessionManager
 
@@ -1936,7 +2021,7 @@ class CheckIn:
                 if not username or not password:
                     print(f"❌ {self.account_name}: Incomplete Linux.do account information")
                     results.append(("linux.do", False, {"error": "Incomplete Linux.do account information"}))
-                # 特殊处理：有 get_cdk 的 provider（如 b4u, fuli_wheel, x666）
+                # 特殊处理：有 get_cdk 的 provider（如 fuli_wheel, x666）
                 # 这类 provider 的签到通过 get_cdk 函数完成
                 elif self.provider_config.get_cdk:
                     print(f"ℹ️ {self.account_name}: Provider uses get_cdk for check-in")
