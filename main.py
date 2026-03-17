@@ -7,8 +7,10 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
+from fnmatch import fnmatch
 from itertools import groupby
 from urllib.parse import urlparse
 
@@ -143,6 +145,32 @@ def mask_linuxdo_username(username: str) -> str:
     return f"{username[:3]}***{username[-2:]}"
 
 
+def extract_account_slot_label(account_name: str | None) -> str | None:
+    """从账号名提取类似 -1 / -2 的批次标识"""
+    if not account_name:
+        return None
+
+    match = re.search(r"-(\d+)$", account_name)
+    if not match:
+        return None
+    return f"-{match.group(1)}"
+
+
+def build_linuxdo_binding_label(account_name: str, account_config) -> str | None:
+    """构建日志里展示的 Linux.do 账号标识"""
+    if not account_config.linux_do:
+        return None
+
+    username = account_config.linux_do.get("username", "")
+    if not username:
+        return None
+
+    slot_label = extract_account_slot_label(account_name)
+    if slot_label:
+        return f"{username} ({slot_label})"
+    return username
+
+
 def build_linuxdo_prewarm_alert_lines(prewarm_summary: dict | None, account_results: list[dict]) -> list[str]:
     """汇总 LinuxDo 预热态失效提醒，追加到最终通知中"""
     alert_items = []
@@ -244,6 +272,9 @@ async def process_single_account(
             result["site_origin"] = provider_config.origin
 
             print(f"🌀 Processing {account_name} using provider '{account_config.provider}'\n")
+            linuxdo_binding = build_linuxdo_binding_label(account_name, account_config)
+            if linuxdo_binding:
+                print(f"🔐 {account_name}: Bound Linux.do account -> {linuxdo_binding}")
 
             # 获取共享的 Linux.do 会话（如果有）
             linuxdo_session = None
@@ -403,6 +434,21 @@ def collect_failed_account_indices(account_results: list) -> list[int]:
     return failed_indices
 
 
+def collect_failed_account_indices_for_candidates(account_results: list, candidate_indices: list[int]) -> list[int]:
+    """仅针对指定账号索引收集失败账号"""
+    failed_indices = []
+    for index in candidate_indices:
+        if not (0 <= index < len(account_results)):
+            continue
+        result = account_results[index]
+        if isinstance(result, Exception):
+            failed_indices.append(index)
+            continue
+        if isinstance(result, dict) and not result.get("success"):
+            failed_indices.append(index)
+    return failed_indices
+
+
 def should_skip_failed_retry(result: dict) -> bool:
     """判断失败结果是否应跳过 failed retry，避免放大 Linux.do 限流"""
     if not isinstance(result, dict) or result.get("success"):
@@ -474,20 +520,227 @@ def collect_linuxdo_backoff_retry_indices(account_results: list) -> list[int]:
     return retry_indices
 
 
+def collect_linuxdo_backoff_retry_indices_for_candidates(account_results: list, candidate_indices: list[int]) -> list[int]:
+    """仅针对指定账号索引收集 Linux.do 延迟退避重试账号"""
+    retry_indices = []
+    for index in candidate_indices:
+        if not (0 <= index < len(account_results)):
+            continue
+        if should_enable_linuxdo_backoff_retry(account_results[index]):
+            retry_indices.append(index)
+    return retry_indices
+
+
+def build_execution_batches(accounts: list) -> list[dict]:
+    """按 Linux.do 用户分批执行账号，优先执行后展开的 Linux.do 账号批次"""
+    batches_by_key = {}
+    ordered_keys = []
+
+    for index, account_config in enumerate(accounts):
+        linuxdo_username = ""
+        if account_config.linux_do:
+            linuxdo_username = account_config.linux_do.get("username", "")
+
+        if linuxdo_username:
+            batch_key = f"linuxdo:{linuxdo_username}"
+            batch_label = f"Linux.do {mask_linuxdo_username(linuxdo_username)}"
+        else:
+            batch_key = f"account:{index}"
+            batch_label = account_config.get_display_name(index)
+
+        if batch_key not in batches_by_key:
+            ordered_keys.append(batch_key)
+            slot_label = extract_account_slot_label(account_config.get_display_name(index))
+            if linuxdo_username and slot_label:
+                batch_label = f"Linux.do {linuxdo_username} ({slot_label})"
+            batches_by_key[batch_key] = {
+                "key": batch_key,
+                "label": batch_label,
+                "linuxdo_username": linuxdo_username or None,
+                "indices": [],
+                "first_index": index,
+                "slot_label": slot_label,
+            }
+
+        batches_by_key[batch_key]["indices"].append(index)
+
+    # Linux.do 批次按首次出现位置倒序执行：
+    # 在 site-1 / site-2 的账号展开模型下，会先跑完整批 -2，再跑完整批 -1。
+    linuxdo_batches = []
+    other_batches = []
+    for key in ordered_keys:
+        batch = batches_by_key[key]
+        if batch["linuxdo_username"]:
+            linuxdo_batches.append(batch)
+        else:
+            other_batches.append(batch)
+
+    batch_order = os.getenv("LINUXDO_BATCH_ORDER", "descending").strip().lower()
+    reverse_order = batch_order != "ascending"
+    linuxdo_batches.sort(key=lambda batch: batch["first_index"], reverse=reverse_order)
+    other_batches.sort(key=lambda batch: batch["first_index"])
+    return linuxdo_batches + other_batches
+
+
+def merge_prewarm_summary(overall_summary: dict, batch_summary: dict | None) -> dict:
+    """合并批次级 Linux.do 预热摘要"""
+    if not batch_summary:
+        return overall_summary
+
+    overall_summary["attempted"] += batch_summary.get("attempted", 0)
+    overall_summary["successful"] += batch_summary.get("successful", 0)
+    overall_summary["failed"] += batch_summary.get("failed", 0)
+    overall_summary["issues"].extend(batch_summary.get("issues", []))
+    return overall_summary
+
+
+def clear_linuxdo_runtime_state(reason: str):
+    """清理进程内 Linux.do 运行态，隔离下一批账号"""
+    print(f"\n🧹 Clearing Linux.do runtime state: {reason}")
+    LinuxDoSessionManager.clear_all_sessions()
+    LinuxDoSessionManager.clear_all_circuits()
+
+
+def purge_site_auth_caches(storage_dir: str = "storage-states") -> list[str]:
+    """清理站点侧登录缓存，保留 Linux.do 预热态，尽量模拟首次运行"""
+    if not os.path.isdir(storage_dir):
+        return []
+
+    deleted = []
+    for filename in sorted(os.listdir(storage_dir)):
+        if filename.startswith("linuxdo_"):
+            continue
+        if (
+            fnmatch(filename, "provider_*_session.json")
+            or fnmatch(filename, "*_linuxdo_*_storage_state.json")
+            or fnmatch(filename, "github_*_storage_state.json")
+        ):
+            file_path = os.path.join(storage_dir, filename)
+            try:
+                os.remove(file_path)
+                deleted.append(filename)
+            except FileNotFoundError:
+                continue
+    return deleted
+
+
+def build_oauth_probe_payload(
+    username: str,
+    account_name: str,
+    provider_name: str,
+    provider_origin: str,
+    client_id: str,
+) -> dict:
+    """构造 Linux.do OAuth 预热探针"""
+    slot_label = extract_account_slot_label(account_name) or ""
+    state_seed = f"{username}:{provider_name}:{slot_label or 'default'}"
+    state = f"prewarm-{hashlib.sha1(state_seed.encode('utf-8')).hexdigest()[:12]}"
+    return {
+        "label": f"{provider_name}{slot_label}",
+        "client_id": client_id,
+        "provider_origin": provider_origin,
+        "state": state,
+    }
+
+
+def get_default_linuxdo_oauth_probe(app_config: AppConfig, username: str) -> dict | None:
+    """获取默认 Linux.do OAuth 探针，优先选择 anyrouter"""
+    preferred_provider_names = ["anyrouter", *sorted(app_config.providers.keys())]
+    seen = set()
+    for provider_name in preferred_provider_names:
+        if provider_name in seen:
+            continue
+        seen.add(provider_name)
+        provider = app_config.get_provider(provider_name)
+        if not provider or not provider.linuxdo_client_id:
+            continue
+        return build_oauth_probe_payload(
+            username=username,
+            account_name=provider_name,
+            provider_name=provider.name,
+            provider_origin=provider.origin,
+            client_id=provider.linuxdo_client_id,
+        )
+    return None
+
+
+def collect_linuxdo_oauth_probes_for_indices(app_config: AppConfig, account_indices: list[int] | None = None) -> dict[str, list[dict]]:
+    """为指定账号范围收集 Linux.do OAuth 预热探针"""
+    if account_indices is None:
+        account_indices = list(range(len(app_config.accounts)))
+
+    probes_by_username: dict[str, list[dict]] = {}
+    seen_probe_keys: dict[str, set[tuple[str, str]]] = {}
+
+    for index in account_indices:
+        if not (0 <= index < len(app_config.accounts)):
+            continue
+
+        account_config = app_config.accounts[index]
+        if not account_config.linux_do:
+            continue
+
+        username = account_config.linux_do.get("username", "")
+        if not username:
+            continue
+
+        provider = app_config.get_provider(account_config.provider)
+        if not provider or not provider.linuxdo_client_id:
+            continue
+
+        account_name = account_config.get_display_name(index)
+        probe_key = (provider.linuxdo_client_id, provider.origin)
+        user_seen_probe_keys = seen_probe_keys.setdefault(username, set())
+        if probe_key in user_seen_probe_keys:
+            continue
+
+        probes_by_username.setdefault(username, []).append(
+            build_oauth_probe_payload(
+                username=username,
+                account_name=account_name,
+                provider_name=provider.name,
+                provider_origin=provider.origin,
+                client_id=provider.linuxdo_client_id,
+            )
+        )
+        user_seen_probe_keys.add(probe_key)
+
+    for username in {
+        app_config.accounts[index].linux_do.get("username", "")
+        for index in account_indices
+        if 0 <= index < len(app_config.accounts) and app_config.accounts[index].linux_do
+    }:
+        if not username:
+            continue
+        if probes_by_username.get(username):
+            continue
+        default_probe = get_default_linuxdo_oauth_probe(app_config, username)
+        if default_probe:
+            probes_by_username[username] = [default_probe]
+
+    return probes_by_username
+
+
 async def prewarm_linuxdo_sessions(
-    accounts: list,
-    global_proxy: dict | None = None,
+    app_config: AppConfig,
     account_indices: list[int] | None = None,
     reason: str = "Pre-logging in",
 ) -> dict:
     """预热指定账号范围内的 Linux.do 会话"""
-    selected_accounts = accounts if account_indices is None else [
-        accounts[index]
+    selected_indices = list(range(len(app_config.accounts))) if account_indices is None else [
+        index
         for index in account_indices
-        if 0 <= index < len(accounts)
+        if 0 <= index < len(app_config.accounts)
+    ]
+    selected_accounts = [
+        app_config.accounts[index]
+        for index in selected_indices
+        if 0 <= index < len(app_config.accounts)
     ]
 
     linuxdo_credentials = {}
+    oauth_probes_by_username = collect_linuxdo_oauth_probes_for_indices(app_config, selected_indices)
+
     for account_config in selected_accounts:
         if not account_config.linux_do:
             continue
@@ -499,7 +752,8 @@ async def prewarm_linuxdo_sessions(
 
         linuxdo_credentials[username] = {
             "password": password,
-            "proxy": account_config.proxy or global_proxy,
+            "proxy": account_config.proxy or app_config.global_proxy,
+            "oauth_probes": oauth_probes_by_username.get(username, []),
         }
 
     if not linuxdo_credentials:
@@ -509,7 +763,7 @@ async def prewarm_linuxdo_sessions(
     print(f"\n🔐 {reason} {len(linuxdo_credentials)} unique Linux.do account(s)...")
     prelogin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_PRELOGIN)
 
-    async def prelogin_one(username: str, password: str, proxy):
+    async def prelogin_one(username: str, password: str, proxy, oauth_probes: list[dict]):
         async with prelogin_semaphore:
             try:
                 session = await LinuxDoSessionManager.get_session(
@@ -517,6 +771,7 @@ async def prewarm_linuxdo_sessions(
                     password,
                     proxy=proxy,
                     auto_login=True,
+                    oauth_probes=oauth_probes,
                 )
                 if getattr(session, "is_logged_in", False):
                     return username, True, None, None
@@ -535,7 +790,7 @@ async def prewarm_linuxdo_sessions(
 
     prelogin_results = await asyncio.gather(
         *(
-            prelogin_one(username, config["password"], config["proxy"])
+            prelogin_one(username, config["password"], config["proxy"], config.get("oauth_probes", []))
             for username, config in linuxdo_credentials.items()
         )
     )
@@ -707,6 +962,46 @@ async def rerun_failed_accounts_once(account_results: list, app_config, semaphor
     )
 
 
+async def rerun_failed_accounts_once_for_candidates(
+    account_results: list,
+    app_config,
+    semaphore: asyncio.Semaphore,
+    candidate_indices: list[int],
+    retry_reason: str,
+) -> list:
+    """仅对指定批次中的失败账号补跑一轮"""
+    failed_indices = [
+        index
+        for index in collect_failed_account_indices_for_candidates(account_results, candidate_indices)
+        if not (
+            index < len(account_results)
+            and isinstance(account_results[index], dict)
+            and should_skip_failed_retry(account_results[index])
+        )
+    ]
+
+    skipped_retry_indices = [
+        index
+        for index in collect_failed_account_indices_for_candidates(account_results, candidate_indices)
+        if index < len(account_results)
+        and isinstance(account_results[index], dict)
+        and should_skip_failed_retry(account_results[index])
+    ]
+    if skipped_retry_indices:
+        print(
+            f"ℹ️ {retry_reason}: skipping {len(skipped_retry_indices)} account(s) "
+            "with Linux.do high-load/SSO-stuck errors"
+        )
+
+    return await rerun_selected_accounts(
+        account_results,
+        app_config,
+        semaphore,
+        failed_indices,
+        retry_reason=retry_reason,
+    )
+
+
 async def rerun_selected_accounts(
     account_results: list,
     app_config,
@@ -832,7 +1127,7 @@ async def main():
     print("🚀 newapi.ai multi-account auto check-in script started (using Camoufox)")
     print(f'🕒 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
-    LinuxDoSessionManager.clear_all_circuits()
+    clear_linuxdo_runtime_state("startup")
 
     app_config = AppConfig.load_from_env()
     setattr(app_config, "bypass_toggle_retry_applied", set())
@@ -849,58 +1144,91 @@ async def main():
     if discovered_runtime_overrides:
         print(f"⚙️ Runtime site overrides updated for {len(discovered_runtime_overrides)} site(s)")
 
-    prewarm_summary = await prewarm_linuxdo_sessions(
-        app_config.accounts,
-        app_config.global_proxy,
-        reason="Pre-logging in",
-    )
-
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
 
-    # 并行处理所有账号
-    print(f"\n🚀 Starting parallel processing with max {MAX_CONCURRENT_ACCOUNTS} concurrent accounts...")
+    execution_batches = build_execution_batches(app_config.accounts)
+    print(f"⚙️ Built {len(execution_batches)} execution batch(es)")
+    for batch_index, batch in enumerate(execution_batches, start=1):
+        print(
+            f"  • Batch {batch_index}: {batch['label']} "
+            f"({len(batch['indices'])} account(s))"
+        )
+
+    # 分批处理所有账号，避免同站点连续切换 Linux.do 双账号授权
+    print(f"\n🚀 Starting batched processing with max {MAX_CONCURRENT_ACCOUNTS} concurrent accounts...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ACCOUNTS)
+    account_results: list = [None] * len(app_config.accounts)
+    prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
 
-    # 创建所有账号的处理任务
-    tasks = [
-        process_single_account(i, account_config, app_config, semaphore)
-        for i, account_config in enumerate(app_config.accounts)
-    ]
-
-    # 并行执行所有任务
-    account_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for backoff_round, delay_seconds in enumerate(LINUXDO_BACKOFF_RETRY_DELAYS, start=1):
-        retry_indices = collect_linuxdo_backoff_retry_indices(account_results)
-        if not retry_indices:
-            break
+    for batch_index, batch in enumerate(execution_batches, start=1):
+        batch_indices = batch["indices"]
+        batch_label = batch["label"]
 
         print(
-            f"⏳ Linux.do backoff retry round {backoff_round}/{len(LINUXDO_BACKOFF_RETRY_DELAYS)}: "
-            f"{len(retry_indices)} account(s) will retry after {delay_seconds}s"
-        )
-        await prewarm_linuxdo_sessions(
-            app_config.accounts,
-            app_config.global_proxy,
-            account_indices=retry_indices,
-            reason=f"Linux.do warm-up before backoff retry round {backoff_round}",
-        )
-        await asyncio.sleep(delay_seconds)
-        account_results = await rerun_selected_accounts(
-            account_results,
-            app_config,
-            semaphore,
-            retry_indices,
-            retry_reason=f"Linux.do backoff retry round {backoff_round}",
+            f"\n🧩 Starting batch {batch_index}/{len(execution_batches)}: "
+            f"{batch_label} -> {len(batch_indices)} account(s)"
         )
 
-    for retry_round in range(MAX_FAILED_RETRY_ROUNDS):
-        failed_indices = collect_failed_account_indices(account_results)
-        if not failed_indices:
-            break
-        print(f"ℹ️ Retry round {retry_round + 1}/{MAX_FAILED_RETRY_ROUNDS}")
-        account_results = await rerun_failed_accounts_once(account_results, app_config, semaphore)
+        cleared_site_caches = purge_site_auth_caches()
+        if cleared_site_caches:
+            print(
+                f"🧹 Cleared {len(cleared_site_caches)} site auth cache file(s) before batch {batch_label}"
+            )
+
+        batch_prewarm_summary = await prewarm_linuxdo_sessions(
+            app_config,
+            account_indices=batch_indices,
+            reason=f"Pre-logging in for batch {batch_index}/{len(execution_batches)} [{batch_label}]",
+        )
+        merge_prewarm_summary(prewarm_summary, batch_prewarm_summary)
+
+        tasks = [
+            process_single_account(i, app_config.accounts[i], app_config, semaphore)
+            for i in batch_indices
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for index, result in zip(batch_indices, batch_results):
+            account_results[index] = result
+
+        for backoff_round, delay_seconds in enumerate(LINUXDO_BACKOFF_RETRY_DELAYS, start=1):
+            retry_indices = collect_linuxdo_backoff_retry_indices_for_candidates(account_results, batch_indices)
+            if not retry_indices:
+                break
+
+            print(
+                f"⏳ Linux.do backoff retry round {backoff_round}/{len(LINUXDO_BACKOFF_RETRY_DELAYS)} "
+                f"for batch {batch_label}: {len(retry_indices)} account(s) will retry after {delay_seconds}s"
+            )
+            await prewarm_linuxdo_sessions(
+                app_config,
+                account_indices=retry_indices,
+                reason=f"Linux.do warm-up before backoff retry round {backoff_round} [{batch_label}]",
+            )
+            await asyncio.sleep(delay_seconds)
+            account_results = await rerun_selected_accounts(
+                account_results,
+                app_config,
+                semaphore,
+                retry_indices,
+                retry_reason=f"Linux.do backoff retry round {backoff_round} [{batch_label}]",
+            )
+
+        for retry_round in range(MAX_FAILED_RETRY_ROUNDS):
+            failed_indices = collect_failed_account_indices_for_candidates(account_results, batch_indices)
+            if not failed_indices:
+                break
+            print(f"ℹ️ Retry round {retry_round + 1}/{MAX_FAILED_RETRY_ROUNDS} for batch {batch_label}")
+            account_results = await rerun_failed_accounts_once_for_candidates(
+                account_results,
+                app_config,
+                semaphore,
+                batch_indices,
+                retry_reason=f"Retrying failed account(s) once [{batch_label}]",
+            )
+
+        if batch_index < len(execution_batches):
+            clear_linuxdo_runtime_state(f"after batch {batch_index}/{len(execution_batches)} [{batch_label}]")
 
     # 汇总结果
     current_balances = {}

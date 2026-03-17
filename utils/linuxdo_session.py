@@ -27,6 +27,15 @@ if TYPE_CHECKING:
 
 # 存储目录
 STORAGE_STATE_DIR = "storage-states"
+TIMEOUT_OAUTH_PROBE = 45000
+
+
+def _build_oauth_probe_url(client_id: str, state: str) -> str:
+    """构造用于验证 Linux.do 会话可复用性的 OAuth 探针链接"""
+    return (
+        "https://connect.linux.do/oauth2/authorize"
+        f"?response_type=code&client_id={client_id}&state={state}"
+    )
 
 
 class LinuxDoSession:
@@ -51,7 +60,7 @@ class LinuxDoSession:
         # 确保存储目录存在
         os.makedirs(STORAGE_STATE_DIR, exist_ok=True)
 
-    async def ensure_logged_in(self) -> bool:
+    async def ensure_logged_in(self, oauth_probes: list[dict] | None = None) -> bool:
         """确保已登录，如果未登录则执行登录
 
         Returns:
@@ -65,7 +74,7 @@ class LinuxDoSession:
         if os.path.exists(self.storage_state_path):
             print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Found cache file, verifying...")
             # 尝试使用缓存验证登录状态
-            is_valid = await self._verify_cached_session()
+            is_valid = await self._verify_cached_session(oauth_probes=oauth_probes)
             if is_valid:
                 self.is_logged_in = True
                 return True
@@ -77,7 +86,7 @@ class LinuxDoSession:
         self.invalidate()
         return False
 
-    async def _verify_cached_session(self) -> bool:
+    async def _verify_cached_session(self, oauth_probes: list[dict] | None = None) -> bool:
         """验证缓存的会话是否有效
 
         Returns:
@@ -95,6 +104,91 @@ class LinuxDoSession:
                 page = await context.new_page()
 
                 try:
+                    if oauth_probes:
+                        probe_labels = ", ".join(
+                            probe.get("label", probe.get("client_id", "unknown"))
+                            for probe in oauth_probes
+                            if isinstance(probe, dict)
+                        )
+                        print(
+                            f"ℹ️ LinuxDoSession [{self.username_hash}]: "
+                            f"Verifying cache via OAuth probe(s): {probe_labels}"
+                        )
+
+                        for probe in oauth_probes:
+                            if not isinstance(probe, dict):
+                                continue
+
+                            client_id = probe.get("client_id", "")
+                            if not client_id:
+                                continue
+
+                            label = probe.get("label", client_id)
+                            state = probe.get("state") or f"prewarm-{self.username_hash}-{int(time.time())}"
+                            probe_url = probe.get("oauth_url") or _build_oauth_probe_url(client_id, state)
+                            provider_origin = probe.get("provider_origin", "")
+
+                            print(
+                                f"ℹ️ LinuxDoSession [{self.username_hash}]: "
+                                f"OAuth probe -> {label} ({provider_origin or 'connect.linux.do'})"
+                            )
+                            try:
+                                await page.goto(probe_url, wait_until="domcontentloaded", timeout=TIMEOUT_OAUTH_PROBE)
+                            except Exception:
+                                await page.goto(probe_url, wait_until="load", timeout=TIMEOUT_OAUTH_PROBE)
+
+                            await page.wait_for_timeout(1500)
+                            current_url = page.url.lower()
+                            guard = await detect_linuxdo_page_guard(page)
+
+                            if guard.get("human_verification"):
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe blocked by Human Verification: {label}"
+                                )
+                                return False
+                            if guard.get("cloudflare_challenge"):
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe blocked by Cloudflare challenge: {label}"
+                                )
+                                return False
+                            if "linux.do/login" in current_url:
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe redirected to login page: {label}"
+                                )
+                                return False
+                            if "linux.do/session/sso_provider" in current_url:
+                                print(
+                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe stalled at sso_provider: {label}"
+                                )
+                                return False
+
+                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                            if allow_btn:
+                                print(
+                                    f"✅ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe reached authorize page: {label}"
+                                )
+                                self._storage_state = await context.storage_state()
+                                return True
+
+                            if provider_origin and page.url.startswith(provider_origin):
+                                print(
+                                    f"✅ LinuxDoSession [{self.username_hash}]: "
+                                    f"OAuth probe already reached provider: {label}"
+                                )
+                                self._storage_state = await context.storage_state()
+                                return True
+
+                        print(
+                            f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                            "OAuth probes did not reach authorize/provider page"
+                        )
+                        return False
+
                     # 访问 linux.do 检查登录状态
                     await page.goto("https://linux.do", wait_until="domcontentloaded")
                     # 等待页面稳定，使用较短的固定等待
@@ -393,6 +487,7 @@ class LinuxDoSessionManager:
         password: str,
         proxy: dict | None = None,
         auto_login: bool = True,
+        oauth_probes: list[dict] | None = None,
     ) -> LinuxDoSession:
         """获取或创建 Linux.do 会话
 
@@ -413,7 +508,7 @@ class LinuxDoSessionManager:
             session = cls._sessions[username_hash]
             print(f"ℹ️ LinuxDoSessionManager: Reusing existing session for [{username_hash}]")
             if auto_login and not circuit_reason:
-                await session.ensure_logged_in()
+                await session.ensure_logged_in(oauth_probes=oauth_probes)
             elif auto_login and circuit_reason:
                 print(f"⚠️ LinuxDoSessionManager: Session [{username_hash}] circuit is open, skip auto-login: {circuit_reason}")
             return session
@@ -424,7 +519,7 @@ class LinuxDoSessionManager:
         cls._sessions[username_hash] = session
 
         if auto_login and not circuit_reason:
-            await session.ensure_logged_in()
+            await session.ensure_logged_in(oauth_probes=oauth_probes)
         elif auto_login and circuit_reason:
             print(f"⚠️ LinuxDoSessionManager: Session [{username_hash}] circuit is open, skip auto-login: {circuit_reason}")
 

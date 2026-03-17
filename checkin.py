@@ -1697,19 +1697,35 @@ class CheckIn:
                             from utils.linuxdo_session import LinuxDoSessionManager
 
                             print(f"ℹ️ {self.account_name}: anyrouter cache invalid, forcing LinuxDo shared session rebuild")
+                            oauth_probes = None
+                            if self.provider_config.linuxdo_client_id:
+                                oauth_probes = [{
+                                    "label": self.provider_config.name,
+                                    "client_id": self.provider_config.linuxdo_client_id,
+                                    "provider_origin": self.provider_config.origin,
+                                }]
                             refreshed_session = await LinuxDoSessionManager.get_session(
                                 username,
                                 password,
                                 proxy=self.camoufox_proxy_config,
                                 auto_login=True,
+                                oauth_probes=oauth_probes,
                             )
-                            if not getattr(refreshed_session, "is_logged_in", False):
+                            shared_state_path = refreshed_session.get_storage_state_path()
+                            if not getattr(refreshed_session, "is_logged_in", False) and not (
+                                shared_state_path and os.path.exists(shared_state_path)
+                            ):
                                 return False, {
                                     "error": (
                                         "anyrouter provider cache invalid and LinuxDo shared session is not warmed. "
                                         "Please run `uv run python prepare_linuxdo_session.py` first"
                                     )
                                 }
+                            if not getattr(refreshed_session, "is_logged_in", False):
+                                print(
+                                    f"ℹ️ {self.account_name}: LinuxDo shared session is not confirmed by prewarm, "
+                                    "but storage state file still exists, continue OAuth re-authorization"
+                                )
                             self.linuxdo_session = refreshed_session
                         # 继续执行下面的 OAuth 流程
                     else:
