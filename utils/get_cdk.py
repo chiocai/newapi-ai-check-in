@@ -710,6 +710,7 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                     await page.goto('https://linux.do/login', wait_until='domcontentloaded', timeout=TIMEOUT_PAGE_LOAD)
 
                     current_url = page.url
+                    print(f"ℹ️ {account_name}: x666 fallback login current URL after goto: {current_url}")
                     if 'linux.do/login' not in current_url and 'linux.do' in current_url:
                         print(f"✅ {account_name}: Shared Linux.do session already logged in ({current_url})")
                         return True
@@ -749,12 +750,14 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                             return False
 
                     await page.click('#login-button', timeout=TIMEOUT_CLICK)
+                    print(f"ℹ️ {account_name}: x666 fallback clicked Linux.do login button")
                     try:
                         await page.wait_for_selector('.current-user', timeout=15000)
                     except Exception:
                         await page.wait_for_timeout(3000)
 
                     post_login_guard = await detect_linuxdo_page_guard(page)
+                    print(f"ℹ️ {account_name}: x666 fallback login URL after submit: {page.url}")
                     if 'linux.do/login' in page.url and post_login_guard.get('human_verification'):
                         solved = await attempt_linuxdo_human_verification(page, account_name)
                         if solved:
@@ -916,10 +919,12 @@ async def _x666_browser_login_impl(account_config: "AccountConfig", username: st
                         if 'linux.do/session/sso_provider' in current_url:
                             print(f"ℹ️ {account_name}: sso_provider stuck, trying to re-login linux.do")
                             login_ok = await ensure_linuxdo_login()
+                            print(f"ℹ️ {account_name}: x666 fallback re-login result: {login_ok}")
                             if not login_ok:
                                 return None
                             # 重新获取 auth_url，旧的 state 已失效
                             auth_url = await get_auth_url()
+                            print(f"ℹ️ {account_name}: x666 fallback refreshed auth_url: {'present' if auth_url else 'missing'}")
                             if not auth_url:
                                 return None
                             continue

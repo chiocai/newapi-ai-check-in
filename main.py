@@ -564,6 +564,22 @@ def build_execution_batches(accounts: list) -> list[dict]:
 
         batches_by_key[batch_key]["indices"].append(index)
 
+    def sort_batch_indices(indices: list[int]) -> list[int]:
+        def sort_key(index: int) -> tuple[int, int]:
+            provider_name = accounts[index].provider
+            if provider_name == 'anyrouter':
+                priority = 0
+            elif provider_name == 'x666':
+                priority = 2
+            else:
+                priority = 1
+            return (priority, index)
+
+        return sorted(indices, key=sort_key)
+
+    for batch in batches_by_key.values():
+        batch["indices"] = sort_batch_indices(batch["indices"])
+
     # Linux.do 批次按首次出现位置倒序执行：
     # 在 site-1 / site-2 的账号展开模型下，会先跑完整批 -2，再跑完整批 -1。
     linuxdo_batches = []
@@ -1224,6 +1240,8 @@ async def main():
             f"\n🧩 Starting batch {batch_index}/{len(execution_batches)}: "
             f"{batch_label} -> {len(batch_indices)} account(s)"
         )
+        ordered_account_names = [app_config.accounts[index].get_display_name(index) for index in batch_indices]
+        print(f"ℹ️ {batch_label} execution order: {', '.join(ordered_account_names[:10])}")
 
         cleared_site_caches = purge_site_auth_caches()
         if cleared_site_caches:
