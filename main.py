@@ -601,6 +601,44 @@ def clear_linuxdo_runtime_state(reason: str):
     LinuxDoSessionManager.clear_all_circuits()
 
 
+def get_github_skip_prewarm_slot_labels() -> set[str]:
+    """获取 GitHub 环境下需要跳过预热的账号槽位标识"""
+    raw_value = os.getenv("LINUXDO_GITHUB_SKIP_PREWARM_SLOT_LABELS")
+    if raw_value is None and os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        raw_value = "-2"
+
+    if not raw_value:
+        return set()
+
+    return {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+
+
+def should_skip_linuxdo_prewarm_for_batch(batch: dict) -> bool:
+    """判断当前批次是否应跳过 Linux.do 预热"""
+    slot_label = batch.get("slot_label")
+    if not slot_label:
+        return False
+    return slot_label in get_github_skip_prewarm_slot_labels()
+
+
+def purge_linuxdo_prewarm_for_username(username: str, storage_dir: str = "storage-states") -> str | None:
+    """删除指定 Linux.do 用户名对应的预热 storage state 文件"""
+    if not username:
+        return None
+
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+    file_path = os.path.join(storage_dir, f"linuxdo_{username_hash}_storage_state.json")
+    if not os.path.exists(file_path):
+        return None
+
+    os.remove(file_path)
+    return os.path.basename(file_path)
+
+
 def purge_site_auth_caches(storage_dir: str = "storage-states") -> list[str]:
     """清理站点侧登录缓存，保留 Linux.do 预热态，尽量模拟首次运行"""
     if not os.path.isdir(storage_dir):
@@ -1180,6 +1218,7 @@ async def main():
     for batch_index, batch in enumerate(execution_batches, start=1):
         batch_indices = batch["indices"]
         batch_label = batch["label"]
+        batch_linuxdo_username = batch.get("linuxdo_username")
 
         print(
             f"\n🧩 Starting batch {batch_index}/{len(execution_batches)}: "
@@ -1192,11 +1231,22 @@ async def main():
                 f"🧹 Cleared {len(cleared_site_caches)} site auth cache file(s) before batch {batch_label}"
             )
 
-        batch_prewarm_summary = await prewarm_linuxdo_sessions(
-            app_config,
-            account_indices=batch_indices,
-            reason=f"Pre-logging in for batch {batch_index}/{len(execution_batches)} [{batch_label}]",
-        )
+        if should_skip_linuxdo_prewarm_for_batch(batch):
+            deleted_prewarm_file = purge_linuxdo_prewarm_for_username(batch_linuxdo_username or "")
+            if deleted_prewarm_file:
+                print(
+                    f"🧹 Skipping LinuxDo prewarm for batch {batch_label} on GitHub, "
+                    f"deleted prewarmed state {deleted_prewarm_file}"
+                )
+            else:
+                print(f"🧹 Skipping LinuxDo prewarm for batch {batch_label} on GitHub (no prewarmed state file found)")
+            batch_prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
+        else:
+            batch_prewarm_summary = await prewarm_linuxdo_sessions(
+                app_config,
+                account_indices=batch_indices,
+                reason=f"Pre-logging in for batch {batch_index}/{len(execution_batches)} [{batch_label}]",
+            )
         merge_prewarm_summary(prewarm_summary, batch_prewarm_summary)
 
         tasks = [

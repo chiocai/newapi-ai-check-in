@@ -62,6 +62,35 @@ def get_linuxdo_signin_semaphore() -> asyncio.Semaphore:
     return _linuxdo_signin_semaphore
 
 
+def _get_github_skip_prewarm_slot_labels() -> set[str]:
+    """获取 GitHub 环境下需要跳过预热态的账号槽位标识"""
+    raw_value = os.getenv('LINUXDO_GITHUB_SKIP_PREWARM_SLOT_LABELS')
+    if raw_value is None and os.getenv('GITHUB_ACTIONS', '').lower() == 'true':
+        raw_value = '-2'
+
+    if not raw_value:
+        return set()
+
+    return {
+        item.strip()
+        for item in raw_value.split(',')
+        if item.strip()
+    }
+
+
+def _should_skip_prewarmed_storage_for_account(account_name: str) -> bool:
+    """判断当前账号是否应跳过预热态，直接走 reference-style 直登"""
+    if os.getenv('GITHUB_ACTIONS', '').lower() != 'true':
+        return False
+
+    match = re.search(r'-(\d+)$', account_name or '')
+    if not match:
+        return False
+
+    slot_label = f"-{match.group(1)}"
+    return slot_label in _get_github_skip_prewarm_slot_labels()
+
+
 def _build_linuxdo_error(error_type: str, error_summary: str, error_detail: str | None = None, **extra) -> dict:
     """构造结构化 Linux.do 错误信息"""
     payload = {
@@ -386,6 +415,13 @@ class LinuxDoSignIn:
 
     async def _resolve_storage_state(self, cache_file_path: str = ''):
         """解析当前登录流程应使用的 storage state"""
+        if _should_skip_prewarmed_storage_for_account(self.account_name):
+            print(
+                f"ℹ️ {self.account_name}: GitHub slot is configured to skip prewarmed storage state, "
+                "reference-style fallback will be preferred"
+            )
+            return None
+
         if self.shared_session:
             if getattr(self.shared_session, 'is_logged_in', False):
                 shared_state = await self.shared_session.get_storage_state()
@@ -653,6 +689,19 @@ class LinuxDoSignIn:
             f"ℹ️ {self.account_name}: Using client_id: {client_id}, auth_state: {auth_state}, cache_file: {cache_file_path}"
         )
 
+        github_reference_fallback_allowed = os.getenv('GITHUB_ACTIONS', '').lower() == 'true'
+        if github_reference_fallback_allowed and _should_skip_prewarmed_storage_for_account(self.account_name):
+            print(
+                f"ℹ️ {self.account_name}: GitHub slot is configured to bypass prewarm, "
+                "starting with reference-style fallback"
+            )
+            return await self._signin_with_reference_style_fallback(
+                client_id,
+                auth_state,
+                auth_cookies,
+                cache_file_path,
+            )
+
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = await self._resolve_storage_state(cache_file_path)
 
@@ -690,7 +739,6 @@ class LinuxDoSignIn:
                 )
 
                 max_flow_rounds = 3
-                github_reference_fallback_allowed = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
                 for flow_round in range(1, max_flow_rounds + 1):
                     if flow_round > 1:
                         print(f"ℹ️ {self.account_name}: Continuing Linux.do OAuth flow round {flow_round}")
