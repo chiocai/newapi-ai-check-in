@@ -538,27 +538,10 @@ class CheckIn:
                 "error": f"Failed to get client id, {e}",
             }
 
-    def _should_prefer_login_page_for_browser_auth_state(self) -> bool:
-        """判断浏览器获取 auth state 时是否优先从登录页引导"""
-        origin = (self.provider_config.origin or "").lower()
-        return self.provider_config.name == "anyrouter" or "anyrouter.top" in origin
-
     def _get_auth_state_browser_entry_urls(self) -> list[str]:
         """返回浏览器获取 auth state 时的页面引导顺序"""
-        login_url = self.provider_config.get_login_url()
         console_url = self.provider_config.get_console_personal_url()
-
-        candidates = [console_url]
-        if self._should_prefer_login_page_for_browser_auth_state():
-            candidates.insert(0, login_url)
-        elif login_url != console_url:
-            candidates.append(login_url)
-
-        ordered_urls = []
-        for url in candidates:
-            if url and url not in ordered_urls:
-                ordered_urls.append(url)
-        return ordered_urls
+        return [console_url] if console_url else []
 
     async def _wait_auth_state_page_stable(self, page) -> None:
         """等待 provider 页面基础脚本与运行时状态稳定"""
@@ -635,7 +618,7 @@ class CheckIn:
             self.provider_config.get_auth_state_url(),
         )
 
-    async def _click_linuxdo_continue_and_capture_auth_state(self, page, browser) -> dict | None:
+    async def _click_linuxdo_continue_and_capture_auth_state(self, page, browser, entry_url: str | None = None) -> dict | None:
         """优先通过页面上的“使用 LinuxDO 继续”按钮引导到 connect 授权页"""
         text_patterns = [
             "使用 LinuxDO 继续",
@@ -647,11 +630,35 @@ class CheckIn:
         clicked = False
         for attempt in range(1, 3):
             if attempt > 1:
-                print(f"ℹ️ {self.account_name}: LinuxDO continue entry not found, refreshing page and retrying once")
-                await page.reload(wait_until="domcontentloaded")
-                print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL after refresh: {page.url}")
+                print(f"ℹ️ {self.account_name}: LinuxDO continue entry not found, reopening bootstrap page and retrying once")
+                target_url = entry_url or page.url
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL after retry navigation: {page.url}")
                 await self._wait_auth_state_page_stable(page)
                 await self._dismiss_known_login_modals(page)
+
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        return Array.from(document.querySelectorAll('button, a, [role=\"button\"]')).some((el) => {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            return /使用\\s*LinuxDO\\s*继续|使用\\s*LinuxDo\\s*继续|Continue with LinuxDO|Continue with LinuxDo/i.test(text);
+                        });
+                    }""",
+                    timeout=5000,
+                )
+            except Exception:
+                try:
+                    visible_buttons = await page.evaluate(
+                        """() => Array.from(document.querySelectorAll('button'))
+                            .map((el) => (el.innerText || el.textContent || '').trim())
+                            .filter(Boolean)
+                            .slice(0, 10)"""
+                    )
+                    if visible_buttons:
+                        print(f"ℹ️ {self.account_name}: Current visible button texts: {visible_buttons}")
+                except Exception:
+                    pass
 
             for text in text_patterns:
                 try:
@@ -711,6 +718,26 @@ class CheckIn:
 
         print(f"⚠️ {self.account_name}: LinuxDO continue entry did not land on connect authorize page: {current_url}")
         return None
+
+    async def _click_linuxdo_continue_via_login_then_console(self, page, browser) -> dict | None:
+        """当 console/personal 没有 LinuxDO 按钮时，先访问 login 再回 console/personal 重试"""
+        login_url = self.provider_config.get_login_url()
+        console_url = self.provider_config.get_console_personal_url()
+        if not login_url or not console_url or login_url == console_url:
+            return None
+
+        print(f"ℹ️ {self.account_name}: LinuxDO continue entry missing, trying login -> console/personal fallback")
+
+        for step_label, target_url in [
+            ("login", login_url),
+            ("console/personal", console_url),
+        ]:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+            print(f"ℹ️ {self.account_name}: Auth-state fallback step {step_label} current URL: {page.url}")
+            await self._wait_auth_state_page_stable(page)
+            await self._dismiss_known_login_modals(page)
+
+        return await self._click_linuxdo_continue_and_capture_auth_state(page, browser, console_url)
 
     def _get_linuxdo_oauth_attempts(self) -> int:
         """返回 Linux.do OAuth 整链路最大尝试次数"""
@@ -848,7 +875,9 @@ class CheckIn:
                             if captcha_check:
                                 await page.wait_for_timeout(3000)
 
-                        clicked_auth_state = await self._click_linuxdo_continue_and_capture_auth_state(page, browser)
+                        clicked_auth_state = await self._click_linuxdo_continue_and_capture_auth_state(page, browser, entry_url)
+                        if not clicked_auth_state:
+                            clicked_auth_state = await self._click_linuxdo_continue_via_login_then_console(page, browser)
                         if clicked_auth_state:
                             return clicked_auth_state
 
