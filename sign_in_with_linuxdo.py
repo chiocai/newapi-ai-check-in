@@ -415,6 +415,152 @@ class LinuxDoSignIn:
             self.shared_session._storage_state = current_state
         return current_state
 
+    async def _extract_authorized_result(self, page) -> tuple[bool, dict]:
+        """从授权完成后的页面中提取 cookies 和 api_user/code"""
+        parsed = urlparse(self.provider_config.origin)
+        try:
+            await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
+        except Exception:
+            current_url = page.url
+            if parsed.netloc in current_url:
+                print(f"ℹ️ {self.account_name}: Already on provider domain: {current_url}")
+            else:
+                raise
+
+        api_user = None
+        try:
+            try:
+                await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
+            except Exception:
+                await page.wait_for_timeout(2000)
+
+            user_data = await page.evaluate("() => localStorage.getItem('user')")
+            if user_data:
+                user_obj = json.loads(user_data)
+                api_user = user_obj.get("id")
+                if api_user:
+                    print(f"✅ {self.account_name}: Got api user: {api_user}")
+                else:
+                    print(f"⚠️ {self.account_name}: User id not found in localStorage")
+            else:
+                print(f"⚠️ {self.account_name}: User data not found in localStorage")
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
+
+        if api_user:
+            print(f"✅ {self.account_name}: OAuth authorization successful")
+            restore_cookies = await page.context.cookies()
+            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+            return True, {"cookies": user_cookies, "api_user": api_user}
+
+        print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
+        await take_screenshot(page, "oauth_failed_no_user_id_bypass", self.account_name)
+        parsed_url = urlparse(page.url)
+        query_params = parse_qs(parsed_url.query)
+        if "code" in query_params:
+            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+            return True, query_params
+
+        print(f"❌ {self.account_name}: OAuth failed, no code in callback")
+        return False, _build_linuxdo_error(
+            "linuxdo_oauth_no_code",
+            "Linux.do OAuth 回调缺少 code",
+            "Linux.do OAuth failed - no code in callback",
+        )
+
+    async def _signin_with_reference_style_fallback(
+        self,
+        client_id: str,
+        auth_state: str,
+        auth_cookies: list,
+        cache_file_path: str = '',
+    ) -> tuple[bool, dict]:
+        """GitHub 上 SSO 卡住时，使用参考仓风格的无预热直登流程兜底"""
+        print(f"ℹ️ {self.account_name}: Falling back to reference-style LinuxDo sign-in without prewarmed state")
+        oauth_url = (
+            f"https://connect.linux.do/oauth2/authorize?"
+            f"response_type=code&client_id={client_id}&state={auth_state}"
+        )
+
+        async with AsyncCamoufox(
+            headless=True,
+            humanize=True,
+            locale="en-US",
+            os="macos",
+            config={
+                "forceScopeAccess": True,
+            },
+        ) as browser:
+            context = await browser.new_context()
+            if auth_cookies:
+                await context.add_cookies(auth_cookies)
+
+            page = await context.new_page()
+            try:
+                login_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                if not login_ok:
+                    return False, _build_linuxdo_error(
+                        "linuxdo_signin_failed",
+                        "Linux.do 参考仓风格直登失败",
+                        "Reference-style LinuxDo sign-in failed during fresh login",
+                    )
+
+                print(f"ℹ️ {self.account_name}: Fresh LinuxDo login succeeded, opening OAuth page again")
+                try:
+                    await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
+                except Exception:
+                    await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                    await page.wait_for_timeout(3000)
+
+                current_url = page.url
+                print(f"ℹ️ {self.account_name}: Reference-style fallback OAuth URL: {current_url}")
+
+                if "linux.do/session/sso_provider" in current_url:
+                    current_url = await self._handle_sso_provider_page(page)
+                    if "linux.do/session/sso_provider" in current_url:
+                        return False, _build_linuxdo_error(
+                            "linuxdo_sso_provider_stuck",
+                            "Linux.do SSO 中转页卡住",
+                            f"Reference-style fallback is still stuck at LinuxDo SSO provider page: {current_url}",
+                        )
+
+                if "linux.do/login" in page.url:
+                    return False, _build_linuxdo_error(
+                        "linuxdo_redirect_login",
+                        "Linux.do 授权前被重定向回登录页",
+                        f"Reference-style fallback redirected back to LinuxDo login page: {page.url}",
+                    )
+
+                print(f"ℹ️ {self.account_name}: Waiting for authorization button in reference-style fallback...")
+                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
+                allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
+                if not allow_btn_ele:
+                    return False, _build_linuxdo_error(
+                        "linuxdo_allow_button_not_found",
+                        "Linux.do 授权页未找到允许按钮",
+                        "Reference-style fallback did not find LinuxDo allow button",
+                    )
+
+                print(f"ℹ️ {self.account_name}: Clicking authorization button in reference-style fallback...")
+                await allow_btn_ele.click()
+                return await self._extract_authorized_result(page)
+            except Exception as e:
+                print(f"❌ {self.account_name}: Reference-style fallback failed: {e}")
+                await take_screenshot(page, "linuxdo_reference_fallback_failed", self.account_name)
+                diagnosed = await _diagnose_linuxdo_page_issue(page)
+                if diagnosed:
+                    diagnosed["error_detail"] = f"{diagnosed['error_detail']}; reference-style fallback exception: {e}"
+                    diagnosed["error"] = diagnosed["error_detail"]
+                    return False, diagnosed
+                return False, _build_linuxdo_error(
+                    "linuxdo_signin_failed",
+                    "Linux.do 参考仓风格兜底失败",
+                    f"Reference-style fallback failed: {e}",
+                )
+            finally:
+                await page.close()
+                await context.close()
+
     async def _ensure_linuxdo_login(self, page, context, cache_file_path: str = '') -> bool:
         """在当前浏览器上下文中重新登录 Linux.do，恢复共享会话"""
         print(f"ℹ️ {self.account_name}: Navigating to linux.do/login for OAuth fallback")
@@ -544,6 +690,7 @@ class LinuxDoSignIn:
                 )
 
                 max_flow_rounds = 3
+                github_reference_fallback_allowed = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
                 for flow_round in range(1, max_flow_rounds + 1):
                     if flow_round > 1:
                         print(f"ℹ️ {self.account_name}: Continuing Linux.do OAuth flow round {flow_round}")
@@ -598,6 +745,17 @@ class LinuxDoSignIn:
                                     )
                                 elif "linux.do/session/sso_provider" in current_url:
                                     print(f"⚠️ {self.account_name}: Cache session stalled at Linux.do SSO provider page")
+                                    if github_reference_fallback_allowed:
+                                        print(
+                                            f"ℹ️ {self.account_name}: GitHub detected and cache session stuck at "
+                                            "sso_provider, switching to reference-style fallback"
+                                        )
+                                        return await self._signin_with_reference_style_fallback(
+                                            client_id,
+                                            auth_state,
+                                            auth_cookies,
+                                            cache_file_path,
+                                        )
                                     if flow_round < max_flow_rounds:
                                         relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
                                         if relogin_ok:
@@ -626,6 +784,17 @@ class LinuxDoSignIn:
                             "linuxdo_sso_provider_stuck",
                             "linuxdo_redirect_login",
                         } and flow_round < max_flow_rounds:
+                            if github_reference_fallback_allowed and diagnosed.get("error_type") == "linuxdo_sso_provider_stuck":
+                                print(
+                                    f"ℹ️ {self.account_name}: GitHub detected and OAuth probe stuck at sso_provider, "
+                                    "switching to reference-style fallback"
+                                )
+                                return await self._signin_with_reference_style_fallback(
+                                    client_id,
+                                    auth_state,
+                                    auth_cookies,
+                                    cache_file_path,
+                                )
                             relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
                             if relogin_ok:
                                 storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
@@ -643,6 +812,17 @@ class LinuxDoSignIn:
                             current_url = await self._handle_sso_provider_page(page)
                             if "linux.do/session/sso_provider" in current_url:
                                 print(f"ℹ️ {self.account_name}: sso_provider stuck, trying to re-login linux.do")
+                                if github_reference_fallback_allowed:
+                                    print(
+                                        f"ℹ️ {self.account_name}: GitHub detected and authorization stuck at "
+                                        "sso_provider, switching to reference-style fallback"
+                                    )
+                                    return await self._signin_with_reference_style_fallback(
+                                        client_id,
+                                        auth_state,
+                                        auth_cookies,
+                                        cache_file_path,
+                                    )
                                 if flow_round < max_flow_rounds:
                                     relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
                                     if relogin_ok:
@@ -659,6 +839,17 @@ class LinuxDoSignIn:
 
                         if "linux.do/login" in page.url:
                             print(f"⚠️ {self.account_name}: Redirected back to LinuxDo login page before authorization")
+                            if github_reference_fallback_allowed:
+                                print(
+                                    f"ℹ️ {self.account_name}: GitHub detected and authorization returned to "
+                                    "LinuxDo login, switching to reference-style fallback"
+                                )
+                                return await self._signin_with_reference_style_fallback(
+                                    client_id,
+                                    auth_state,
+                                    auth_cookies,
+                                    cache_file_path,
+                                )
                             if flow_round < max_flow_rounds:
                                 relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
                                 if relogin_ok:
@@ -692,47 +883,7 @@ class LinuxDoSignIn:
                                 else:
                                     raise
 
-                            api_user = None
-                            try:
-                                try:
-                                    await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
-                                except Exception:
-                                    await page.wait_for_timeout(2000)
-
-                                user_data = await page.evaluate("() => localStorage.getItem('user')")
-                                if user_data:
-                                    user_obj = json.loads(user_data)
-                                    api_user = user_obj.get("id")
-                                    if api_user:
-                                        print(f"✅ {self.account_name}: Got api user: {api_user}")
-                                    else:
-                                        print(f"⚠️ {self.account_name}: User id not found in localStorage")
-                                else:
-                                    print(f"⚠️ {self.account_name}: User data not found in localStorage")
-                            except Exception as e:
-                                print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
-
-                            if api_user:
-                                print(f"✅ {self.account_name}: OAuth authorization successful")
-                                restore_cookies = await page.context.cookies()
-                                user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
-                                return True, {"cookies": user_cookies, "api_user": api_user}
-                            else:
-                                print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
-                                await take_screenshot(page, "oauth_failed_no_user_id_bypass", self.account_name)
-                                parsed_url = urlparse(page.url)
-                                query_params = parse_qs(parsed_url.query)
-
-                            if "code" in query_params:
-                                print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
-                                return True, query_params
-
-                            print(f"❌ {self.account_name}: OAuth failed, no code in callback")
-                            return False, _build_linuxdo_error(
-                                "linuxdo_oauth_no_code",
-                                "Linux.do OAuth 回调缺少 code",
-                                "Linux.do OAuth failed - no code in callback",
-                            )
+                            return await self._extract_authorized_result(page)
 
                         print(f"❌ {self.account_name}: Approve button not found")
                         await take_screenshot(page, "approve_button_not_found_bypass", self.account_name)
