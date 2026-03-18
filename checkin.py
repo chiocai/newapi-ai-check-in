@@ -10,7 +10,7 @@ import json
 import os
 import tempfile
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from camoufox.async_api import AsyncCamoufox
@@ -635,6 +635,56 @@ class CheckIn:
             self.provider_config.get_auth_state_url(),
         )
 
+    async def _click_linuxdo_continue_and_capture_auth_state(self, page, browser) -> dict | None:
+        """优先通过页面上的“使用 LinuxDO 继续”按钮引导到 connect 授权页"""
+        text_patterns = [
+            "使用 LinuxDO 继续",
+            "使用 LinuxDo 继续",
+            "Continue with LinuxDO",
+            "Continue with LinuxDo",
+        ]
+
+        clicked = False
+        for text in text_patterns:
+            try:
+                span_locator = page.locator("span.ml-3").filter(has_text=text)
+                if await span_locator.count():
+                    target = span_locator.first.locator("xpath=ancestor::button[1] | ancestor::a[1] | ancestor::div[@role='button'][1]")
+                    if await target.count():
+                        await target.first.click()
+                    else:
+                        await span_locator.first.click()
+                    clicked = True
+                    print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue entry via text '{text}'")
+                    break
+            except Exception as click_err:
+                print(f"⚠️ {self.account_name}: Failed to click LinuxDO continue entry '{text}': {click_err}")
+
+        if not clicked:
+            return None
+
+        try:
+            await page.wait_for_url("**connect.linux.do/oauth2/authorize**", timeout=20000)
+        except Exception:
+            await page.wait_for_timeout(3000)
+
+        current_url = page.url
+        parsed = urlparse(current_url)
+        query = parse_qs(parsed.query)
+        state = query.get("state", [None])[0]
+
+        if parsed.netloc == "connect.linux.do" and parsed.path.startswith("/oauth2/authorize") and state:
+            cookies = await browser.cookies()
+            print(f"ℹ️ {self.account_name}: Captured auth state from LinuxDO continue entry: {state}")
+            return {
+                "success": True,
+                "state": state,
+                "cookies": cookies,
+            }
+
+        print(f"⚠️ {self.account_name}: LinuxDO continue entry did not land on connect authorize page: {current_url}")
+        return None
+
     def _get_linuxdo_oauth_attempts(self) -> int:
         """返回 Linux.do OAuth 整链路最大尝试次数"""
         return 2
@@ -762,6 +812,10 @@ class CheckIn:
                             captcha_check = await aliyun_captcha_check(page, self.account_name)
                             if captcha_check:
                                 await page.wait_for_timeout(3000)
+
+                        clicked_auth_state = await self._click_linuxdo_continue_and_capture_auth_state(page, browser)
+                        if clicked_auth_state:
+                            return clicked_auth_state
 
                         response = await self._fetch_auth_state_in_browser_context(page)
                         last_response = response
