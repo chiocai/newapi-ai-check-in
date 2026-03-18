@@ -14,10 +14,13 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from camoufox.async_api import AsyncCamoufox
 
 from utils.browser_utils import (
+    attempt_linuxdo_human_verification,
     detect_linuxdo_page_guard,
     filter_cookies,
+    has_linuxdo_human_verification,
     save_page_content_to_file,
     take_screenshot,
+    wait_for_linuxdo_login_ready,
 )
 from utils.config import ProviderConfig
 
@@ -401,6 +404,96 @@ class LinuxDoSignIn:
 
         return None
 
+    async def _persist_linuxdo_storage_state(self, context, cache_file_path: str = '') -> dict:
+        """持久化当前 Linux.do 登录态到文件和共享会话"""
+        if cache_file_path:
+            await context.storage_state(path=cache_file_path)
+
+        current_state = await context.storage_state()
+        if self.shared_session:
+            self.shared_session.is_logged_in = True
+            self.shared_session._storage_state = current_state
+        return current_state
+
+    async def _ensure_linuxdo_login(self, page, context, cache_file_path: str = '') -> bool:
+        """在当前浏览器上下文中重新登录 Linux.do，恢复共享会话"""
+        print(f"ℹ️ {self.account_name}: Navigating to linux.do/login for OAuth fallback")
+        await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+
+        current_url = page.url
+        if "linux.do/login" not in current_url and "linux.do" in current_url:
+            await self._persist_linuxdo_storage_state(context, cache_file_path)
+            print(f"✅ {self.account_name}: Linux.do session already available during fallback ({current_url})")
+            return True
+
+        try:
+            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
+        except Exception as ready_err:
+            guard = await detect_linuxdo_page_guard(page)
+            print(f"⚠️ {self.account_name}: Linux.do login form not ready: {ready_err}")
+            if guard.get("human_verification"):
+                solved = await attempt_linuxdo_human_verification(page, self.account_name)
+                if not solved:
+                    await save_page_content_to_file(
+                        page,
+                        "linuxdo_hcaptcha_before_login_ready",
+                        self.account_name,
+                        prefix="linuxdo",
+                    )
+                    await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", self.account_name)
+                    return False
+            elif guard.get("cloudflare_challenge"):
+                await page.wait_for_timeout(3000)
+            else:
+                await page.wait_for_timeout(2000)
+            await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)
+
+        await page.fill("#login-account-name", self.username, timeout=TIMEOUT_ELEMENT_WAIT)
+        await page.wait_for_timeout(500)
+        await page.fill("#login-account-password", self.password, timeout=TIMEOUT_ELEMENT_WAIT)
+        await page.wait_for_timeout(500)
+
+        if await has_linuxdo_human_verification(page):
+            solved = await attempt_linuxdo_human_verification(page, self.account_name)
+            if not solved:
+                await save_page_content_to_file(page, "linuxdo_hcaptcha_detected", self.account_name, prefix="linuxdo")
+                await take_screenshot(page, "linuxdo_hcaptcha_detected", self.account_name)
+                return False
+
+        await page.click("#login-button", timeout=TIMEOUT_ELEMENT_WAIT)
+        try:
+            await page.wait_for_selector(".current-user", timeout=15000)
+        except Exception:
+            await page.wait_for_timeout(3000)
+
+        post_login_guard = await detect_linuxdo_page_guard(page)
+        current_url = page.url
+        if "linux.do/login" in current_url and post_login_guard.get("human_verification"):
+            solved = await attempt_linuxdo_human_verification(page, self.account_name)
+            if solved:
+                print(f"ℹ️ {self.account_name}: Human Verification solved after fallback login, retrying once")
+                await page.click("#login-button", timeout=TIMEOUT_ELEMENT_WAIT)
+                await page.wait_for_timeout(5000)
+                current_url = page.url
+                post_login_guard = await detect_linuxdo_page_guard(page)
+
+        await page.wait_for_timeout(1000)
+        current_user = await page.query_selector(".current-user")
+        if not current_user:
+            await page.wait_for_timeout(2000)
+            current_user = await page.query_selector(".current-user")
+
+        current_url = page.url
+        if current_user or ("linux.do" in current_url and "login" not in current_url and not post_login_guard.get("human_verification")):
+            await self._persist_linuxdo_storage_state(context, cache_file_path)
+            print(f"✅ {self.account_name}: Linux.do session recovered via fallback login")
+            return True
+
+        print(f"❌ {self.account_name}: Linux.do fallback login failed - still on {current_url}")
+        await save_page_content_to_file(page, "linuxdo_fallback_login_failed", self.account_name, prefix="linuxdo")
+        await take_screenshot(page, "linuxdo_fallback_login_failed", self.account_name)
+        return False
+
     async def _signin_impl(
         self,
         client_id: str,
@@ -445,74 +538,78 @@ class LinuxDoSignIn:
             page = await context.new_page()
 
             try:
-                # 检查是否已经登录（通过缓存恢复）
-                is_logged_in = False
                 oauth_url = (
                     f"https://connect.linux.do/oauth2/authorize?"
                     f"response_type=code&client_id={client_id}&state={auth_state}"
                 )
 
-                if storage_state:
-                    try:
-                        print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
-                        # 直接访问授权页面检查是否已登录
+                max_flow_rounds = 3
+                for flow_round in range(1, max_flow_rounds + 1):
+                    if flow_round > 1:
+                        print(f"ℹ️ {self.account_name}: Continuing Linux.do OAuth flow round {flow_round}")
+
+                    is_logged_in = False
+                    response = None
+
+                    if storage_state:
                         try:
-                            response = await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
-                        except Exception:
-                            response = await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                            await page.wait_for_timeout(3000)
-                        print(f"ℹ️ {self.account_name}: redirected to app page {response.url if response else 'N/A'}")
-
-                        # 检查是否遇到 Cloudflare 挑战页面
-                        page_title = await page.title()
-                        if "Just a moment" in page_title or "challenge" in page.url.lower():
-                            print(
-                                f"⚠️ {self.account_name}: Cloudflare challenge detected on OAuth page, "
-                                "waiting for challenge to complete..."
-                            )
+                            print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
                             try:
-                                # 等待 Cloudflare 挑战完成（页面标题变化或授权按钮出现）
-                                await page.wait_for_function(
-                                    "document.title !== 'Just a moment...'",
-                                    timeout=TIMEOUT_CLOUDFLARE
-                                )
-                                await page.wait_for_timeout(1500)  # 额外等待页面稳定
-                                print(f"✅ {self.account_name}: Cloudflare challenge completed")
-                            except Exception as cf_err:
-                                print(f"⚠️ {self.account_name}: Cloudflare challenge timeout: {cf_err}")
+                                response = await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
+                            except Exception:
+                                response = await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                                await page.wait_for_timeout(3000)
+                            print(f"ℹ️ {self.account_name}: redirected to app page {response.url if response else 'N/A'}")
 
-                        await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
-
-                        current_url = page.url
-                        if "linux.do/session/sso_provider" in current_url:
-                            current_url = await self._handle_sso_provider_page(page)
-
-                        # 登录后可能直接跳转回应用页面
-                        if response and response.url.startswith(self.provider_config.origin):
-                            is_logged_in = True
-                            print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
-                        elif current_url.startswith(self.provider_config.origin):
-                            is_logged_in = True
-                            print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
-                        else:
-                            # 检查是否出现授权按钮（表示已登录）
-                            allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
-                            if allow_btn:
-                                is_logged_in = True
+                            page_title = await page.title()
+                            if "Just a moment" in page_title or "challenge" in page.url.lower():
                                 print(
-                                    f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization"
+                                    f"⚠️ {self.account_name}: Cloudflare challenge detected on OAuth page, "
+                                    "waiting for challenge to complete..."
                                 )
-                            else:
-                                if "linux.do/session/sso_provider" in current_url:
-                                    print(f"❌ {self.account_name}: Cache session stalled at Linux.do SSO provider page")
-                                    diagnosed = await _diagnose_linuxdo_page_issue(page)
-                                    if diagnosed:
-                                        return False, diagnosed
-                                    return False, _build_linuxdo_error(
-                                        "linuxdo_sso_provider_stuck",
-                                        "Linux.do SSO 中转页卡住",
-                                        f"Linux.do SSO provider page is stuck after cache restore: {current_url}",
+                                try:
+                                    await page.wait_for_function(
+                                        "document.title !== 'Just a moment...'",
+                                        timeout=TIMEOUT_CLOUDFLARE
                                     )
+                                    await page.wait_for_timeout(1500)
+                                    print(f"✅ {self.account_name}: Cloudflare challenge completed")
+                                except Exception as cf_err:
+                                    print(f"⚠️ {self.account_name}: Cloudflare challenge timeout: {cf_err}")
+
+                            await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
+
+                            current_url = page.url
+                            if "linux.do/session/sso_provider" in current_url:
+                                current_url = await self._handle_sso_provider_page(page)
+
+                            if response and response.url.startswith(self.provider_config.origin):
+                                is_logged_in = True
+                                print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
+                            elif current_url.startswith(self.provider_config.origin):
+                                is_logged_in = True
+                                print(f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization")
+                            else:
+                                allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
+                                if allow_btn:
+                                    is_logged_in = True
+                                    print(
+                                        f"✅ {self.account_name}: Already logged in via cache, proceeding to authorization"
+                                    )
+                                elif "linux.do/session/sso_provider" in current_url:
+                                    print(f"⚠️ {self.account_name}: Cache session stalled at Linux.do SSO provider page")
+                                    if flow_round < max_flow_rounds:
+                                        relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                                        if relogin_ok:
+                                            storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                            continue
+                                elif "linux.do/login" in current_url:
+                                    print(f"⚠️ {self.account_name}: Cache session redirected back to LinuxDo login page")
+                                    if flow_round < max_flow_rounds:
+                                        relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                                        if relogin_ok:
+                                            storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                            continue
                                 elif "connect.linux.do" in current_url:
                                     print(
                                         f"⚠️ {self.account_name}: Cache session reached connect.linux.do but approve button is missing, "
@@ -520,117 +617,134 @@ class LinuxDoSignIn:
                                     )
                                 else:
                                     print(f"⚠️ {self.account_name}: Cache session is not reusable for OAuth")
-                    except Exception as e:
-                        print(f"⚠️ {self.account_name}: Failed to check login status: {e}")
+                        except Exception as e:
+                            print(f"⚠️ {self.account_name}: Failed to check login status: {e}")
 
-                if not is_logged_in:
-                    diagnosed = await _diagnose_linuxdo_page_issue(page)
-                    if diagnosed:
-                        return False, diagnosed
-                    return False, _build_linuxdo_error(
-                        "linuxdo_prewarmed_state_invalid",
-                        "Linux.do 预热会话已失效，请重新预热",
-                        f"Prewarmed LinuxDo storage state is not reusable for OAuth: {page.url}",
-                    )
-
-                # 统一处理授权逻辑（无论是否通过缓存登录）
-                try:
-                    if "linux.do/session/sso_provider" in page.url:
-                        current_url = await self._handle_sso_provider_page(page)
-                        if "linux.do/session/sso_provider" in current_url:
-                            diagnosed = await _diagnose_linuxdo_page_issue(page)
-                            if diagnosed:
-                                return False, diagnosed
-                            return False, _build_linuxdo_error(
-                                "linuxdo_sso_provider_stuck",
-                                "Linux.do SSO 中转页卡住",
-                                f"Linux.do SSO provider page is still stuck after handler: {current_url}",
-                            )
-
-                    if "linux.do/login" in page.url:
-                        print(f"❌ {self.account_name}: Redirected back to LinuxDo login page before authorization")
-                        await save_page_content_to_file(page, "linuxdo_authorize_redirect_login", self.account_name, prefix="linuxdo")
-                        await take_screenshot(page, "linuxdo_authorize_redirect_login", self.account_name)
-                        return False, _build_linuxdo_error(
+                    if not is_logged_in:
+                        diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed and diagnosed.get("error_type") in {
+                            "linuxdo_sso_provider_stuck",
                             "linuxdo_redirect_login",
-                            "Linux.do 授权前被重定向回登录页",
-                            (
-                                "LinuxDo authorization redirected back to login page. "
-                                "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
-                            ),
+                        } and flow_round < max_flow_rounds:
+                            relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                            if relogin_ok:
+                                storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                continue
+                        if diagnosed:
+                            return False, diagnosed
+                        return False, _build_linuxdo_error(
+                            "linuxdo_prewarmed_state_invalid",
+                            "Linux.do 预热会话已失效，请重新预热",
+                            f"Prewarmed LinuxDo storage state is not reusable for OAuth: {page.url}",
                         )
 
-                    # 等待授权按钮出现
-                    print(f"ℹ️ {self.account_name}: Waiting for authorization button...")
-                    await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
-                    allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
+                    try:
+                        if "linux.do/session/sso_provider" in page.url:
+                            current_url = await self._handle_sso_provider_page(page)
+                            if "linux.do/session/sso_provider" in current_url:
+                                print(f"ℹ️ {self.account_name}: sso_provider stuck, trying to re-login linux.do")
+                                if flow_round < max_flow_rounds:
+                                    relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                                    if relogin_ok:
+                                        storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                        continue
+                                diagnosed = await _diagnose_linuxdo_page_issue(page)
+                                if diagnosed:
+                                    return False, diagnosed
+                                return False, _build_linuxdo_error(
+                                    "linuxdo_sso_provider_stuck",
+                                    "Linux.do SSO 中转页卡住",
+                                    f"Linux.do SSO provider page is still stuck after handler: {current_url}",
+                                )
 
-                    if allow_btn_ele:
-                        print(f"ℹ️ {self.account_name}: Clicking authorization button...")
-                        await allow_btn_ele.click()
-                        # 等待页面跳转到 provider 域名（支持 HTTP 和 HTTPS，不限制路径）
-                        from urllib.parse import urlparse
-                        parsed = urlparse(self.provider_config.origin)
-                        try:
-                            await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
-                        except Exception:
-                            # 如果超时，检查当前页面是否已经在 provider 域名
-                            current_url = page.url
-                            if parsed.netloc in current_url:
-                                print(f"ℹ️ {self.account_name}: Already on provider domain: {current_url}")
-                            else:
-                                raise
+                        if "linux.do/login" in page.url:
+                            print(f"⚠️ {self.account_name}: Redirected back to LinuxDo login page before authorization")
+                            if flow_round < max_flow_rounds:
+                                relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                                if relogin_ok:
+                                    storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                    continue
+                            await save_page_content_to_file(page, "linuxdo_authorize_redirect_login", self.account_name, prefix="linuxdo")
+                            await take_screenshot(page, "linuxdo_authorize_redirect_login", self.account_name)
+                            return False, _build_linuxdo_error(
+                                "linuxdo_redirect_login",
+                                "Linux.do 授权前被重定向回登录页",
+                                (
+                                    "LinuxDo authorization redirected back to login page. "
+                                    "Please warm up LinuxDo session manually with `uv run python prepare_linuxdo_session.py`"
+                                ),
+                            )
 
-                        # 从 localStorage 获取 user 对象并提取 id
-                        api_user = None
-                        try:
+                        print(f"ℹ️ {self.account_name}: Waiting for authorization button...")
+                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
+                        allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
+
+                        if allow_btn_ele:
+                            print(f"ℹ️ {self.account_name}: Clicking authorization button...")
+                            await allow_btn_ele.click()
+                            parsed = urlparse(self.provider_config.origin)
                             try:
-                                await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
+                                await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
                             except Exception:
-                                await page.wait_for_timeout(2000)
-
-                            user_data = await page.evaluate("() => localStorage.getItem('user')")
-                            if user_data:
-                                user_obj = json.loads(user_data)
-                                api_user = user_obj.get("id")
-                                if api_user:
-                                    print(f"✅ {self.account_name}: Got api user: {api_user}")
+                                current_url = page.url
+                                if parsed.netloc in current_url:
+                                    print(f"ℹ️ {self.account_name}: Already on provider domain: {current_url}")
                                 else:
-                                    print(f"⚠️ {self.account_name}: User id not found in localStorage")
+                                    raise
+
+                            api_user = None
+                            try:
+                                try:
+                                    await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
+                                except Exception:
+                                    await page.wait_for_timeout(2000)
+
+                                user_data = await page.evaluate("() => localStorage.getItem('user')")
+                                if user_data:
+                                    user_obj = json.loads(user_data)
+                                    api_user = user_obj.get("id")
+                                    if api_user:
+                                        print(f"✅ {self.account_name}: Got api user: {api_user}")
+                                    else:
+                                        print(f"⚠️ {self.account_name}: User id not found in localStorage")
+                                else:
+                                    print(f"⚠️ {self.account_name}: User data not found in localStorage")
+                            except Exception as e:
+                                print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
+
+                            if api_user:
+                                print(f"✅ {self.account_name}: OAuth authorization successful")
+                                restore_cookies = await page.context.cookies()
+                                user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+                                return True, {"cookies": user_cookies, "api_user": api_user}
                             else:
-                                print(f"⚠️ {self.account_name}: User data not found in localStorage")
-                        except Exception as e:
-                            print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
+                                print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
+                                await take_screenshot(page, "oauth_failed_no_user_id_bypass", self.account_name)
+                                parsed_url = urlparse(page.url)
+                                query_params = parse_qs(parsed_url.query)
 
-                        if api_user:
-                            print(f"✅ {self.account_name}: OAuth authorization successful")
+                            if "code" in query_params:
+                                print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+                                return True, query_params
 
-                            # 提取 session cookie，只保留与 provider domain 匹配的
-                            restore_cookies = await page.context.cookies()
-                            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
-
-                            return True, {"cookies": user_cookies, "api_user": api_user}
-                        else:
-                            print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
-                            await take_screenshot(page, "oauth_failed_no_user_id_bypass", self.account_name)
-                            parsed_url = urlparse(page.url)
-                            query_params = parse_qs(parsed_url.query)
-
-                            # 如果 query 中包含 code，说明 OAuth 回调成功
-                        if "code" in query_params:
-                            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
-                            return True, query_params
-                        else:
                             print(f"❌ {self.account_name}: OAuth failed, no code in callback")
                             return False, _build_linuxdo_error(
                                 "linuxdo_oauth_no_code",
                                 "Linux.do OAuth 回调缺少 code",
                                 "Linux.do OAuth failed - no code in callback",
                             )
-                    else:
+
                         print(f"❌ {self.account_name}: Approve button not found")
                         await take_screenshot(page, "approve_button_not_found_bypass", self.account_name)
                         diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed and diagnosed.get("error_type") in {
+                            "linuxdo_sso_provider_stuck",
+                            "linuxdo_redirect_login",
+                        } and flow_round < max_flow_rounds:
+                            relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                            if relogin_ok:
+                                storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                continue
                         if diagnosed:
                             return False, diagnosed
                         return False, _build_linuxdo_error(
@@ -639,22 +753,30 @@ class LinuxDoSignIn:
                             "Linux.do allow button not found",
                         )
 
-                except Exception as e:
-                    print(
-                        f"❌ {self.account_name}: Error occurred during authorization: {e}\n\n"
-                        f"Current page is: {page.url}"
-                    )
-                    await take_screenshot(page, "authorization_failed_bypass", self.account_name)
-                    diagnosed = await _diagnose_linuxdo_page_issue(page)
-                    if diagnosed:
-                        diagnosed["error_detail"] = f"{diagnosed['error_detail']}; authorization exception: {e}"
-                        diagnosed["error"] = diagnosed["error_detail"]
-                        return False, diagnosed
-                    return False, _build_linuxdo_error(
-                        "linuxdo_authorization_failed",
-                        "Linux.do 授权流程异常",
-                        f"Linux.do authorization failed: {e}",
-                    )
+                    except Exception as e:
+                        print(
+                            f"❌ {self.account_name}: Error occurred during authorization: {e}\n\n"
+                            f"Current page is: {page.url}"
+                        )
+                        await take_screenshot(page, "authorization_failed_bypass", self.account_name)
+                        diagnosed = await _diagnose_linuxdo_page_issue(page)
+                        if diagnosed and diagnosed.get("error_type") in {
+                            "linuxdo_sso_provider_stuck",
+                            "linuxdo_redirect_login",
+                        } and flow_round < max_flow_rounds:
+                            relogin_ok = await self._ensure_linuxdo_login(page, context, cache_file_path)
+                            if relogin_ok:
+                                storage_state = await self._persist_linuxdo_storage_state(context, cache_file_path)
+                                continue
+                        if diagnosed:
+                            diagnosed["error_detail"] = f"{diagnosed['error_detail']}; authorization exception: {e}"
+                            diagnosed["error"] = diagnosed["error_detail"]
+                            return False, diagnosed
+                        return False, _build_linuxdo_error(
+                            "linuxdo_authorization_failed",
+                            "Linux.do 授权流程异常",
+                            f"Linux.do authorization failed: {e}",
+                        )
 
             except Exception as e:
                 print(f"❌ {self.account_name}: Error occurred while processing linux.do page: {e}")
