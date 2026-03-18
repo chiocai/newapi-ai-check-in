@@ -637,6 +637,7 @@ def build_oauth_probe_payload(
     state = f"prewarm-{hashlib.sha1(state_seed.encode('utf-8')).hexdigest()[:12]}"
     return {
         "label": f"{provider_name}{slot_label}",
+        "provider_name": provider_name,
         "client_id": client_id,
         "provider_origin": provider_origin,
         "state": state,
@@ -717,6 +718,21 @@ def collect_linuxdo_oauth_probes_for_indices(app_config: AppConfig, account_indi
         default_probe = get_default_linuxdo_oauth_probe(app_config, username)
         if default_probe:
             probes_by_username[username] = [default_probe]
+
+    preferred_provider_order = {
+        "anyrouter": 0,
+        "x666": 1,
+    }
+    max_probe_count = max(1, int(os.getenv("MAX_LINUXDO_PREWARM_PROBES", "3")))
+    for username, probes in probes_by_username.items():
+        ordered_probes = sorted(
+            probes,
+            key=lambda probe: (
+                preferred_provider_order.get(probe.get("provider_name", ""), 100),
+                probe.get("label", ""),
+            ),
+        )
+        probes_by_username[username] = ordered_probes[:max_probe_count]
 
     return probes_by_username
 

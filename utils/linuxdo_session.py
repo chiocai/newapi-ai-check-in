@@ -114,6 +114,7 @@ class LinuxDoSession:
                             f"ℹ️ LinuxDoSession [{self.username_hash}]: "
                             f"Verifying cache via OAuth probe(s): {probe_labels}"
                         )
+                        probe_failures = []
 
                         for probe in oauth_probes:
                             if not isinstance(probe, dict):
@@ -142,29 +143,25 @@ class LinuxDoSession:
                             guard = await detect_linuxdo_page_guard(page)
 
                             if guard.get("human_verification"):
-                                print(
-                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
-                                    f"OAuth probe blocked by Human Verification: {label}"
-                                )
-                                return False
+                                reason = f"Human Verification: {label}"
+                                probe_failures.append(reason)
+                                print(f"⚠️ LinuxDoSession [{self.username_hash}]: OAuth probe blocked by {reason}")
+                                continue
                             if guard.get("cloudflare_challenge"):
-                                print(
-                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
-                                    f"OAuth probe blocked by Cloudflare challenge: {label}"
-                                )
-                                return False
+                                reason = f"Cloudflare challenge: {label}"
+                                probe_failures.append(reason)
+                                print(f"⚠️ LinuxDoSession [{self.username_hash}]: OAuth probe blocked by {reason}")
+                                continue
                             if "linux.do/login" in current_url:
-                                print(
-                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
-                                    f"OAuth probe redirected to login page: {label}"
-                                )
-                                return False
+                                reason = f"redirected to login: {label}"
+                                probe_failures.append(reason)
+                                print(f"⚠️ LinuxDoSession [{self.username_hash}]: OAuth probe {reason}")
+                                continue
                             if "linux.do/session/sso_provider" in current_url:
-                                print(
-                                    f"⚠️ LinuxDoSession [{self.username_hash}]: "
-                                    f"OAuth probe stalled at sso_provider: {label}"
-                                )
-                                return False
+                                reason = f"stalled at sso_provider: {label}"
+                                probe_failures.append(reason)
+                                print(f"⚠️ LinuxDoSession [{self.username_hash}]: OAuth probe {reason}")
+                                continue
 
                             allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
                             if allow_btn:
@@ -183,9 +180,16 @@ class LinuxDoSession:
                                 self._storage_state = await context.storage_state()
                                 return True
 
+                            reason = f"authorize page not reached: {label} -> {page.url}"
+                            probe_failures.append(reason)
+                            print(
+                                f"⚠️ LinuxDoSession [{self.username_hash}]: "
+                                f"OAuth probe did not reach authorize/provider page: {label}"
+                            )
+
                         print(
                             f"⚠️ LinuxDoSession [{self.username_hash}]: "
-                            "OAuth probes did not reach authorize/provider page"
+                            f"OAuth probes all failed: {probe_failures[:3]}"
                         )
                         return False
 
