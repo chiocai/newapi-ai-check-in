@@ -8,8 +8,11 @@ Linux.do 会话管理器
 import hashlib
 import json
 import os
+import re
 import time
+from html import unescape
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin, urlparse
 
 from camoufox.async_api import AsyncCamoufox
 
@@ -28,6 +31,16 @@ if TYPE_CHECKING:
 # 存储目录
 STORAGE_STATE_DIR = "storage-states"
 TIMEOUT_OAUTH_PROBE = 45000
+REDIRECT_ASSIGN_RE = re.compile(
+    r"""(?:window\.)?location(?:\.href|\.assign|\.replace)?\s*(?:=|\()\s*['"]([^'"]+)['"]""",
+    re.IGNORECASE,
+)
+META_REFRESH_RE = re.compile(
+    r"""<meta[^>]+http-equiv=['"]refresh['"][^>]+content=['"][^'"]*url=([^;'"]+)""",
+    re.IGNORECASE,
+)
+HREF_ACTION_RE = re.compile(r"""(?:href|action)=['"]([^'"]+)['"]""", re.IGNORECASE)
+ABS_URL_RE = re.compile(r"""https?://[^\s"'<>]+""", re.IGNORECASE)
 
 
 def _build_oauth_probe_url(client_id: str, state: str) -> str:
@@ -36,6 +49,149 @@ def _build_oauth_probe_url(client_id: str, state: str) -> str:
         "https://connect.linux.do/oauth2/authorize"
         f"?response_type=code&client_id={client_id}&state={state}"
     )
+
+
+def _extract_sso_provider_redirect_candidates(html: str, current_url: str, provider_origin: str) -> list[str]:
+    """从 sso_provider HTML 中提取可能的跳转地址"""
+    normalized_html = unescape(html or '')
+    provider_netloc = urlparse(provider_origin).netloc
+    current_url_lower = current_url.lower()
+
+    raw_candidates = []
+    raw_candidates.extend(META_REFRESH_RE.findall(normalized_html))
+    raw_candidates.extend(REDIRECT_ASSIGN_RE.findall(normalized_html))
+    raw_candidates.extend(HREF_ACTION_RE.findall(normalized_html))
+    raw_candidates.extend(ABS_URL_RE.findall(normalized_html))
+
+    candidates = []
+    seen = set()
+    for raw_candidate in raw_candidates:
+        candidate = urljoin(current_url, raw_candidate.strip())
+        if not candidate or candidate.lower() == current_url_lower:
+            continue
+
+        parsed = urlparse(candidate)
+        is_relevant = parsed.netloc in {'connect.linux.do', provider_netloc} or any(
+            token in candidate.lower()
+            for token in [
+                '/discourse/sso_callback',
+                '/oauth2/authorize',
+                '/session/sso_login',
+                '/session/sso_provider',
+            ]
+        )
+        if not is_relevant or candidate in seen:
+            continue
+
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    return candidates
+
+
+async def _handle_oauth_probe_sso_provider(page, provider_origin: str, username_hash: str, label: str) -> str:
+    """尝试处理 Linux.do sso_provider 中转页，用于预热探针"""
+    print(f"ℹ️ LinuxDoSession [{username_hash}]: OAuth probe hit sso_provider, waiting for redirect: {label}")
+
+    try:
+        await page.wait_for_url("**connect.linux.do/**", timeout=12000)
+        return page.url
+    except Exception:
+        pass
+
+    try:
+        parsed = urlparse(provider_origin)
+        if parsed.netloc:
+            await page.wait_for_url(f"**{parsed.netloc}/**", timeout=5000)
+            return page.url
+    except Exception:
+        pass
+
+    current_url = page.url
+    if "linux.do/session/sso_provider" not in current_url:
+        return current_url
+
+    handled = await page.evaluate("""() => {
+        const textMatches = (el) => {
+            const text = (el.innerText || el.textContent || el.value || '').trim();
+            return /允许|继续|authorize|continue|approve|sign in|login/i.test(text);
+        };
+
+        const clickable = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]'))
+            .find((el) => textMatches(el));
+        if (clickable) {
+            clickable.click();
+            return 'clicked:' + (clickable.innerText || clickable.value || clickable.tagName);
+        }
+
+        const form = document.querySelector('form');
+        if (form) {
+            form.submit();
+            return 'submitted:form';
+        }
+
+        return 'noop';
+    }""")
+    print(f"ℹ️ LinuxDoSession [{username_hash}]: OAuth probe sso_provider handler result: {handled}")
+
+    if handled == "noop":
+        try:
+            post_result = await page.evaluate("""async () => {
+                const form = document.querySelector('form');
+                if (!form) return 'no-form';
+                const action = form.action || window.location.href;
+                const data = new FormData(form);
+                const body = new URLSearchParams(data).toString();
+                const resp = await fetch(action, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body,
+                    redirect: 'follow',
+                });
+                return 'fetch:' + resp.status + ':' + resp.url;
+            }""")
+            print(f"ℹ️ LinuxDoSession [{username_hash}]: OAuth probe sso_provider fetch POST result: {post_result}")
+        except Exception as fetch_err:
+            print(f"⚠️ LinuxDoSession [{username_hash}]: OAuth probe sso_provider fetch POST failed: {fetch_err}")
+
+        try:
+            html = await page.content()
+            redirect_candidates = _extract_sso_provider_redirect_candidates(
+                html,
+                page.url,
+                provider_origin,
+            )
+            if redirect_candidates:
+                print(
+                    f"ℹ️ LinuxDoSession [{username_hash}]: "
+                    f"OAuth probe sso_provider redirect candidates: {redirect_candidates[:3]}"
+                )
+            for redirect_target in redirect_candidates[:3]:
+                try:
+                    await page.goto(redirect_target, wait_until="domcontentloaded", timeout=TIMEOUT_OAUTH_PROBE)
+                    await page.wait_for_timeout(1500)
+                    if "linux.do/session/sso_provider" not in page.url:
+                        break
+                except Exception as redirect_err:
+                    print(
+                        f"⚠️ LinuxDoSession [{username_hash}]: "
+                        f"OAuth probe redirect candidate failed: {redirect_err}"
+                    )
+        except Exception as html_err:
+            print(f"⚠️ LinuxDoSession [{username_hash}]: OAuth probe inspect sso_provider failed: {html_err}")
+
+    try:
+        await page.wait_for_url("**connect.linux.do/**", timeout=12000)
+    except Exception:
+        try:
+            parsed = urlparse(provider_origin)
+            if parsed.netloc:
+                await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_OAUTH_PROBE)
+        except Exception:
+            await page.wait_for_timeout(2000)
+
+    print(f"ℹ️ LinuxDoSession [{username_hash}]: OAuth probe URL after sso_provider handler: {page.url}")
+    return page.url
 
 
 class LinuxDoSession:
@@ -56,6 +212,7 @@ class LinuxDoSession:
         self.storage_state_path = f"{STORAGE_STATE_DIR}/linuxdo_{self.username_hash}_storage_state.json"
         self.is_logged_in = False
         self._storage_state: dict | None = None
+        self._oauth_probes: list[dict] = []
 
         # 确保存储目录存在
         os.makedirs(STORAGE_STATE_DIR, exist_ok=True)
@@ -69,6 +226,11 @@ class LinuxDoSession:
         if self.is_logged_in and self._storage_state:
             print(f"ℹ️ LinuxDoSession [{self.username_hash}]: Already logged in (memory cache)")
             return True
+
+        if oauth_probes is None:
+            oauth_probes = self._oauth_probes
+        elif oauth_probes:
+            self._oauth_probes = oauth_probes
 
         # 检查是否有缓存文件
         if os.path.exists(self.storage_state_path):
@@ -141,6 +303,17 @@ class LinuxDoSession:
                             await page.wait_for_timeout(1500)
                             current_url = page.url.lower()
                             guard = await detect_linuxdo_page_guard(page)
+
+                            if "linux.do/session/sso_provider" in current_url:
+                                current_url = (
+                                    await _handle_oauth_probe_sso_provider(
+                                        page,
+                                        provider_origin,
+                                        self.username_hash,
+                                        label,
+                                    )
+                                ).lower()
+                                guard = await detect_linuxdo_page_guard(page)
 
                             if guard.get("human_verification"):
                                 reason = f"Human Verification: {label}"
@@ -520,6 +693,8 @@ class LinuxDoSessionManager:
         # 创建新会话
         print(f"ℹ️ LinuxDoSessionManager: Creating new session for [{username_hash}]")
         session = LinuxDoSession(username, password, proxy)
+        if oauth_probes:
+            session._oauth_probes = oauth_probes
         cls._sessions[username_hash] = session
 
         if auto_login and not circuit_reason:
