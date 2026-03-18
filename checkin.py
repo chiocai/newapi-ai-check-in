@@ -645,20 +645,47 @@ class CheckIn:
         ]
 
         clicked = False
-        for text in text_patterns:
-            try:
-                span_locator = page.locator("span.ml-3").filter(has_text=text)
-                if await span_locator.count():
-                    target = span_locator.first.locator("xpath=ancestor::button[1] | ancestor::a[1] | ancestor::div[@role='button'][1]")
-                    if await target.count():
-                        await target.first.click()
-                    else:
-                        await span_locator.first.click()
-                    clicked = True
-                    print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue entry via text '{text}'")
-                    break
-            except Exception as click_err:
-                print(f"⚠️ {self.account_name}: Failed to click LinuxDO continue entry '{text}': {click_err}")
+        for attempt in range(1, 3):
+            if attempt > 1:
+                print(f"ℹ️ {self.account_name}: LinuxDO continue entry not found, refreshing page and retrying once")
+                await page.reload(wait_until="domcontentloaded")
+                print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL after refresh: {page.url}")
+                await self._wait_auth_state_page_stable(page)
+                await self._dismiss_known_login_modals(page)
+
+            for text in text_patterns:
+                try:
+                    button_locator = page.get_by_role("button", name=text)
+                    if await button_locator.count():
+                        await button_locator.first.click()
+                        clicked = True
+                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via role/name '{text}'")
+                        break
+
+                    text_button_locator = page.locator(f"button:has-text('{text}')")
+                    if await text_button_locator.count():
+                        await text_button_locator.first.click()
+                        clicked = True
+                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via has-text '{text}'")
+                        break
+
+                    span_locator = page.locator("span.ml-3").filter(has_text=text)
+                    if await span_locator.count():
+                        target = span_locator.first.locator(
+                            "xpath=ancestor::button[1] | ancestor::a[1] | ancestor::div[@role='button'][1]"
+                        )
+                        if await target.count():
+                            await target.first.click()
+                        else:
+                            await span_locator.first.click()
+                        clicked = True
+                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue entry via span text '{text}'")
+                        break
+                except Exception as click_err:
+                    print(f"⚠️ {self.account_name}: Failed to click LinuxDO continue entry '{text}': {click_err}")
+
+            if clicked:
+                break
 
         if not clicked:
             return None
@@ -688,6 +715,10 @@ class CheckIn:
     def _get_linuxdo_oauth_attempts(self) -> int:
         """返回 Linux.do OAuth 整链路最大尝试次数"""
         return 2
+
+    def _should_run_auth_state_browser_headful(self) -> bool:
+        """是否以有头模式运行 auth-state 调试浏览器"""
+        return os.getenv("LINUXDO_AUTH_STATE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _should_retry_linuxdo_oauth_once(self, error_payload: dict | None) -> bool:
         """判断是否应重新获取 state 并再走一次 Linux.do OAuth"""
@@ -784,10 +815,13 @@ class CheckIn:
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_auth_") as tmp_dir:
             print(f"ℹ️ {self.account_name}: Using temporary directory: {tmp_dir}")
+            headful_debug = self._should_run_auth_state_browser_headful()
+            if headful_debug:
+                print(f"ℹ️ {self.account_name}: Auth-state browser debug is running in headed mode")
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
                 persistent_context=True,
-                headless=True,
+                headless=not headful_debug,
                 humanize=True,
                 locale="en-US",
                 geoip=True if self.camoufox_proxy_config else False,
@@ -805,6 +839,7 @@ class CheckIn:
                             f"{index}/{len(entry_urls)} -> {entry_url}"
                         )
                         await page.goto(entry_url, wait_until="domcontentloaded")
+                        print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL: {page.url}")
                         await self._wait_auth_state_page_stable(page)
                         await self._dismiss_known_login_modals(page)
 
