@@ -465,6 +465,9 @@ def detect_linuxdo_page_guard_from_text(text: str) -> dict:
             for keyword in [
                 'just a moment',
                 'checking your browser',
+                'enable javascript and cookies to continue',
+                'verification successful. waiting for',
+                'cf-turnstile-response',
                 '/cdn-cgi/challenge-platform/',
                 'challenge-platform',
             ]

@@ -634,25 +634,11 @@ def get_github_skip_prewarm_slot_labels() -> set[str]:
 
 
 def should_skip_linuxdo_prewarm_for_batch(batch: dict) -> bool:
-    """判断当前批次是否应跳过 Linux.do 预热"""
+    """判断当前批次是否应跳过 Linux.do 预热校验"""
     slot_label = batch.get("slot_label")
     if not slot_label:
         return False
     return slot_label in get_github_skip_prewarm_slot_labels()
-
-
-def purge_linuxdo_prewarm_for_username(username: str, storage_dir: str = "storage-states") -> str | None:
-    """删除指定 Linux.do 用户名对应的预热 storage state 文件"""
-    if not username:
-        return None
-
-    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    file_path = os.path.join(storage_dir, f"linuxdo_{username_hash}_storage_state.json")
-    if not os.path.exists(file_path):
-        return None
-
-    os.remove(file_path)
-    return os.path.basename(file_path)
 
 
 def purge_site_auth_caches(storage_dir: str = "storage-states") -> list[str]:
@@ -1234,8 +1220,6 @@ async def main():
     for batch_index, batch in enumerate(execution_batches, start=1):
         batch_indices = batch["indices"]
         batch_label = batch["label"]
-        batch_linuxdo_username = batch.get("linuxdo_username")
-
         print(
             f"\n🧩 Starting batch {batch_index}/{len(execution_batches)}: "
             f"{batch_label} -> {len(batch_indices)} account(s)"
@@ -1250,14 +1234,10 @@ async def main():
             )
 
         if should_skip_linuxdo_prewarm_for_batch(batch):
-            deleted_prewarm_file = purge_linuxdo_prewarm_for_username(batch_linuxdo_username or "")
-            if deleted_prewarm_file:
-                print(
-                    f"🧹 Skipping LinuxDo prewarm for batch {batch_label} on GitHub, "
-                    f"deleted prewarmed state {deleted_prewarm_file}"
-                )
-            else:
-                print(f"🧹 Skipping LinuxDo prewarm for batch {batch_label} on GitHub (no prewarmed state file found)")
+            print(
+                f"🧹 Skipping LinuxDo prewarm verification for batch {batch_label} on GitHub, "
+                "preserving restored prewarmed storage state"
+            )
             batch_prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
         else:
             batch_prewarm_summary = await prewarm_linuxdo_sessions(

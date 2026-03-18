@@ -79,7 +79,7 @@ def _get_github_skip_prewarm_slot_labels() -> set[str]:
 
 
 def _should_skip_prewarmed_storage_for_account(account_name: str) -> bool:
-    """判断当前账号是否应跳过预热态，直接走 reference-style 直登"""
+    """判断当前账号是否属于 GitHub 上跳过批次预热校验的槽位"""
     if os.getenv('GITHUB_ACTIONS', '').lower() != 'true':
         return False
 
@@ -415,13 +415,6 @@ class LinuxDoSignIn:
 
     async def _resolve_storage_state(self, cache_file_path: str = ''):
         """解析当前登录流程应使用的 storage state"""
-        if _should_skip_prewarmed_storage_for_account(self.account_name):
-            print(
-                f"ℹ️ {self.account_name}: GitHub slot is configured to skip prewarmed storage state, "
-                "reference-style fallback will be preferred"
-            )
-            return None
-
         if self.shared_session:
             if getattr(self.shared_session, 'is_logged_in', False):
                 shared_state = await self.shared_session.get_storage_state()
@@ -613,6 +606,11 @@ class LinuxDoSignIn:
         except Exception as ready_err:
             guard = await detect_linuxdo_page_guard(page)
             print(f"⚠️ {self.account_name}: Linux.do login form not ready: {ready_err}")
+            print(
+                f"ℹ️ {self.account_name}: Linux.do guard snapshot before fallback login wait -> "
+                f"human_verification={guard.get('human_verification')}, "
+                f"cloudflare_challenge={guard.get('cloudflare_challenge')}, url={page.url}"
+            )
             if guard.get("human_verification"):
                 solved = await attempt_linuxdo_human_verification(page, self.account_name)
                 if not solved:
@@ -625,6 +623,14 @@ class LinuxDoSignIn:
                     await take_screenshot(page, "linuxdo_hcaptcha_before_login_ready", self.account_name)
                     return False
             elif guard.get("cloudflare_challenge"):
+                print(f"ℹ️ {self.account_name}: Waiting for Cloudflare/interstitial to clear before retrying login form")
+                try:
+                    await page.wait_for_function(
+                        "document.title.toLowerCase().indexOf('just a moment') === -1",
+                        timeout=TIMEOUT_CLOUDFLARE,
+                    )
+                except Exception as cf_err:
+                    print(f"⚠️ {self.account_name}: Cloudflare/interstitial did not clear in time: {cf_err}")
                 await page.wait_for_timeout(3000)
             else:
                 await page.wait_for_timeout(2000)
@@ -690,17 +696,6 @@ class LinuxDoSignIn:
         )
 
         github_reference_fallback_allowed = os.getenv('GITHUB_ACTIONS', '').lower() == 'true'
-        if github_reference_fallback_allowed and _should_skip_prewarmed_storage_for_account(self.account_name):
-            print(
-                f"ℹ️ {self.account_name}: GitHub slot is configured to bypass prewarm, "
-                "starting with reference-style fallback"
-            )
-            return await self._signin_with_reference_style_fallback(
-                client_id,
-                auth_state,
-                auth_cookies,
-                cache_file_path,
-            )
 
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = await self._resolve_storage_state(cache_file_path)
