@@ -231,7 +231,7 @@ class LinuxDoSignIn:
         auth_cookies: list,
         cache_file_path: str = '',
     ) -> tuple[bool, dict]:
-        """使用 Linux.do 账号执行登录授权（带重试机制）
+        """使用 Linux.do 账号执行单次登录授权
 
         Args:
             client_id: OAuth 客户端 ID
@@ -242,71 +242,23 @@ class LinuxDoSignIn:
         Returns:
             (成功标志, 用户信息字典)
         """
-        last_error = None
-        last_error_summary = None
-        last_result_payload = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                if attempt > 1:
-                    print(f"ℹ️ {self.account_name}: Retry attempt {attempt}/{MAX_RETRIES}")
-                    await asyncio.sleep(RETRY_DELAY)
-
-                async with get_linuxdo_signin_semaphore():
-                    result = await self._signin_impl(
-                        client_id,
-                        auth_state,
-                        auth_cookies,
-                        cache_file_path,
-                    )
-                if result[0]:
-                    return result
-
-                last_result_payload = result[1] or {}
-                last_error = last_result_payload.get('error', 'Unknown error')
-                last_error_summary = last_result_payload.get('error_summary', last_error)
-                error_type = last_result_payload.get('error_type')
-
-                non_retry_error_types = {
-                    'linuxdo_hcaptcha_login',
-                    'linuxdo_hcaptcha_authorize',
-                    'linuxdo_cloudflare_challenge',
-                    'linuxdo_high_load',
-                    'linuxdo_sso_provider_stuck',
-                    'linuxdo_redirect_login',
-                    'linuxdo_prewarmed_state_missing',
-                    'linuxdo_prewarmed_state_invalid',
-                }
-                non_retry_keywords = [
-                    'not found',
-                    'human verification',
-                    'hcaptcha',
-                    'h-captcha',
-                    'cloudflare challenge',
-                    'high load',
-                    'sso provider page is stuck',
-                    'redirected back to login page',
-                    'prewarmed linuxdo storage state',
-                ]
-                if error_type in non_retry_error_types or any(
-                    keyword in str(last_error).lower() for keyword in non_retry_keywords
-                ):
-                    print(f"❌ {self.account_name}: Non-retryable error: {last_error_summary}")
-                    return result
-                print(f"⚠️ {self.account_name}: Attempt {attempt} failed: {last_error_summary}")
-
-            except Exception as e:
-                last_error = str(e)
-                last_error_summary = last_error
-                print(f"⚠️ {self.account_name}: Attempt {attempt} exception: {e}")
-
-        print(f"❌ {self.account_name}: All {MAX_RETRIES} attempts failed. Last error: {last_error}")
-        payload = dict(last_result_payload or {})
-        payload["error"] = f"All {MAX_RETRIES} attempts failed: {last_error}"
-        payload.setdefault("error_summary", last_error_summary or last_error)
-        payload.setdefault("error_detail", last_error)
-        payload.setdefault("error_type", "linuxdo_signin_failed")
-        return False, payload
+        try:
+            async with get_linuxdo_signin_semaphore():
+                return await self._signin_impl(
+                    client_id,
+                    auth_state,
+                    auth_cookies,
+                    cache_file_path,
+                )
+        except Exception as e:
+            error_text = str(e)
+            print(f"⚠️ {self.account_name}: Sign-in exception: {error_text}")
+            return False, {
+                'error_type': 'linuxdo_signin_failed',
+                'error_summary': error_text or 'Linux.do signin failed',
+                'error_detail': error_text or 'Linux.do signin failed',
+                'error': error_text or 'Linux.do signin failed',
+            }
 
     async def _handle_sso_provider_page(self, page) -> str:
         """处理 linux.do/session/sso_provider 中转页"""
@@ -609,7 +561,8 @@ class LinuxDoSignIn:
             print(
                 f"ℹ️ {self.account_name}: Linux.do guard snapshot before fallback login wait -> "
                 f"human_verification={guard.get('human_verification')}, "
-                f"cloudflare_challenge={guard.get('cloudflare_challenge')}, url={page.url}"
+                f"cloudflare_challenge={guard.get('cloudflare_challenge')}, "
+                f"login_form_present={guard.get('login_form_present')}, url={page.url}"
             )
             if guard.get("human_verification"):
                 solved = await attempt_linuxdo_human_verification(page, self.account_name)
@@ -626,12 +579,33 @@ class LinuxDoSignIn:
                 print(f"ℹ️ {self.account_name}: Waiting for Cloudflare/interstitial to clear before retrying login form")
                 try:
                     await page.wait_for_function(
-                        "document.title.toLowerCase().indexOf('just a moment') === -1",
+                        """() => {
+                            const title = (document.title || '').toLowerCase();
+                            const bodyText = (document.body?.innerText || '').toLowerCase();
+                            return (
+                                !title.includes('just a moment') &&
+                                !bodyText.includes('enable javascript and cookies to continue') &&
+                                !document.querySelector('#challenge-error-text') &&
+                                !window._cf_chl_opt
+                            );
+                        }""",
                         timeout=TIMEOUT_CLOUDFLARE,
                     )
                 except Exception as cf_err:
                     print(f"⚠️ {self.account_name}: Cloudflare/interstitial did not clear in time: {cf_err}")
                 await page.wait_for_timeout(3000)
+            elif guard.get("login_form_present"):
+                print(f"ℹ️ {self.account_name}: Login form markup exists, waiting for modal to become visible")
+                await page.wait_for_function(
+                    """() => {
+                        const input = document.querySelector('#login-account-name');
+                        if (!input) return false;
+                        const style = window.getComputedStyle(input);
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        return !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length);
+                    }""",
+                    timeout=15000,
+                )
             else:
                 await page.wait_for_timeout(2000)
             await wait_for_linuxdo_login_ready(page, self.account_name, timeout=TIMEOUT_ELEMENT_WAIT)

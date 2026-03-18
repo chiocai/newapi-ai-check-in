@@ -6,6 +6,7 @@ sys.path.insert(0, str(project_root))
 
 from utils.browser_utils import (
 	classify_linuxdo_human_verification_snapshot,
+	detect_linuxdo_page_guard_from_markup,
 	detect_linuxdo_page_guard_from_text,
 )
 
@@ -95,3 +96,42 @@ def test_detect_linuxdo_page_guard_from_text_too_many_requests():
 	result = detect_linuxdo_page_guard_from_text(text)
 
 	assert result['high_load'] is True
+
+
+def test_detect_linuxdo_page_guard_from_markup_cloudflare_shell():
+	markup = """
+	<html>
+	<head><title>LINUX DO - 新的理想型社区</title></head>
+	<body class="crawler">
+		<div class="cf-turnstile" data-sitekey="site-key"></div>
+		<div class="main-wrapper">
+			<span id="challenge-error-text">Enable JavaScript and cookies to continue</span>
+		</div>
+		<script>window._cf_chl_opt = {};</script>
+	</body>
+	</html>
+	"""
+
+	result = detect_linuxdo_page_guard_from_markup(markup)
+
+	assert result['cloudflare_challenge'] is True
+	assert result['login_form_present'] is False
+
+
+def test_detect_linuxdo_page_guard_from_markup_login_form_not_cloudflare():
+	markup = """
+	<html>
+	<body>
+		<input id="login-account-name" type="email">
+		<input id="login-account-password" type="password">
+		<button id="login-button" type="button">Login</button>
+		<div class="cf-turnstile" data-sitekey="site-key"></div>
+		<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+	</body>
+	</html>
+	"""
+
+	result = detect_linuxdo_page_guard_from_markup(markup)
+
+	assert result['cloudflare_challenge'] is False
+	assert result['login_form_present'] is True

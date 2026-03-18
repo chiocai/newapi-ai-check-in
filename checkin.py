@@ -4,6 +4,7 @@ CheckIn 类
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -537,6 +538,186 @@ class CheckIn:
                 "error": f"Failed to get client id, {e}",
             }
 
+    def _should_prefer_login_page_for_browser_auth_state(self) -> bool:
+        """判断浏览器获取 auth state 时是否优先从登录页引导"""
+        origin = (self.provider_config.origin or "").lower()
+        return self.provider_config.name == "anyrouter" or "anyrouter.top" in origin
+
+    def _get_auth_state_browser_entry_urls(self) -> list[str]:
+        """返回浏览器获取 auth state 时的页面引导顺序"""
+        login_url = self.provider_config.get_login_url()
+        console_url = self.provider_config.get_console_personal_url()
+
+        candidates = [console_url]
+        if self._should_prefer_login_page_for_browser_auth_state():
+            candidates.insert(0, login_url)
+        elif login_url != console_url:
+            candidates.append(login_url)
+
+        ordered_urls = []
+        for url in candidates:
+            if url and url not in ordered_urls:
+                ordered_urls.append(url)
+        return ordered_urls
+
+    async def _wait_auth_state_page_stable(self, page) -> None:
+        """等待 provider 页面基础脚本与运行时状态稳定"""
+        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_function('document.readyState === "complete"', timeout=10000)
+        except Exception:
+            await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(2000)
+
+    async def _dismiss_known_login_modals(self, page) -> list[str]:
+        """关闭会阻塞登录操作的已知公告弹窗"""
+        dismissed_labels = []
+        candidate_labels = [
+            "Close Notice",
+            "Close Today",
+            "关闭公告",
+            "今日关闭",
+            "关闭提示",
+            "关闭通知",
+            "关闭",
+        ]
+
+        for _ in range(2):
+            clicked_label = None
+            for label in candidate_labels:
+                button = page.get_by_role("button", name=label)
+                try:
+                    if await button.count():
+                        await button.first.click()
+                        await page.wait_for_timeout(1000)
+                        dismissed_labels.append(label)
+                        clicked_label = label
+                        break
+                except Exception as modal_err:
+                    print(f"⚠️ {self.account_name}: Failed to dismiss modal button {label}: {modal_err}")
+
+            if not clicked_label:
+                break
+
+        if dismissed_labels:
+            print(f"ℹ️ {self.account_name}: Dismissed blocking modal(s): {dismissed_labels}")
+
+        return dismissed_labels
+
+    async def _fetch_auth_state_in_browser_context(self, page) -> dict:
+        """在当前浏览器上下文中直接请求 provider auth state 接口"""
+        return await page.evaluate(
+            """async (authStateUrl) => {
+                try {
+                    const response = await fetch(authStateUrl, { credentials: 'include' });
+                    const rawText = await response.text();
+                    let payload = null;
+                    try {
+                        payload = JSON.parse(rawText);
+                    } catch (parseErr) {
+                        payload = null;
+                    }
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        payload,
+                        text: rawText.slice(0, 1000),
+                    };
+                } catch (e) {
+                    return {
+                        ok: false,
+                        status: -1,
+                        payload: null,
+                        text: String(e),
+                    };
+                }
+            }""",
+            self.provider_config.get_auth_state_url(),
+        )
+
+    def _get_linuxdo_oauth_attempts(self) -> int:
+        """返回 Linux.do OAuth 整链路最大尝试次数"""
+        return 2
+
+    def _should_retry_linuxdo_oauth_once(self, error_payload: dict | None) -> bool:
+        """判断是否应重新获取 state 并再走一次 Linux.do OAuth"""
+        if not isinstance(error_payload, dict):
+            return False
+
+        error_type = error_payload.get("error_type", "")
+        retryable_error_types = {
+            "linuxdo_signin_failed",
+            "linuxdo_cloudflare_challenge",
+            "linuxdo_high_load",
+            "linuxdo_sso_provider_stuck",
+            "linuxdo_redirect_login",
+            "linuxdo_oauth_no_code",
+            "linuxdo_allow_button_not_found",
+            "linuxdo_auth_state_failed",
+        }
+        return error_type in retryable_error_types
+
+    def _snapshot_linuxdo_authorize_state(self, cache_file_path: str) -> dict:
+        """快照 Linux.do 授权前的预热态，便于失败后恢复干净状态"""
+        snapshot = {
+            'cache_file_path': cache_file_path,
+            'cache_file_exists': bool(cache_file_path and os.path.exists(cache_file_path)),
+            'cache_file_content': None,
+            'shared_session_present': self.linuxdo_session is not None,
+            'shared_is_logged_in': None,
+            'shared_storage_state': None,
+            'shared_storage_state_path': None,
+            'shared_storage_state_file_exists': False,
+            'shared_storage_state_file_content': None,
+        }
+
+        if snapshot['cache_file_exists']:
+            with open(cache_file_path, 'r', encoding='utf-8') as f:
+                snapshot['cache_file_content'] = f.read()
+
+        if self.linuxdo_session is not None:
+            snapshot['shared_is_logged_in'] = getattr(self.linuxdo_session, 'is_logged_in', False)
+            snapshot['shared_storage_state'] = copy.deepcopy(getattr(self.linuxdo_session, '_storage_state', None))
+
+            try:
+                shared_path = self.linuxdo_session.get_storage_state_path()
+            except Exception:
+                shared_path = None
+
+            snapshot['shared_storage_state_path'] = shared_path
+            if shared_path and os.path.exists(shared_path):
+                snapshot['shared_storage_state_file_exists'] = True
+                with open(shared_path, 'r', encoding='utf-8') as f:
+                    snapshot['shared_storage_state_file_content'] = f.read()
+
+        return snapshot
+
+    def _restore_linuxdo_authorize_state(self, snapshot: dict) -> None:
+        """恢复 Linux.do 授权前快照，丢弃失败尝试遗留状态"""
+        cache_file_path = snapshot.get('cache_file_path')
+        if cache_file_path:
+            if snapshot.get('cache_file_exists'):
+                with open(cache_file_path, 'w', encoding='utf-8') as f:
+                    f.write(snapshot.get('cache_file_content') or '')
+            elif os.path.exists(cache_file_path):
+                os.remove(cache_file_path)
+
+        if self.linuxdo_session is None or not snapshot.get('shared_session_present'):
+            return
+
+        self.linuxdo_session.is_logged_in = bool(snapshot.get('shared_is_logged_in'))
+        self.linuxdo_session._storage_state = copy.deepcopy(snapshot.get('shared_storage_state'))
+
+        shared_path = snapshot.get('shared_storage_state_path')
+        if not shared_path:
+            return
+
+        if snapshot.get('shared_storage_state_file_exists'):
+            with open(shared_path, 'w', encoding='utf-8') as f:
+                f.write(snapshot.get('shared_storage_state_file_content') or '')
+        elif os.path.exists(shared_path):
+            os.remove(shared_path)
+
     async def get_auth_state_with_browser(self) -> dict:
         """使用 Camoufox 获取认证 URL 和 cookies
 
@@ -565,51 +746,44 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. Open console/personal first，部分站点需从这里跳转后才会出现 LinuxDo 登录按钮
-                    print(f"ℹ️ {self.account_name}: Opening console/personal page")
-                    await page.goto(self.provider_config.get_console_personal_url(), wait_until="domcontentloaded")
+                    last_response = None
+                    entry_urls = self._get_auth_state_browser_entry_urls()
 
-                    # 等待页面稳定，避免执行上下文被销毁
-                    await page.wait_for_timeout(3000)
+                    for index, entry_url in enumerate(entry_urls, start=1):
+                        print(
+                            f"ℹ️ {self.account_name}: Opening auth-state bootstrap page "
+                            f"{index}/{len(entry_urls)} -> {entry_url}"
+                        )
+                        await page.goto(entry_url, wait_until="domcontentloaded")
+                        await self._wait_auth_state_page_stable(page)
+                        await self._dismiss_known_login_modals(page)
 
-                    # Wait for page to be fully loaded
-                    try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=10000)
-                    except Exception:
-                        await page.wait_for_timeout(3000)
+                        if self.provider_config.aliyun_captcha:
+                            captcha_check = await aliyun_captcha_check(page, self.account_name)
+                            if captcha_check:
+                                await page.wait_for_timeout(3000)
 
-                    # 再次等待确保页面稳定（避免重定向导致上下文销毁）
-                    await page.wait_for_timeout(2000)
+                        response = await self._fetch_auth_state_in_browser_context(page)
+                        last_response = response
+                        response_payload = response.get("payload") or {}
 
-                    if self.provider_config.aliyun_captcha:
-                        captcha_check = await aliyun_captcha_check(page, self.account_name)
-                        if captcha_check:
-                            await page.wait_for_timeout(3000)
+                        if response_payload.get("success") and "data" in response_payload:
+                            cookies = await browser.cookies()
+                            return {
+                                "success": True,
+                                "state": response_payload.get("data"),
+                                "cookies": cookies,
+                            }
 
-                    response = await page.evaluate(
-                        f"""async () => {{
-                            try{{
-                                const response = await fetch('{self.provider_config.get_auth_state_url()}');
-                                const data = await response.json();
-                                return data;
-                            }}catch(e){{
-                                return {{
-                                    success: false,
-                                    message: e.message
-                                }};
-                            }}
-                        }}"""
-                    )
+                        print(
+                            f"⚠️ {self.account_name}: Browser auth state fetch via {entry_url} failed: "
+                            f"status={response.get('status')}, text={response.get('text')}"
+                        )
 
-                    if response and "data" in response:
-                        cookies = await browser.cookies()
-                        return {
-                            "success": True,
-                            "state": response.get("data"),
-                            "cookies": cookies,
-                        }
-
-                    return {"success": False, "error": f"Failed to get state, \n{json.dumps(response, indent=2)}"}
+                    return {
+                        "success": False,
+                        "error": f"Failed to get state, \n{json.dumps(last_response, ensure_ascii=False, indent=2)}",
+                    }
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
@@ -1787,28 +1961,6 @@ class CheckIn:
                         "error": f"Failed to get Linux.do client ID: {error_msg}",
                     }
 
-            # 获取 OAuth 认证状态
-            # 如果需要绕过 WAF，使用浏览器获取 auth state
-            if self.provider_config.needs_waf_cookies():
-                print(f"ℹ️ {self.account_name}: Using browser to get auth state (WAF bypass)")
-                auth_state_result = await self.get_auth_state_with_browser()
-            else:
-                auth_state_result = await self.get_auth_state(
-                    client=client,
-                    headers=headers,
-                )
-            if auth_state_result and auth_state_result.get("success"):
-                print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
-            else:
-                error_msg = auth_state_result.get("error", "Unknown error")
-                print(f"❌ {self.account_name}: {error_msg}")
-                return False, {
-                    "error_type": "linuxdo_auth_state_failed",
-                    "error_summary": summarize_linuxdo_auth_state_error(error_msg),
-                    "error_detail": error_msg,
-                    "error": f"Failed to get Linux.do auth state: {error_msg}",
-                }
-
             # 生成 Linux.do storage state 缓存文件路径
             cache_file_path = f"{self.storage_state_dir}/linuxdo_{username_hash}_storage_state.json"
 
@@ -1822,12 +1974,69 @@ class CheckIn:
                 shared_session=self.linuxdo_session,
             )
 
-            success, result_data = await linuxdo.signin(
-                client_id=client_id_result["client_id"],
-                auth_state=auth_state_result["state"],
-                auth_cookies=auth_state_result.get("cookies", []),
-                cache_file_path=cache_file_path,
-            )
+            max_oauth_attempts = self._get_linuxdo_oauth_attempts()
+            linuxdo_state_snapshot = self._snapshot_linuxdo_authorize_state(cache_file_path)
+            auth_state_result = None
+            success = False
+            result_data = {}
+
+            for oauth_attempt in range(1, max_oauth_attempts + 1):
+                if oauth_attempt > 1:
+                    print(
+                        f"⚠️ {self.account_name}: Linux.do OAuth authorization failed previously, "
+                        f"restarting full state+authorize flow ({oauth_attempt}/{max_oauth_attempts})"
+                    )
+                    self._restore_linuxdo_authorize_state(linuxdo_state_snapshot)
+                    await asyncio.sleep(2)
+
+                client.cookies.clear()
+                client.cookies.update(waf_cookies)
+                print(f"ℹ️ {self.account_name}: Reset provider-side cookies before OAuth attempt {oauth_attempt}")
+
+                # 获取 OAuth 认证状态
+                # 如果需要绕过 WAF，使用浏览器获取 auth state
+                if self.provider_config.needs_waf_cookies():
+                    print(f"ℹ️ {self.account_name}: Using browser to get auth state (WAF bypass)")
+                    auth_state_result = await self.get_auth_state_with_browser()
+                else:
+                    auth_state_result = await self.get_auth_state(
+                        client=client,
+                        headers=headers,
+                    )
+
+                if auth_state_result and auth_state_result.get("success"):
+                    print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
+                else:
+                    error_msg = auth_state_result.get("error", "Unknown error")
+                    print(f"❌ {self.account_name}: {error_msg}")
+                    result_data = {
+                        "error_type": "linuxdo_auth_state_failed",
+                        "error_summary": summarize_linuxdo_auth_state_error(error_msg),
+                        "error_detail": error_msg,
+                        "error": f"Failed to get Linux.do auth state: {error_msg}",
+                    }
+                    if oauth_attempt < max_oauth_attempts:
+                        continue
+                    return False, result_data
+
+                success, result_data = await linuxdo.signin(
+                    client_id=client_id_result["client_id"],
+                    auth_state=auth_state_result["state"],
+                    auth_cookies=auth_state_result.get("cookies", []),
+                    cache_file_path=cache_file_path,
+                )
+
+                if success:
+                    break
+
+                if oauth_attempt < max_oauth_attempts and self._should_retry_linuxdo_oauth_once(result_data):
+                    print(
+                        f"⚠️ {self.account_name}: Linux.do authorize step failed with "
+                        f"{result_data.get('error_type', 'unknown_error')}, will reset cookies/session and retry once"
+                    )
+                    continue
+
+                break
 
             if not success and isinstance(result_data, dict):
                 error_type = result_data.get("error_type", "")
@@ -1843,11 +2052,18 @@ class CheckIn:
                         result_data.get("error_detail") or result_data.get("error_summary") or error_type,
                     )
 
+            bootstrap_cookies = {**waf_cookies}
+            for cookie_dict in (auth_state_result or {}).get("cookies", []):
+                cookie_name = cookie_dict.get("name")
+                cookie_value = cookie_dict.get("value")
+                if cookie_name and cookie_value is not None:
+                    bootstrap_cookies[cookie_name] = cookie_value
+
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:
                 user_cookies = result_data["cookies"]
                 api_user = result_data["api_user"]
-                merged_cookies = {**waf_cookies, **user_cookies}
+                merged_cookies = {**bootstrap_cookies, **user_cookies}
 
                 # 保存 provider session 缓存
                 _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
@@ -1890,7 +2106,7 @@ class CheckIn:
                                 print(
                                     f"ℹ️ {self.account_name}: Extracted {len(user_cookies)} user cookies: {list(user_cookies.keys())}"
                                 )
-                                merged_cookies = {**waf_cookies, **user_cookies}
+                                merged_cookies = {**bootstrap_cookies, **user_cookies}
 
                                 # 保存 provider session 缓存
                                 _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
@@ -1912,7 +2128,7 @@ class CheckIn:
                                 auth_state_result.get("cookies", []),
                             )
                             if fallback_result.get("success"):
-                                merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                                merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                                 api_user = fallback_result["api_user"]
                                 _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
                                 print(f"✅ {self.account_name}: Browser callback fallback succeeded")
@@ -1927,7 +2143,7 @@ class CheckIn:
                             auth_state_result.get("cookies", []),
                         )
                         if fallback_result.get("success"):
-                            merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                            merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                             api_user = fallback_result["api_user"]
                             _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
                             print(f"✅ {self.account_name}: Browser callback fallback succeeded")
@@ -1942,7 +2158,7 @@ class CheckIn:
                         auth_state_result.get("cookies", []),
                     )
                     if fallback_result.get("success"):
-                        merged_cookies = {**waf_cookies, **fallback_result["cookies"]}
+                        merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                         api_user = fallback_result["api_user"]
                         _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
                         print(f"✅ {self.account_name}: Browser callback fallback succeeded")

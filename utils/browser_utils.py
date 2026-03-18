@@ -259,21 +259,37 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
 
 
 async def wait_for_linuxdo_login_ready(page, account_name: str, timeout: int = 45000) -> None:
-    """等待 LinuxDo 登录页前端完全就绪
+	"""等待 LinuxDo 登录页前端完全就绪
 
-    LinuxDo 当前登录页是 Ember 单页应用，表单元素会先渲染出来，
-    但登录按钮事件绑定可能稍后才完成。过早点击会停留在 `/login`，
-    且不会真正发出登录请求。
-    """
-    await page.wait_for_selector('#login-account-name', timeout=timeout)
-    await page.wait_for_function(
-        """() => {
-            return !!window.requirejs || !!window.Ember || !!document.querySelector('.ember-application');
-        }""",
-        timeout=timeout,
-    )
-    await page.wait_for_timeout(1500)
-    print(f"ℹ️ {account_name}: LinuxDo login page is ready")
+	LinuxDo 当前登录页是 Ember 单页应用，表单元素会先渲染出来，
+	但登录按钮事件绑定可能稍后才完成。过早点击会停留在 `/login`，
+	且不会真正发出登录请求。
+	"""
+	await page.wait_for_function(
+		"""() => {
+			const isVisible = (selector) => {
+				const el = document.querySelector(selector);
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				if (style.display === 'none' || style.visibility === 'hidden') return false;
+				return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+			};
+			const loginFormReady =
+				isVisible('#login-account-name') &&
+				isVisible('#login-account-password') &&
+				isVisible('#login-button');
+			if (!loginFormReady) return false;
+			return (
+				!!window.requirejs ||
+				!!window.Ember ||
+				!!document.querySelector('.ember-application') ||
+				document.readyState === 'complete'
+			);
+		}""",
+		timeout=timeout,
+	)
+	await page.wait_for_timeout(1500)
+	print(f"ℹ️ {account_name}: LinuxDo login page is ready")
 
 
 async def has_linuxdo_human_verification(page) -> bool:
@@ -447,9 +463,9 @@ async def get_linuxdo_hcaptcha_response(page) -> str:
 
 
 def detect_linuxdo_page_guard_from_text(text: str) -> dict:
-    """从页面文本中检测 LinuxDo 的拦截类型"""
-    normalized = (text or '').lower()
-    return {
+	"""从页面文本中检测 LinuxDo 的拦截类型"""
+	normalized = (text or '').lower()
+	return {
         'human_verification': any(
             keyword in normalized
             for keyword in [
@@ -482,47 +498,92 @@ def detect_linuxdo_page_guard_from_text(text: str) -> dict:
                 'rate limited',
                 'rate limit exceeded',
             ]
-        ),
-    }
+		),
+	}
+
+
+def detect_linuxdo_page_guard_from_markup(markup: str) -> dict:
+	"""从页面 HTML 标记中检测 Cloudflare 壳页与登录表单"""
+	normalized = (markup or '').lower()
+	login_form_present = any(
+		token in normalized
+		for token in [
+			'id="login-account-name"',
+			"id='login-account-name'",
+			'id="login-account-password"',
+			"id='login-account-password'",
+			'id="login-button"',
+			"id='login-button'",
+		]
+	)
+
+	cloudflare_interstitial_markers = [
+		'window._cf_chl_opt',
+		'id="challenge-error-text"',
+		"id='challenge-error-text'",
+		'cf-mitigated',
+		'body class="crawler',
+		"body class='crawler",
+		'/cdn-cgi/challenge-platform/h/',
+		'enable javascript and cookies to continue',
+		'<title>just a moment',
+	]
+
+	return {
+		'login_form_present': login_form_present,
+		'cloudflare_challenge': bool(
+			not login_form_present and any(marker in normalized for marker in cloudflare_interstitial_markers)
+		),
+	}
 
 
 async def detect_linuxdo_page_guard(page) -> dict:
-    """检测当前 LinuxDo 页面是否被验证码或挑战页拦截"""
-    try:
-        page_text = await page.locator('body').inner_text()
-    except Exception:
-        page_text = ''
+	"""检测当前 LinuxDo 页面是否被验证码或挑战页拦截"""
+	try:
+		page_text = await page.locator('body').inner_text()
+	except Exception:
+		page_text = ''
 
-    result = detect_linuxdo_page_guard_from_text(page_text)
+	result = detect_linuxdo_page_guard_from_text(page_text)
+	result['login_form_present'] = False
 
-    snapshot = await get_linuxdo_human_verification_snapshot(page)
-    state = classify_linuxdo_human_verification_snapshot(snapshot)
-    if state['present']:
-        result['human_verification'] = True
-        result['human_verification_sitekey'] = state.get('sitekey')
-        result['human_verification_solved'] = state.get('solved')
-        result['human_verification_blocking'] = state.get('blocking')
-        result['human_verification_verify_button_disabled'] = state.get('verify_button_disabled')
-        result['human_verification_iframe_count'] = state.get('iframe_count')
+	try:
+		page_markup = await page.content()
+	except Exception:
+		page_markup = ''
 
-    try:
-        title = (await page.title()).lower()
-    except Exception:
-        title = ''
+	markup_result = detect_linuxdo_page_guard_from_markup(page_markup)
+	result['cloudflare_challenge'] = result['cloudflare_challenge'] or markup_result['cloudflare_challenge']
+	result['login_form_present'] = markup_result['login_form_present']
 
-    if 'just a moment' in title or 'challenge' in page.url.lower():
-        result['cloudflare_challenge'] = True
+	snapshot = await get_linuxdo_human_verification_snapshot(page)
+	state = classify_linuxdo_human_verification_snapshot(snapshot)
+	if state['present']:
+		result['human_verification'] = True
+		result['human_verification_sitekey'] = state.get('sitekey')
+		result['human_verification_solved'] = state.get('solved')
+		result['human_verification_blocking'] = state.get('blocking')
+		result['human_verification_verify_button_disabled'] = state.get('verify_button_disabled')
+		result['human_verification_iframe_count'] = state.get('iframe_count')
 
-    return result
+	try:
+		title = (await page.title()).lower()
+	except Exception:
+		title = ''
+
+	if 'just a moment' in title or 'challenge' in page.url.lower():
+		result['cloudflare_challenge'] = True
+
+	return result
 
 
 async def attempt_linuxdo_human_verification(page, account_name: str, timeout_ms: int = 25000) -> bool:
-    """尝试自动触发并等待 LinuxDo Human Verification 完成
+	"""尝试自动触发并等待 LinuxDo Human Verification 完成
 
-    说明：
-    - 不引入第三方打码服务
-    - 只做轻量自动尝试：点击 Verify / hCaptcha checkbox，并等待 token
-    - 若环境可信且站点允许，有机会自动通过；否则走明确降级
-    """
-    result = await try_bypass_linuxdo_human_verification(page, account_name, timeout=timeout_ms)
-    return bool(result.get('solved'))
+	说明：
+	- 不引入第三方打码服务
+	- 只做轻量自动尝试：点击 Verify / hCaptcha checkbox，并等待 token
+	- 若环境可信且站点允许，有机会自动通过；否则走明确降级
+	"""
+	result = await try_bypass_linuxdo_human_verification(page, account_name, timeout=timeout_ms)
+	return bool(result.get('solved'))

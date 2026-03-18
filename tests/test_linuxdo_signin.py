@@ -37,12 +37,12 @@ def test_diagnose_linuxdo_page_issue_prefers_sso_provider_over_high_load(monkeyp
 def test_linuxdo_signin_does_not_retry_with_fresh_login_after_sso_provider_stuck(tmp_path):
 	provider = SimpleNamespace(origin='https://anyrouter.top')
 	signin = LinuxDoSignIn('anyrouter-1', provider, 'user', 'pass')
-	call_force_fresh_login = []
+	call_count = []
 	cache_file = tmp_path / 'storage.json'
 	cache_file.write_text('{}')
 
-	async def fake_signin_impl(client_id, auth_state, auth_cookies, cache_file_path='', force_fresh_login=False):
-		call_force_fresh_login.append(force_fresh_login)
+	async def fake_signin_impl(client_id, auth_state, auth_cookies, cache_file_path=''):
+		call_count.append((client_id, auth_state, cache_file_path))
 		return False, {
 			'error_type': 'linuxdo_sso_provider_stuck',
 			'error_summary': 'Linux.do SSO 中转页卡住',
@@ -56,7 +56,30 @@ def test_linuxdo_signin_does_not_retry_with_fresh_login_after_sso_provider_stuck
 
 	assert success is False
 	assert payload['error_type'] == 'linuxdo_sso_provider_stuck'
-	assert call_force_fresh_login == [False]
+	assert call_count == [('client-id', 'state-1', str(cache_file))]
+
+
+def test_linuxdo_signin_does_not_retry_same_state_on_generic_failure():
+	provider = SimpleNamespace(origin='https://alpha.example.com')
+	signin = LinuxDoSignIn('alpha-1', provider, 'user', 'pass')
+	call_count = []
+
+	async def fake_signin_impl(client_id, auth_state, auth_cookies, cache_file_path=''):
+		call_count.append((client_id, auth_state))
+		return False, {
+			'error_type': 'linuxdo_signin_failed',
+			'error_summary': 'Generic failure',
+			'error_detail': 'Generic failure',
+			'error': 'Generic failure',
+		}
+
+	signin._signin_impl = fake_signin_impl
+
+	success, payload = asyncio.run(signin.signin('client-id', 'state-1', [], ''))
+
+	assert success is False
+	assert payload['error_type'] == 'linuxdo_signin_failed'
+	assert call_count == [('client-id', 'state-1')]
 
 
 def test_resolve_storage_state_skips_shared_cache_when_session_not_logged_in(tmp_path):

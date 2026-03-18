@@ -215,3 +215,116 @@ def test_check_in_with_linuxdo_login_only_reauths_when_provider_cache_invalid(mo
 	assert success is True
 	assert login_result == {'cookies': {'session': 'fresh'}, 'api_user': '456'}
 	assert json.loads(cache_path.read_text(encoding='utf-8'))['api_user'] == '456'
+
+
+def test_auth_state_browser_entry_urls_prefer_login_for_anyrouter():
+	account_config = build_account('anyrouter')
+	provider_config = ProviderConfig(
+		name='anyrouter',
+		origin='https://anyrouter.top',
+		sign_in_path=None,
+	)
+	checkin = CheckIn('anyrouter-1', account_config, provider_config)
+
+	assert checkin._get_auth_state_browser_entry_urls() == [
+		'https://anyrouter.top/login',
+		'https://anyrouter.top/console/personal',
+	]
+
+
+def test_linuxdo_oauth_attempts_retry_once_for_all_sites():
+	account_config = build_account('alpha')
+	provider_config = ProviderConfig(
+		name='alpha',
+		origin='https://alpha.example.com',
+		sign_in_path=None,
+	)
+	checkin = CheckIn('alpha-1', account_config, provider_config)
+
+	assert checkin._get_linuxdo_oauth_attempts() == 2
+	assert checkin._should_retry_linuxdo_oauth_once({'error_type': 'linuxdo_sso_provider_stuck'}) is True
+	assert checkin._should_retry_linuxdo_oauth_once({'error_type': 'linuxdo_hcaptcha_login'}) is False
+
+
+def test_dismiss_known_login_modals_clicks_close_notice():
+	account_config = build_account('anyrouter')
+	provider_config = ProviderConfig(
+		name='anyrouter',
+		origin='https://anyrouter.top',
+		sign_in_path=None,
+	)
+	checkin = CheckIn('anyrouter-1', account_config, provider_config)
+	clicked = []
+
+	class DummyLocator:
+		def __init__(self, page, label: str):
+			self.page = page
+			self.label = label
+
+		async def count(self):
+			return 1 if self.label == self.page.visible_label else 0
+
+		@property
+		def first(self):
+			return self
+
+		async def click(self):
+			clicked.append(self.label)
+			self.page.visible_label = None
+
+	class DummyPage:
+		def __init__(self, visible_label: str):
+			self.visible_label = visible_label
+
+		def get_by_role(self, _role, name: str):
+			return DummyLocator(self, name)
+
+		async def wait_for_timeout(self, _ms):
+			return None
+
+	dismissed = asyncio.run(checkin._dismiss_known_login_modals(DummyPage('Close Notice')))
+
+	assert dismissed == ['Close Notice']
+	assert clicked == ['Close Notice']
+
+
+def test_restore_linuxdo_authorize_state_resets_cache_and_shared_session(tmp_path):
+	account_config = build_account('alpha')
+	provider_config = ProviderConfig(
+		name='alpha',
+		origin='https://alpha.example.com',
+		sign_in_path=None,
+		linuxdo_client_id='client-id',
+	)
+	checkin = CheckIn('alpha-1', account_config, provider_config, storage_state_dir=str(tmp_path))
+
+	cache_path = tmp_path / 'linuxdo_cache.json'
+	cache_path.write_text('{"cookies": ["original"]}', encoding='utf-8')
+
+	shared_path = tmp_path / 'shared_state.json'
+	shared_path.write_text('{"cookies": ["shared-original"]}', encoding='utf-8')
+
+	class DummySharedSession:
+		def __init__(self):
+			self.is_logged_in = True
+			self._storage_state = {'cookies': ['shared-original']}
+
+		def get_storage_state_path(self):
+			return str(shared_path)
+
+	shared_session = DummySharedSession()
+	checkin.linuxdo_session = shared_session
+
+	snapshot = checkin._snapshot_linuxdo_authorize_state(str(cache_path))
+
+	cache_path.write_text('{"cookies": ["mutated"]}', encoding='utf-8')
+	shared_path.write_text('{"cookies": ["shared-mutated"]}', encoding='utf-8')
+	shared_session.is_logged_in = False
+	shared_session._storage_state = {'cookies': ['shared-mutated']}
+
+	checkin._restore_linuxdo_authorize_state(snapshot)
+
+	assert cache_path.read_text(encoding='utf-8') == '{"cookies": ["original"]}'
+	assert shared_path.read_text(encoding='utf-8') == '{"cookies": ["shared-original"]}'
+	assert shared_session.is_logged_in is True
+	assert shared_session._storage_state == {'cookies': ['shared-original']}
