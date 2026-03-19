@@ -618,6 +618,38 @@ class CheckIn:
             self.provider_config.get_auth_state_url(),
         )
 
+    async def _load_linuxdo_storage_state_for_auth_browser(self) -> dict | None:
+        """加载 LinuxDo 共享会话，用于注入 provider auth-state 浏览器上下文"""
+        if self.linuxdo_session:
+            shared_state = await self.linuxdo_session.get_storage_state()
+            if shared_state:
+                return shared_state
+
+            shared_state_path = self.linuxdo_session.get_storage_state_path()
+            if shared_state_path and os.path.exists(shared_state_path):
+                try:
+                    with open(shared_state_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except Exception as load_err:
+                    print(f"⚠️ {self.account_name}: Failed to load shared LinuxDo storage state from file: {load_err}")
+
+        linux_do = self.account_config.linux_do or {}
+        username = linux_do.get("username", "")
+        if not username:
+            return None
+
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        storage_state_path = os.path.join(self.storage_state_dir, f"linuxdo_{username_hash}_storage_state.json")
+        if not os.path.exists(storage_state_path):
+            return None
+
+        try:
+            with open(storage_state_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as load_err:
+            print(f"⚠️ {self.account_name}: Failed to load LinuxDo storage state from {storage_state_path}: {load_err}")
+            return None
+
     async def _click_linuxdo_continue_and_capture_auth_state(self, page, browser, entry_url: str | None = None) -> dict | None:
         """优先通过页面上的“使用 LinuxDO 继续”按钮引导到 connect 授权页"""
         text_patterns = [
@@ -845,6 +877,7 @@ class CheckIn:
             headful_debug = self._should_run_auth_state_browser_headful()
             if headful_debug:
                 print(f"ℹ️ {self.account_name}: Auth-state browser debug is running in headed mode")
+            linuxdo_storage_state = await self._load_linuxdo_storage_state_for_auth_browser()
             async with AsyncCamoufox(
                 user_data_dir=tmp_dir,
                 persistent_context=True,
@@ -857,6 +890,13 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
+                    if linuxdo_storage_state and linuxdo_storage_state.get("cookies"):
+                        await browser.add_cookies(linuxdo_storage_state.get("cookies", []))
+                        print(
+                            f"ℹ️ {self.account_name}: Injected {len(linuxdo_storage_state.get('cookies', []))} "
+                            "LinuxDo cookie(s) into auth-state browser"
+                        )
+
                     last_response = None
                     entry_urls = self._get_auth_state_browser_entry_urls()
 
