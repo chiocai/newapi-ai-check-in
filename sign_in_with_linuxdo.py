@@ -40,7 +40,7 @@ MAX_RETRIES = 2  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
 MAX_CONCURRENT_LINUXDO_OAUTH = max(
     1,
-    int(os.getenv("MAX_CONCURRENT_LINUXDO_OAUTH", "2"))
+    int(os.getenv("MAX_CONCURRENT_LINUXDO_OAUTH", os.getenv("MAX_CONCURRENT_ACCOUNTS", "10")))
 )  # Linux.do OAuth 浏览器流程最大并发数
 MAX_LINUXDO_FLOW_ROUNDS = max(
     1,
@@ -75,6 +75,11 @@ def get_linuxdo_signin_account_lock(username: str) -> asyncio.Lock:
     if username_hash not in _linuxdo_signin_account_locks:
         _linuxdo_signin_account_locks[username_hash] = asyncio.Lock()
     return _linuxdo_signin_account_locks[username_hash]
+
+
+def should_serialize_same_linuxdo_oauth() -> bool:
+    """是否按 Linux.do 用户名串行化 OAuth 浏览器流程"""
+    return os.getenv('SERIALIZE_SAME_LINUXDO_OAUTH', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 def _get_github_skip_prewarm_slot_labels() -> set[str]:
@@ -259,13 +264,20 @@ class LinuxDoSignIn:
         """
         try:
             async with get_linuxdo_signin_semaphore():
-                async with get_linuxdo_signin_account_lock(self.username):
-                    return await self._signin_impl(
-                        client_id,
-                        auth_state,
-                        auth_cookies,
-                        cache_file_path,
-                    )
+                if should_serialize_same_linuxdo_oauth():
+                    async with get_linuxdo_signin_account_lock(self.username):
+                        return await self._signin_impl(
+                            client_id,
+                            auth_state,
+                            auth_cookies,
+                            cache_file_path,
+                        )
+                return await self._signin_impl(
+                    client_id,
+                    auth_state,
+                    auth_cookies,
+                    cache_file_path,
+                )
         except Exception as e:
             error_text = str(e)
             print(f"⚠️ {self.account_name}: Sign-in exception: {error_text}")

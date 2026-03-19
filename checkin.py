@@ -143,6 +143,64 @@ def summarize_linuxdo_auth_state_error(error_msg: str) -> str:
     return f"站点 auth state 异常: {error_msg}"
 
 
+def has_provider_bypass_cookies(cookies: dict | None) -> bool:
+    """判断当前 cookies 是否已携带可复用的 WAF/CF 绕过态"""
+    if not isinstance(cookies, dict):
+        return False
+
+    bypass_cookie_names = {
+        "cf_clearance",
+        "__cf_bm",
+        "acw_tc",
+        "cdn_sec_tc",
+        "acw_sc__v2",
+    }
+    return any(name in cookies and cookies.get(name) for name in bypass_cookie_names)
+
+
+def should_retry_newapi_checkin_in_browser(error_msg: str) -> bool:
+    """判断 New-API 签到失败后是否值得再起浏览器补救"""
+    normalized = (error_msg or "").strip().lower()
+    if not normalized:
+        return False
+
+    no_retry_indicators = [
+        "当前余额高于签到阈值",
+        "余额高于签到阈值",
+        "签到功能未启用",
+        "今日已签到",
+        "已经签到",
+        "already checked",
+        "already signed",
+        "not enabled",
+        "threshold",
+    ]
+    if any(indicator.lower() in normalized for indicator in no_retry_indicators):
+        return False
+
+    retry_indicators = [
+        "http 401",
+        "http 403",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "invalid response",
+        "text/html",
+        "html",
+        "unauthorized",
+        "cloudflare",
+        "challenge",
+        "waf",
+        "forbidden",
+        "timeout",
+        "未登录",
+        "无权",
+        "会话",
+    ]
+    return any(indicator in normalized for indicator in retry_indicators)
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -1754,8 +1812,35 @@ class CheckIn:
             checkin_reward = None  # 保存签到奖励信息
             if self.account_config.checkin:
                 if self.provider_config.needs_waf_cookies():
-                    print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
-                    do_browser_checkin = True
+                    if has_provider_bypass_cookies(cookies):
+                        print(f"ℹ️ {self.account_name}: Reusable WAF cookies detected, trying HTTP New-API checkin first")
+                        from utils.new_api_checkin import new_api_checkin
+
+                        checkin_result = new_api_checkin(
+                            account_name=self.account_name,
+                            origin=self.provider_config.origin,
+                            api_user=api_user,
+                            headers=headers,
+                            cookies=cookies,
+                            proxy=self.http_proxy_config,
+                            api_user_key=self.provider_config.api_user_key,
+                        )
+                        if checkin_result.get("success"):
+                            checkin_reward = checkin_result.get("reward")
+                            if checkin_result.get("already_checked"):
+                                checkin_reward = None
+                        else:
+                            error_msg = checkin_result.get("error", "New-API checkin failed")
+                            print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
+                            if should_retry_newapi_checkin_in_browser(error_msg):
+                                print(
+                                    f"⚠️ {self.account_name}: HTTP New-API checkin looks recoverable, "
+                                    "will fallback to browser mode in this run"
+                                )
+                                do_browser_checkin = True
+                    else:
+                        print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
+                        do_browser_checkin = True
                 elif self.provider_config.turnstile_site_key:
                     print(f"ℹ️ {self.account_name}: New-API checkin requires Turnstile, using browser...")
                     from utils.new_api_checkin import new_api_checkin_with_turnstile
@@ -1797,7 +1882,7 @@ class CheckIn:
                     else:
                         error_msg = checkin_result.get("error", "New-API checkin failed")
                         print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
-                        if self.provider_config.name != "anyrouter":
+                        if self.provider_config.name != "anyrouter" and should_retry_newapi_checkin_in_browser(error_msg):
                             print(
                                 f"⚠️ {self.account_name}: New-API HTTP checkin failed, "
                                 "will fallback to browser mode in this run"
@@ -1844,18 +1929,38 @@ class CheckIn:
                     if browser_user_info and browser_user_info.get("success"):
                         user_info = browser_user_info
             elif self.provider_config.needs_waf_cookies():
-                print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
-                # 将 cookies dict 转换为 Camoufox 格式的 list
-                auth_cookies_list = []
-                parsed_domain = urlparse(self.provider_config.origin).netloc
-                for name, value in cookies.items():
-                    auth_cookies_list.append({
-                        "name": name,
-                        "value": value,
-                        "domain": parsed_domain,
-                        "path": "/",
-                    })
-                user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=do_browser_checkin)
+                if has_provider_bypass_cookies(cookies) and not do_browser_checkin:
+                    print(f"ℹ️ {self.account_name}: Reusable WAF cookies detected, trying HTTP user info first")
+                    user_info = await self.get_user_info(client, headers)
+                    if not (user_info and user_info.get("success")):
+                        print(f"⚠️ {self.account_name}: HTTP user info failed for WAF site, fallback to browser")
+                        auth_cookies_list = []
+                        parsed_domain = urlparse(self.provider_config.origin).netloc
+                        for name, value in cookies.items():
+                            auth_cookies_list.append({
+                                "name": name,
+                                "value": value,
+                                "domain": parsed_domain,
+                                "path": "/",
+                            })
+                        user_info = await self.get_user_info_with_browser(
+                            auth_cookies_list,
+                            api_user,
+                            do_checkin=do_browser_checkin,
+                        )
+                else:
+                    print(f"ℹ️ {self.account_name}: Using browser to get user info (WAF bypass)")
+                    # 将 cookies dict 转换为 Camoufox 格式的 list
+                    auth_cookies_list = []
+                    parsed_domain = urlparse(self.provider_config.origin).netloc
+                    for name, value in cookies.items():
+                        auth_cookies_list.append({
+                            "name": name,
+                            "value": value,
+                            "domain": parsed_domain,
+                            "path": "/",
+                        })
+                    user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=do_browser_checkin)
             else:
                 user_info = await self.get_user_info(client, headers)
                 if do_browser_checkin or not (user_info and user_info.get("success")):
@@ -2053,6 +2158,9 @@ class CheckIn:
             f"ℹ️ {self.account_name}: Executing check-in with Linux.do account (using proxy: {'true' if self.http_proxy_config else 'false'})"
         )
 
+        if self.provider_config.needs_waf_cookies() and not waf_cookies:
+            print(f"ℹ️ {self.account_name}: Deferring WAF cookie bootstrap until provider session/cache really needs it")
+
         # 生成缓存文件路径
         username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
         provider_cache_path = _get_provider_session_cache_path(
@@ -2163,6 +2271,13 @@ class CheckIn:
                 "error_detail": circuit_reason,
                 "error": f"Linux.do circuit is open for this run: {circuit_reason}",
             }
+
+        if self.provider_config.needs_waf_cookies() and not waf_cookies:
+            waf_cookies = await self.get_waf_cookies_with_browser() or {}
+            if waf_cookies:
+                print(f"✅ {self.account_name}: Deferred WAF cookies obtained before OAuth flow")
+            else:
+                print(f"⚠️ {self.account_name}: Deferred WAF cookie bootstrap failed, continue with auth-state browser flow")
 
         client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
         try:
@@ -2319,7 +2434,7 @@ class CheckIn:
                 merged_cookies = {**bootstrap_cookies, **user_cookies}
 
                 # 保存 provider session 缓存
-                _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
+                _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                 print(f"✅ {self.account_name}: Provider session cached for future use")
 
                 # 如果只需要登录信息，直接返回
@@ -2362,7 +2477,7 @@ class CheckIn:
                                 merged_cookies = {**bootstrap_cookies, **user_cookies}
 
                                 # 保存 provider session 缓存
-                                _save_provider_session_cache(provider_cache_path, user_cookies, api_user)
+                                _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                                 print(f"✅ {self.account_name}: Provider session cached for future use")
 
                                 # 如果只需要登录信息，直接返回
@@ -2383,7 +2498,7 @@ class CheckIn:
                             if fallback_result.get("success"):
                                 merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                                 api_user = fallback_result["api_user"]
-                                _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                                _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                                 print(f"✅ {self.account_name}: Browser callback fallback succeeded")
                                 if login_only:
                                     return True, {"cookies": merged_cookies, "api_user": api_user}
@@ -2398,7 +2513,7 @@ class CheckIn:
                         if fallback_result.get("success"):
                             merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                             api_user = fallback_result["api_user"]
-                            _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                            _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                             print(f"✅ {self.account_name}: Browser callback fallback succeeded")
                             if login_only:
                                 return True, {"cookies": merged_cookies, "api_user": api_user}
@@ -2413,7 +2528,7 @@ class CheckIn:
                     if fallback_result.get("success"):
                         merged_cookies = {**bootstrap_cookies, **fallback_result["cookies"]}
                         api_user = fallback_result["api_user"]
-                        _save_provider_session_cache(provider_cache_path, fallback_result["cookies"], api_user)
+                        _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                         print(f"✅ {self.account_name}: Browser callback fallback succeeded")
                         if login_only:
                             return True, {"cookies": merged_cookies, "api_user": api_user}
@@ -2431,21 +2546,25 @@ class CheckIn:
         """为单个账号执行签到操作，支持多种认证方式"""
         print(f"\n\n⏳ Starting to process {self.account_name}")
 
+        # 解析账号配置
+        cookies_data = self.account_config.cookies
+        github_info = self.account_config.github
+        linuxdo_info = self.account_config.linux_do
+
         waf_cookies = {}
-        if self.provider_config.needs_waf_cookies():
+        should_prefetch_waf_cookies = self.provider_config.needs_waf_cookies() and (bool(cookies_data) or bool(github_info))
+        if should_prefetch_waf_cookies:
             waf_cookies = await self.get_waf_cookies_with_browser()
             if not waf_cookies:
                 print(f"⚠️ {self.account_name}: Unable to get WAF cookies, continuing with empty cookies")
                 waf_cookies = {}  # 确保 waf_cookies 是空字典而不是 None
             else:
                 print(f"✅ {self.account_name}: WAF cookies obtained")
+        elif self.provider_config.needs_waf_cookies():
+            print(f"ℹ️ {self.account_name}: WAF bootstrap deferred for Linux.do flow, will reuse provider/cache first")
         else:
             print(f"ℹ️ {self.account_name}: Bypass WAF not required, using user cookies directly")
 
-        # 解析账号配置
-        cookies_data = self.account_config.cookies
-        github_info = self.account_config.github
-        linuxdo_info = self.account_config.linux_do
         results = []
 
         # 尝试 cookies 认证

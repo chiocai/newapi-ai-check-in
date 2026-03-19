@@ -908,6 +908,9 @@ def should_skip_linuxdo_prewarm_for_batch(batch: dict) -> bool:
 
 def purge_site_auth_caches(storage_dir: str = "storage-states") -> list[str]:
     """清理站点侧登录缓存，保留 Linux.do 预热态，尽量模拟首次运行"""
+    if os.getenv("PURGE_SITE_AUTH_CACHES_PER_BATCH", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return []
+
     if not os.path.isdir(storage_dir):
         return []
 
@@ -1494,6 +1497,15 @@ async def main():
     app_config = AppConfig.load_from_env()
     setattr(app_config, "bypass_toggle_retry_applied", set())
     print(f"⚙️ Loaded {len(app_config.providers)} provider(s)")
+    print(
+        "⚙️ Effective concurrency: "
+        f"accounts={MAX_CONCURRENT_ACCOUNTS}, "
+        f"runtime_discovery={MAX_CONCURRENT_RUNTIME_DISCOVERY}, "
+        f"linuxdo_prewarm={MAX_CONCURRENT_LINUXDO_PRELOGIN}, "
+        f"deferred_retry={MAX_CONCURRENT_DEFERRED_RETRY}, "
+        f"linuxdo_oauth={os.getenv('MAX_CONCURRENT_LINUXDO_OAUTH', os.getenv('MAX_CONCURRENT_ACCOUNTS', '10'))}, "
+        f"serialize_same_linuxdo_oauth={os.getenv('SERIALIZE_SAME_LINUXDO_OAUTH', 'false')}"
+    )
 
     # 检查账号配置
     if not app_config.accounts:
