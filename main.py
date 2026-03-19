@@ -47,7 +47,10 @@ RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS = {"anyrouter", "x666"}
 MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "10")))  # 最大并发账号数
 MAX_CONCURRENT_RUNTIME_DISCOVERY = max(1, int(os.getenv("MAX_CONCURRENT_RUNTIME_DISCOVERY", "10")))  # 运行时自动发现最大并发数
 MAX_CONCURRENT_LINUXDO_PRELOGIN = max(1, int(os.getenv("MAX_CONCURRENT_LINUXDO_PRELOGIN", "2")))  # LinuxDo 预登录最大并发数
-MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
+MAX_FAILED_RETRY_ROUNDS = max(0, int(os.getenv("MAX_FAILED_RETRY_ROUNDS", "1")))  # 主流程完成后的普通失败补跑轮次
+MAX_DEFERRED_RETRY_ROUNDS = max(0, int(os.getenv("MAX_DEFERRED_RETRY_ROUNDS", "1")))  # 慢错误延后补跑轮次
+MAX_CONCURRENT_DEFERRED_RETRY = max(1, int(os.getenv("MAX_CONCURRENT_DEFERRED_RETRY", "1")))  # 慢错误补跑并发
+DEFERRED_RETRY_DELAY_SECONDS = max(0, int(os.getenv("DEFERRED_RETRY_DELAY_SECONDS", "0")))  # 慢错误补跑前等待秒数
 LINUXDO_BACKOFF_RETRY_DELAYS = tuple(
     int(item.strip())
     for item in os.getenv("LINUXDO_BACKOFF_RETRY_DELAYS", "60,180").split(",")
@@ -57,6 +60,18 @@ LINUXDO_PREWARM_ALERT_ERROR_TYPES = {
     "linuxdo_prewarmed_state_missing",
     "linuxdo_prewarmed_state_invalid",
     "linuxdo_redirect_login",
+}
+DEFERRED_RETRY_ERROR_TYPES = {
+    "linuxdo_cloudflare_challenge",
+    "linuxdo_auth_state_failed",
+    "linuxdo_signin_failed",
+    "linuxdo_authorization_failed",
+    "linuxdo_allow_button_not_found",
+    "linuxdo_oauth_no_code",
+    "linuxdo_sso_provider_stuck",
+    "linuxdo_redirect_login",
+    "linuxdo_page_navigation_error",
+    "linuxdo_authorization_navigation_failed",
 }
 
 
@@ -637,9 +652,6 @@ def should_skip_failed_retry(result: dict) -> bool:
 
     error_type = result.get("error_type", "")
     if error_type in {
-        "linuxdo_high_load",
-        "linuxdo_sso_provider_stuck",
-        "linuxdo_redirect_login",
         "linuxdo_prewarmed_state_missing",
         "linuxdo_prewarmed_state_invalid",
         "linuxdo_circuit_open",
@@ -652,10 +664,9 @@ def should_skip_failed_retry(result: dict) -> bool:
         if value
     ).lower()
     skip_indicators = [
-        "高负载",
-        "too many requests",
-        "sso 卡住",
-        "sso provider page is stuck",
+        "缺少预热态",
+        "预热态失效",
+        "oauth 熔断",
     ]
     return any(indicator in error_text for indicator in skip_indicators)
 
@@ -710,6 +721,73 @@ def collect_linuxdo_backoff_retry_indices_for_candidates(account_results: list, 
         if should_enable_linuxdo_backoff_retry(account_results[index]):
             retry_indices.append(index)
     return retry_indices
+
+
+def should_defer_failed_retry(result: dict) -> bool:
+    """判断失败结果是否应延后到主流程完成后再补跑"""
+    if not isinstance(result, dict) or result.get("success"):
+        return False
+    if should_skip_failed_retry(result):
+        return False
+
+    error_type = result.get("error_type", "")
+    if error_type in DEFERRED_RETRY_ERROR_TYPES:
+        return True
+
+    error_text = " ".join(
+        str(value)
+        for value in [result.get("error_label"), result.get("error_summary"), result.get("error_detail"), result.get("error")]
+        if value
+    ).lower()
+    deferred_indicators = [
+        "cloudflare",
+        "challenge",
+        "高负载",
+        "sso provider page is stuck",
+        "sso 卡住",
+        "会话失效",
+        "auth state",
+        "oauth",
+        "authorize",
+        "headless",
+        "browser",
+    ]
+    return any(indicator in error_text for indicator in deferred_indicators)
+
+
+def build_final_retry_plan(
+    account_results: list,
+    candidate_indices: list[int] | None = None,
+    already_retried_indices: set[int] | None = None,
+) -> tuple[list[int], list[int]]:
+    """基于首轮结果构造最终补跑计划，确保每个账号最多只再补跑一次"""
+    if candidate_indices is None:
+        candidate_indices = list(range(len(account_results)))
+    if already_retried_indices is None:
+        already_retried_indices = set()
+
+    normal_retry_indices = []
+    deferred_retry_indices = []
+    for index in candidate_indices:
+        if not (0 <= index < len(account_results)):
+            continue
+        if index in already_retried_indices:
+            continue
+
+        result = account_results[index]
+        if isinstance(result, Exception):
+            normal_retry_indices.append(index)
+            continue
+        if not isinstance(result, dict) or result.get("success"):
+            continue
+        if should_skip_failed_retry(result):
+            continue
+        if should_defer_failed_retry(result):
+            deferred_retry_indices.append(index)
+        else:
+            normal_retry_indices.append(index)
+
+    return normal_retry_indices, deferred_retry_indices
 
 
 def build_execution_batches(accounts: list, account_indices: list[int] | None = None) -> list[dict]:
@@ -950,7 +1028,7 @@ def collect_linuxdo_oauth_probes_for_indices(app_config: AppConfig, account_indi
         "anyrouter": 0,
         "x666": 1,
     }
-    max_probe_count = max(1, int(os.getenv("MAX_LINUXDO_PREWARM_PROBES", "3")))
+    max_probe_count = max(1, int(os.getenv("MAX_LINUXDO_PREWARM_PROBES", "1")))
     for username, probes in probes_by_username.items():
         ordered_probes = sorted(
             probes,
@@ -1184,15 +1262,7 @@ def apply_bypass_runtime_overrides_for_failed_accounts(account_results: list, ap
 
 async def rerun_failed_accounts_once(account_results: list, app_config, semaphore: asyncio.Semaphore) -> list:
     """对失败账号补跑一轮，并用补跑结果覆盖原结果"""
-    failed_indices = [
-        index
-        for index in collect_failed_account_indices(account_results)
-        if not (
-            index < len(account_results)
-            and isinstance(account_results[index], dict)
-            and should_skip_failed_retry(account_results[index])
-        )
-    ]
+    failed_indices, _ = build_final_retry_plan(account_results)
 
     skipped_retry_indices = [
         index
@@ -1222,17 +1292,14 @@ async def rerun_failed_accounts_once_for_candidates(
     semaphore: asyncio.Semaphore,
     candidate_indices: list[int],
     retry_reason: str,
+    already_retried_indices: set[int] | None = None,
 ) -> list:
     """仅对指定批次中的失败账号补跑一轮"""
-    failed_indices = [
-        index
-        for index in collect_failed_account_indices_for_candidates(account_results, candidate_indices)
-        if not (
-            index < len(account_results)
-            and isinstance(account_results[index], dict)
-            and should_skip_failed_retry(account_results[index])
-        )
-    ]
+    failed_indices, _ = build_final_retry_plan(
+        account_results,
+        candidate_indices,
+        already_retried_indices=already_retried_indices,
+    )
 
     skipped_retry_indices = [
         index
@@ -1299,6 +1366,47 @@ async def rerun_selected_accounts(
             recovered_count += 1
 
     print(f"✅ {retry_reason} finished, recovered {recovered_count}/{len(failed_indices)} account(s)")
+    return account_results
+
+
+async def rerun_deferred_accounts_once(
+    account_results: list,
+    app_config,
+    candidate_indices: list[int],
+    already_retried_indices: set[int],
+) -> list:
+    """将慢错误账号延后到主流程完成后统一补跑一次"""
+    _, deferred_retry_indices = build_final_retry_plan(
+        account_results,
+        candidate_indices,
+        already_retried_indices=already_retried_indices,
+    )
+    if not deferred_retry_indices:
+        print("ℹ️ Deferred retry stage: no slow-failure accounts to retry")
+        return account_results
+
+    print(
+        f"\n🕓 Deferred retry stage: retrying {len(deferred_retry_indices)} slow-failure account(s) "
+        "after the main flow"
+    )
+    if DEFERRED_RETRY_DELAY_SECONDS > 0:
+        print(f"⏳ Deferred retry stage: waiting {DEFERRED_RETRY_DELAY_SECONDS}s before retry")
+        await asyncio.sleep(DEFERRED_RETRY_DELAY_SECONDS)
+
+    await prewarm_linuxdo_sessions(
+        app_config,
+        account_indices=deferred_retry_indices,
+        reason="Pre-logging in for deferred retry stage",
+    )
+    deferred_semaphore = asyncio.Semaphore(min(MAX_CONCURRENT_DEFERRED_RETRY, MAX_CONCURRENT_ACCOUNTS))
+    account_results = await rerun_selected_accounts(
+        account_results,
+        app_config,
+        deferred_semaphore,
+        deferred_retry_indices,
+        retry_reason="Deferred retry stage",
+    )
+    already_retried_indices.update(deferred_retry_indices)
     return account_results
 
 
@@ -1433,6 +1541,7 @@ async def main():
     for index, skip_result in recent_success_skip_results.items():
         account_results[index] = skip_result
     prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
+    retried_account_indices: set[int] = set()
 
     for batch_index, batch in enumerate(execution_batches, start=1):
         batch_indices = batch["indices"]
@@ -1472,44 +1581,74 @@ async def main():
         for index, result in zip(batch_indices, batch_results):
             account_results[index] = result
 
-        for backoff_round, delay_seconds in enumerate(LINUXDO_BACKOFF_RETRY_DELAYS, start=1):
-            retry_indices = collect_linuxdo_backoff_retry_indices_for_candidates(account_results, batch_indices)
-            if not retry_indices:
-                break
+        if batch_index < len(execution_batches):
+            clear_linuxdo_runtime_state(f"after batch {batch_index}/{len(execution_batches)} [{batch_label}]")
 
+    if MAX_FAILED_RETRY_ROUNDS > 0:
+        clear_linuxdo_runtime_state("before final normal retry phase")
+        for retry_round in range(1, MAX_FAILED_RETRY_ROUNDS + 1):
+            normal_retry_indices, _ = build_final_retry_plan(
+                account_results,
+                runnable_indices,
+                already_retried_indices=retried_account_indices,
+            )
+            if not normal_retry_indices:
+                break
             print(
-                f"⏳ Linux.do backoff retry round {backoff_round}/{len(LINUXDO_BACKOFF_RETRY_DELAYS)} "
-                f"for batch {batch_label}: {len(retry_indices)} account(s) will retry after {delay_seconds}s"
+                f"\n🔁 Final normal retry round {retry_round}/{MAX_FAILED_RETRY_ROUNDS}: "
+                f"{len(normal_retry_indices)} account(s)"
             )
-            await prewarm_linuxdo_sessions(
-                app_config,
-                account_indices=retry_indices,
-                reason=f"Linux.do warm-up before backoff retry round {backoff_round} [{batch_label}]",
-            )
-            await asyncio.sleep(delay_seconds)
             account_results = await rerun_selected_accounts(
                 account_results,
                 app_config,
                 semaphore,
-                retry_indices,
-                retry_reason=f"Linux.do backoff retry round {backoff_round} [{batch_label}]",
+                normal_retry_indices,
+                retry_reason=f"Final normal retry round {retry_round}",
             )
+            retried_account_indices.update(normal_retry_indices)
 
-        for retry_round in range(MAX_FAILED_RETRY_ROUNDS):
-            failed_indices = collect_failed_account_indices_for_candidates(account_results, batch_indices)
-            if not failed_indices:
+    if MAX_DEFERRED_RETRY_ROUNDS > 0:
+        deferred_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DEFERRED_RETRY)
+        clear_linuxdo_runtime_state("before deferred slow retry phase")
+        deferred_cleared_site_caches = purge_site_auth_caches()
+        if deferred_cleared_site_caches:
+            print(
+                f"🧹 Cleared {len(deferred_cleared_site_caches)} site auth cache file(s) "
+                "before deferred slow retry phase"
+            )
+        for retry_round in range(1, MAX_DEFERRED_RETRY_ROUNDS + 1):
+            _, deferred_retry_indices = build_final_retry_plan(
+                account_results,
+                runnable_indices,
+                already_retried_indices=retried_account_indices,
+            )
+            if not deferred_retry_indices:
                 break
-            print(f"ℹ️ Retry round {retry_round + 1}/{MAX_FAILED_RETRY_ROUNDS} for batch {batch_label}")
-            account_results = await rerun_failed_accounts_once_for_candidates(
+            if DEFERRED_RETRY_DELAY_SECONDS > 0:
+                print(
+                    f"⏳ Deferred slow retry round {retry_round}/{MAX_DEFERRED_RETRY_ROUNDS}: "
+                    f"waiting {DEFERRED_RETRY_DELAY_SECONDS}s before retrying {len(deferred_retry_indices)} account(s)"
+                )
+                await asyncio.sleep(DEFERRED_RETRY_DELAY_SECONDS)
+            else:
+                print(
+                    f"\n🐢 Deferred slow retry round {retry_round}/{MAX_DEFERRED_RETRY_ROUNDS}: "
+                    f"{len(deferred_retry_indices)} account(s)"
+                )
+
+            await prewarm_linuxdo_sessions(
+                app_config,
+                account_indices=deferred_retry_indices,
+                reason=f"Pre-logging in for deferred slow retry round {retry_round}",
+            )
+            account_results = await rerun_selected_accounts(
                 account_results,
                 app_config,
-                semaphore,
-                batch_indices,
-                retry_reason=f"Retrying failed account(s) once [{batch_label}]",
+                deferred_semaphore,
+                deferred_retry_indices,
+                retry_reason=f"Deferred slow retry round {retry_round}",
             )
-
-        if batch_index < len(execution_batches):
-            clear_linuxdo_runtime_state(f"after batch {batch_index}/{len(execution_batches)} [{batch_label}]")
+            retried_account_indices.update(deferred_retry_indices)
 
     recent_success_state = update_recent_success_state_from_results(
         recent_success_state,

@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from utils.browser_utils import (
     wait_for_linuxdo_login_ready,
 )
 from utils.config import ProviderConfig
+from utils.debug_flags import linuxdo_auth_debug_enabled
 
 if TYPE_CHECKING:
     from utils.linuxdo_session import LinuxDoSession
@@ -34,14 +36,19 @@ TIMEOUT_CLOUDFLARE = 90000  # Cloudflare 验证超时
 TIMEOUT_NAVIGATION = 45000  # 导航超时
 
 # 重试配置
-MAX_RETRIES = 3  # 最大重试次数
+MAX_RETRIES = 2  # 最大重试次数
 RETRY_DELAY = 3  # 重试间隔（秒）
 MAX_CONCURRENT_LINUXDO_OAUTH = max(
     1,
-    int(os.getenv("MAX_CONCURRENT_LINUXDO_OAUTH", "1"))
+    int(os.getenv("MAX_CONCURRENT_LINUXDO_OAUTH", "2"))
 )  # Linux.do OAuth 浏览器流程最大并发数
+MAX_LINUXDO_FLOW_ROUNDS = max(
+    1,
+    int(os.getenv("MAX_LINUXDO_FLOW_ROUNDS", "2"))
+)  # 单次 OAuth 浏览器流程内部最大回合数
 
 _linuxdo_signin_semaphore: asyncio.Semaphore | None = None
+_linuxdo_signin_account_locks: dict[str, asyncio.Lock] = {}
 REDIRECT_ASSIGN_RE = re.compile(
     r"""(?:window\.)?location(?:\.href|\.assign|\.replace)?\s*(?:=|\()\s*['"]([^'"]+)['"]""",
     re.IGNORECASE,
@@ -60,6 +67,14 @@ def get_linuxdo_signin_semaphore() -> asyncio.Semaphore:
     if _linuxdo_signin_semaphore is None:
         _linuxdo_signin_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LINUXDO_OAUTH)
     return _linuxdo_signin_semaphore
+
+
+def get_linuxdo_signin_account_lock(username: str) -> asyncio.Lock:
+    """按 Linux.do 用户名串行化 OAuth 浏览器流程，避免同账号并发踩状态"""
+    username_hash = hashlib.sha256(username.encode('utf-8')).hexdigest()[:8]
+    if username_hash not in _linuxdo_signin_account_locks:
+        _linuxdo_signin_account_locks[username_hash] = asyncio.Lock()
+    return _linuxdo_signin_account_locks[username_hash]
 
 
 def _get_github_skip_prewarm_slot_labels() -> set[str]:
@@ -244,12 +259,13 @@ class LinuxDoSignIn:
         """
         try:
             async with get_linuxdo_signin_semaphore():
-                return await self._signin_impl(
-                    client_id,
-                    auth_state,
-                    auth_cookies,
-                    cache_file_path,
-                )
+                async with get_linuxdo_signin_account_lock(self.username):
+                    return await self._signin_impl(
+                        client_id,
+                        auth_state,
+                        auth_cookies,
+                        cache_file_path,
+                    )
         except Exception as e:
             error_text = str(e)
             print(f"⚠️ {self.account_name}: Sign-in exception: {error_text}")
@@ -302,7 +318,8 @@ class LinuxDoSignIn:
 
             return 'noop';
         }""")
-        print(f"ℹ️ {self.account_name}: Linux.do sso_provider handler result: {handled}")
+        if linuxdo_auth_debug_enabled():
+            print(f"ℹ️ {self.account_name}: Linux.do sso_provider handler result: {handled}")
 
         if handled == "noop":
             try:
@@ -320,7 +337,8 @@ class LinuxDoSignIn:
                     });
                     return 'fetch:' + resp.status + ':' + resp.url;
                 }""")
-                print(f"ℹ️ {self.account_name}: Linux.do sso_provider fetch POST result: {post_result}")
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: Linux.do sso_provider fetch POST result: {post_result}")
             except Exception as fetch_err:
                 print(f"⚠️ {self.account_name}: Linux.do sso_provider fetch POST failed: {fetch_err}")
 
@@ -331,14 +349,15 @@ class LinuxDoSignIn:
                     page.url,
                     self.provider_config.origin,
                 )
-                if redirect_candidates:
+                if redirect_candidates and linuxdo_auth_debug_enabled():
                     print(
                         f"ℹ️ {self.account_name}: Linux.do sso_provider extracted redirect candidates: "
                         f"{redirect_candidates[:3]}"
                     )
                 for redirect_target in redirect_candidates[:3]:
                     try:
-                        print(f"ℹ️ {self.account_name}: Trying extracted redirect target: {redirect_target}")
+                        if linuxdo_auth_debug_enabled():
+                            print(f"ℹ️ {self.account_name}: Trying extracted redirect target: {redirect_target}")
                         await page.goto(redirect_target, wait_until="domcontentloaded", timeout=TIMEOUT_NAVIGATION)
                         await page.wait_for_timeout(1500)
                         if "linux.do/session/sso_provider" not in page.url:
@@ -359,7 +378,8 @@ class LinuxDoSignIn:
                 await page.wait_for_timeout(2000)
 
         current_url = page.url
-        print(f"ℹ️ {self.account_name}: URL after Linux.do sso_provider handler: {current_url}")
+        if linuxdo_auth_debug_enabled():
+            print(f"ℹ️ {self.account_name}: URL after Linux.do sso_provider handler: {current_url}")
         if "linux.do/session/sso_provider" in current_url:
             await save_page_content_to_file(page, "linuxdo_sso_provider_stuck", self.account_name, prefix="linuxdo")
             await take_screenshot(page, "linuxdo_sso_provider_stuck", self.account_name)
@@ -494,7 +514,8 @@ class LinuxDoSignIn:
                     await page.wait_for_timeout(3000)
 
                 current_url = page.url
-                print(f"ℹ️ {self.account_name}: Reference-style fallback OAuth URL: {current_url}")
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: Reference-style fallback OAuth URL: {current_url}")
 
                 if "linux.do/session/sso_provider" in current_url:
                     current_url = await self._handle_sso_provider_page(page)
@@ -512,7 +533,8 @@ class LinuxDoSignIn:
                         f"Reference-style fallback redirected back to LinuxDo login page: {page.url}",
                     )
 
-                print(f"ℹ️ {self.account_name}: Waiting for authorization button in reference-style fallback...")
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: Waiting for authorization button in reference-style fallback...")
                 await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_ELEMENT_WAIT)
                 allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
                 if not allow_btn_ele:
@@ -522,7 +544,8 @@ class LinuxDoSignIn:
                         "Reference-style fallback did not find LinuxDo allow button",
                     )
 
-                print(f"ℹ️ {self.account_name}: Clicking authorization button in reference-style fallback...")
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: Clicking authorization button in reference-style fallback...")
                 await allow_btn_ele.click()
                 return await self._extract_authorized_result(page)
             except Exception as e:
@@ -558,12 +581,13 @@ class LinuxDoSignIn:
         except Exception as ready_err:
             guard = await detect_linuxdo_page_guard(page)
             print(f"⚠️ {self.account_name}: Linux.do login form not ready: {ready_err}")
-            print(
-                f"ℹ️ {self.account_name}: Linux.do guard snapshot before fallback login wait -> "
-                f"human_verification={guard.get('human_verification')}, "
-                f"cloudflare_challenge={guard.get('cloudflare_challenge')}, "
-                f"login_form_present={guard.get('login_form_present')}, url={page.url}"
-            )
+            if linuxdo_auth_debug_enabled():
+                print(
+                    f"ℹ️ {self.account_name}: Linux.do guard snapshot before fallback login wait -> "
+                    f"human_verification={guard.get('human_verification')}, "
+                    f"cloudflare_challenge={guard.get('cloudflare_challenge')}, "
+                    f"login_form_present={guard.get('login_form_present')}, url={page.url}"
+                )
             if guard.get("human_verification"):
                 solved = await attempt_linuxdo_human_verification(page, self.account_name)
                 if not solved:
@@ -707,7 +731,7 @@ class LinuxDoSignIn:
                     f"response_type=code&client_id={client_id}&state={auth_state}"
                 )
 
-                max_flow_rounds = 3
+                max_flow_rounds = MAX_LINUXDO_FLOW_ROUNDS
                 for flow_round in range(1, max_flow_rounds + 1):
                     if flow_round > 1:
                         print(f"ℹ️ {self.account_name}: Continuing Linux.do OAuth flow round {flow_round}")
