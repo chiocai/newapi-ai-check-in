@@ -24,6 +24,7 @@ from utils.browser_utils import (
     take_screenshot,
 )
 from utils.config import AccountConfig, ProviderConfig
+from utils.debug_flags import linuxdo_auth_debug_enabled
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
 
@@ -540,8 +541,13 @@ class CheckIn:
 
     def _get_auth_state_browser_entry_urls(self) -> list[str]:
         """返回浏览器获取 auth state 时的页面引导顺序"""
+        login_url = self.provider_config.get_login_url()
         console_url = self.provider_config.get_console_personal_url()
-        return [console_url] if console_url else []
+        urls = []
+        for url in [login_url, console_url]:
+            if url and url not in urls:
+                urls.append(url)
+        return urls
 
     async def _wait_auth_state_page_stable(self, page) -> None:
         """等待 provider 页面基础脚本与运行时状态稳定"""
@@ -583,7 +589,8 @@ class CheckIn:
                 break
 
         if dismissed_labels:
-            print(f"ℹ️ {self.account_name}: Dismissed blocking modal(s): {dismissed_labels}")
+            if linuxdo_auth_debug_enabled():
+                print(f"ℹ️ {self.account_name}: Dismissed blocking modal(s): {dismissed_labels}")
 
         return dismissed_labels
 
@@ -662,10 +669,16 @@ class CheckIn:
         clicked = False
         for attempt in range(1, 3):
             if attempt > 1:
-                print(f"ℹ️ {self.account_name}: LinuxDO continue entry not found, reopening bootstrap page and retrying once")
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: LinuxDO continue entry not found, reopening bootstrap page and retrying once")
                 target_url = entry_url or page.url
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL after retry navigation: {page.url}")
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                except Exception as nav_err:
+                    print(f"⚠️ {self.account_name}: Failed to reopen bootstrap page for LinuxDO continue retry: {nav_err}")
+                    return None
+                if linuxdo_auth_debug_enabled():
+                    print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL after retry navigation: {page.url}")
                 await self._wait_auth_state_page_stable(page)
                 await self._dismiss_known_login_modals(page)
 
@@ -688,7 +701,8 @@ class CheckIn:
                             .slice(0, 10)"""
                     )
                     if visible_buttons:
-                        print(f"ℹ️ {self.account_name}: Current visible button texts: {visible_buttons}")
+                        if linuxdo_auth_debug_enabled():
+                            print(f"ℹ️ {self.account_name}: Current visible button texts: {visible_buttons}")
                 except Exception:
                     pass
 
@@ -698,14 +712,16 @@ class CheckIn:
                     if await button_locator.count():
                         await button_locator.first.click()
                         clicked = True
-                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via role/name '{text}'")
+                        if linuxdo_auth_debug_enabled():
+                            print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via role/name '{text}'")
                         break
 
                     text_button_locator = page.locator(f"button:has-text('{text}')")
                     if await text_button_locator.count():
                         await text_button_locator.first.click()
                         clicked = True
-                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via has-text '{text}'")
+                        if linuxdo_auth_debug_enabled():
+                            print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue button via has-text '{text}'")
                         break
 
                     span_locator = page.locator("span.ml-3").filter(has_text=text)
@@ -718,10 +734,12 @@ class CheckIn:
                         else:
                             await span_locator.first.click()
                         clicked = True
-                        print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue entry via span text '{text}'")
+                        if linuxdo_auth_debug_enabled():
+                            print(f"ℹ️ {self.account_name}: Clicked LinuxDO continue entry via span text '{text}'")
                         break
                 except Exception as click_err:
-                    print(f"⚠️ {self.account_name}: Failed to click LinuxDO continue entry '{text}': {click_err}")
+                    if linuxdo_auth_debug_enabled():
+                        print(f"⚠️ {self.account_name}: Failed to click LinuxDO continue entry '{text}': {click_err}")
 
             if clicked:
                 break
@@ -741,14 +759,18 @@ class CheckIn:
 
         if parsed.netloc == "connect.linux.do" and parsed.path.startswith("/oauth2/authorize") and state:
             cookies = await browser.cookies()
-            print(f"ℹ️ {self.account_name}: Captured auth state from LinuxDO continue entry: {state}")
+            if linuxdo_auth_debug_enabled():
+                print(f"ℹ️ {self.account_name}: Captured auth state from LinuxDO continue entry: {state}")
             return {
                 "success": True,
                 "state": state,
                 "cookies": cookies,
+                "auth_state_via_browser": True,
+                "auth_state_strategy": "linuxdo_continue",
             }
 
-        print(f"⚠️ {self.account_name}: LinuxDO continue entry did not land on connect authorize page: {current_url}")
+        if linuxdo_auth_debug_enabled():
+            print(f"⚠️ {self.account_name}: LinuxDO continue entry did not land on connect authorize page: {current_url}")
         return None
 
     async def _click_linuxdo_continue_via_login_then_console(self, page, browser) -> dict | None:
@@ -758,14 +780,16 @@ class CheckIn:
         if not login_url or not console_url or login_url == console_url:
             return None
 
-        print(f"ℹ️ {self.account_name}: LinuxDO continue entry missing, trying login -> console/personal fallback")
+        if linuxdo_auth_debug_enabled():
+            print(f"ℹ️ {self.account_name}: LinuxDO continue entry missing, trying login -> console/personal fallback")
 
         for step_label, target_url in [
             ("login", login_url),
             ("console/personal", console_url),
         ]:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-            print(f"ℹ️ {self.account_name}: Auth-state fallback step {step_label} current URL: {page.url}")
+            if linuxdo_auth_debug_enabled():
+                print(f"ℹ️ {self.account_name}: Auth-state fallback step {step_label} current URL: {page.url}")
             await self._wait_auth_state_page_stable(page)
             await self._dismiss_known_login_modals(page)
 
@@ -778,6 +802,12 @@ class CheckIn:
     def _should_run_auth_state_browser_headful(self) -> bool:
         """是否以有头模式运行 auth-state 调试浏览器"""
         return os.getenv("LINUXDO_AUTH_STATE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _should_force_ui_click_for_auth_state(self, force_ui_click: bool) -> bool:
+        """判断当前站点是否应始终保留页面 LinuxDO 授权链路"""
+        # anyrouter 已验证依赖前端按钮点击来初始化 provider 侧会话，
+        # 这里保留历史行为，避免被通用 fetch state 逻辑改变。
+        return force_ui_click or self.provider_config.name == "anyrouter"
 
     def _should_retry_linuxdo_oauth_once(self, error_payload: dict | None) -> bool:
         """判断是否应重新获取 state 并再走一次 Linux.do OAuth"""
@@ -858,12 +888,11 @@ class CheckIn:
         elif os.path.exists(shared_path):
             os.remove(shared_path)
 
-    async def get_auth_state_with_browser(self) -> dict:
+    async def get_auth_state_with_browser(self, force_ui_click: bool = False) -> dict:
         """使用 Camoufox 获取认证 URL 和 cookies
 
         Args:
-            status: 要存储到 localStorage 的状态数据
-            wait_for_url: 要等待的 URL 模式
+            force_ui_click: 是否跳过直接 fetch state，强制改走页面 LinuxDO 按钮链路
 
         Returns:
             包含 success、url、cookies 或 error 的字典
@@ -871,6 +900,7 @@ class CheckIn:
         print(
             f"ℹ️ {self.account_name}: Starting browser to get auth state (using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
         )
+        effective_force_ui_click = self._should_force_ui_click_for_auth_state(force_ui_click)
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_auth_") as tmp_dir:
             print(f"ℹ️ {self.account_name}: Using temporary directory: {tmp_dir}")
@@ -892,55 +922,85 @@ class CheckIn:
                 try:
                     if linuxdo_storage_state and linuxdo_storage_state.get("cookies"):
                         await browser.add_cookies(linuxdo_storage_state.get("cookies", []))
-                        print(
-                            f"ℹ️ {self.account_name}: Injected {len(linuxdo_storage_state.get('cookies', []))} "
-                            "LinuxDo cookie(s) into auth-state browser"
-                        )
+                        if linuxdo_auth_debug_enabled():
+                            print(
+                                f"ℹ️ {self.account_name}: Injected {len(linuxdo_storage_state.get('cookies', []))} "
+                                "LinuxDo cookie(s) into auth-state browser"
+                            )
 
                     last_response = None
+                    last_error = None
                     entry_urls = self._get_auth_state_browser_entry_urls()
 
                     for index, entry_url in enumerate(entry_urls, start=1):
-                        print(
-                            f"ℹ️ {self.account_name}: Opening auth-state bootstrap page "
-                            f"{index}/{len(entry_urls)} -> {entry_url}"
-                        )
-                        await page.goto(entry_url, wait_until="domcontentloaded")
-                        print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL: {page.url}")
-                        await self._wait_auth_state_page_stable(page)
-                        await self._dismiss_known_login_modals(page)
+                        try:
+                            print(
+                                f"ℹ️ {self.account_name}: Opening auth-state bootstrap page "
+                                f"{index}/{len(entry_urls)} -> {entry_url}"
+                            )
+                            await page.goto(entry_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
+                            if linuxdo_auth_debug_enabled():
+                                print(f"ℹ️ {self.account_name}: Auth-state bootstrap current URL: {page.url}")
+                            await self._wait_auth_state_page_stable(page)
+                            await self._dismiss_known_login_modals(page)
 
-                        if self.provider_config.aliyun_captcha:
-                            captcha_check = await aliyun_captcha_check(page, self.account_name)
-                            if captcha_check:
-                                await page.wait_for_timeout(3000)
+                            if self.provider_config.aliyun_captcha:
+                                captcha_check = await aliyun_captcha_check(page, self.account_name)
+                                if captcha_check:
+                                    await page.wait_for_timeout(3000)
 
-                        clicked_auth_state = await self._click_linuxdo_continue_and_capture_auth_state(page, browser, entry_url)
-                        if not clicked_auth_state:
-                            clicked_auth_state = await self._click_linuxdo_continue_via_login_then_console(page, browser)
-                        if clicked_auth_state:
-                            return clicked_auth_state
+                            # 默认优先在当前页面内直接 fetch auth state，减少对前端按钮文案/DOM 的依赖。
+                            # 如果上一轮已经拿到 state 但 authorize 仍失败，外层会将 force_ui_click 置为 True，
+                            # 此时本轮跳过 fetch，直接改走页面 LinuxDO 按钮链路。
+                            # anyrouter 需要保留原有页面授权，因此也会强制走按钮链路。
+                            if not effective_force_ui_click:
+                                response = await self._fetch_auth_state_in_browser_context(page)
+                                last_response = response
+                                response_payload = response.get("payload") or {}
 
-                        response = await self._fetch_auth_state_in_browser_context(page)
-                        last_response = response
-                        response_payload = response.get("payload") or {}
+                                if response_payload.get("success") and "data" in response_payload:
+                                    cookies = await browser.cookies()
+                                    return {
+                                        "success": True,
+                                        "state": response_payload.get("data"),
+                                        "cookies": cookies,
+                                        "auth_state_via_browser": True,
+                                        "auth_state_strategy": "fetch",
+                                    }
 
-                        if response_payload.get("success") and "data" in response_payload:
-                            cookies = await browser.cookies()
-                            return {
-                                "success": True,
-                                "state": response_payload.get("data"),
-                                "cookies": cookies,
-                            }
+                                if linuxdo_auth_debug_enabled():
+                                    print(
+                                        f"⚠️ {self.account_name}: Browser auth state fetch via {entry_url} failed: "
+                                        f"status={response.get('status')}, text={response.get('text')}"
+                                    )
+                            else:
+                                if linuxdo_auth_debug_enabled():
+                                    print(
+                                        f"ℹ️ {self.account_name}: Force LinuxDO continue button flow for auth state retry via "
+                                        f"{entry_url}"
+                                    )
 
-                        print(
-                            f"⚠️ {self.account_name}: Browser auth state fetch via {entry_url} failed: "
-                            f"status={response.get('status')}, text={response.get('text')}"
-                        )
+                            clicked_auth_state = await self._click_linuxdo_continue_and_capture_auth_state(
+                                page, browser, entry_url
+                            )
+                            if not clicked_auth_state:
+                                clicked_auth_state = await self._click_linuxdo_continue_via_login_then_console(
+                                    page, browser
+                                )
+                            if clicked_auth_state:
+                                return clicked_auth_state
+                        except Exception as entry_err:
+                            last_error = f"{entry_url}: {entry_err}"
+                            print(f"⚠️ {self.account_name}: Auth-state bootstrap via {entry_url} failed: {entry_err}")
+                            continue
 
+                    if last_error and last_response is None:
+                        error_detail = last_error
+                    else:
+                        error_detail = json.dumps(last_response, ensure_ascii=False, indent=2)
                     return {
                         "success": False,
-                        "error": f"Failed to get state, \n{json.dumps(last_response, ensure_ascii=False, indent=2)}",
+                        "error": f"Failed to get state, \n{error_detail}",
                     }
 
                 except Exception as e:
@@ -954,11 +1014,12 @@ class CheckIn:
         self,
         client: httpx.Client,
         headers: dict,
+        force_browser_ui_click: bool = False,
     ) -> dict:
         """获取认证状态"""
         async def fallback_to_browser(reason: str) -> dict:
             print(f"⚠️ {self.account_name}: HTTP auth state failed ({reason}), fallback to browser auth state")
-            auth_result = await self.get_auth_state_with_browser()
+            auth_result = await self.get_auth_state_with_browser(force_ui_click=force_browser_ui_click)
             if auth_result.get("success"):
                 return auth_result
             error_msg = auth_result.get("error", "Unknown error")
@@ -1736,7 +1797,12 @@ class CheckIn:
                     else:
                         error_msg = checkin_result.get("error", "New-API checkin failed")
                         print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
-                        # 签到失败不阻止后续流程，只记录错误
+                        if self.provider_config.name != "anyrouter":
+                            print(
+                                f"⚠️ {self.account_name}: New-API HTTP checkin failed, "
+                                "will fallback to browser mode in this run"
+                            )
+                            do_browser_checkin = True
 
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
@@ -1792,6 +1858,25 @@ class CheckIn:
                 user_info = await self.get_user_info_with_browser(auth_cookies_list, api_user, do_checkin=do_browser_checkin)
             else:
                 user_info = await self.get_user_info(client, headers)
+                if do_browser_checkin or not (user_info and user_info.get("success")):
+                    fallback_reason = "check-in fallback" if do_browser_checkin else "HTTP user info failed"
+                    print(f"⚠️ {self.account_name}: {fallback_reason}, trying browser mode")
+                    auth_cookies_list = []
+                    parsed_domain = urlparse(self.provider_config.origin).netloc
+                    for name, value in cookies.items():
+                        auth_cookies_list.append({
+                            "name": name,
+                            "value": value,
+                            "domain": parsed_domain,
+                            "path": "/",
+                        })
+                    browser_user_info = await self.get_user_info_with_browser(
+                        auth_cookies_list,
+                        api_user,
+                        do_checkin=do_browser_checkin,
+                    )
+                    if browser_user_info and browser_user_info.get("success"):
+                        user_info = browser_user_info
             if user_info and user_info.get("success"):
                 # 将签到奖励信息添加到 user_info 中
                 if checkin_reward is not None:
@@ -2137,6 +2222,7 @@ class CheckIn:
             auth_state_result = None
             success = False
             result_data = {}
+            force_browser_ui_click = False
 
             for oauth_attempt in range(1, max_oauth_attempts + 1):
                 if oauth_attempt > 1:
@@ -2155,11 +2241,12 @@ class CheckIn:
                 # 如果需要绕过 WAF，使用浏览器获取 auth state
                 if self.provider_config.needs_waf_cookies():
                     print(f"ℹ️ {self.account_name}: Using browser to get auth state (WAF bypass)")
-                    auth_state_result = await self.get_auth_state_with_browser()
+                    auth_state_result = await self.get_auth_state_with_browser(force_ui_click=force_browser_ui_click)
                 else:
                     auth_state_result = await self.get_auth_state(
                         client=client,
                         headers=headers,
+                        force_browser_ui_click=force_browser_ui_click,
                     )
 
                 if auth_state_result and auth_state_result.get("success"):
@@ -2188,6 +2275,14 @@ class CheckIn:
                     break
 
                 if oauth_attempt < max_oauth_attempts and self._should_retry_linuxdo_oauth_once(result_data):
+                    # 首轮如果是浏览器直接 fetch 到 state，但后续 authorize 仍失败，
+                    # 下一轮强制切到页面 LinuxDO 按钮链路，兼容依赖前端点击初始化 provider 会话的站点。
+                    if auth_state_result and auth_state_result.get("auth_state_via_browser") and not force_browser_ui_click:
+                        force_browser_ui_click = True
+                        print(
+                            f"⚠️ {self.account_name}: Browser auth state did not finish Linux.do authorize successfully, "
+                            "next retry will force LinuxDO continue button flow"
+                        )
                     print(
                         f"⚠️ {self.account_name}: Linux.do authorize step failed with "
                         f"{result_data.get('error_type', 'unknown_error')}, will reset cookies/session and retry once"

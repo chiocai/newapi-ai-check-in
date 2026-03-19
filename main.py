@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
 from utils.linuxdo_session import LinuxDoSessionManager
 from utils.notify import notify
+from utils.recent_success_state import load_recent_success_state, save_recent_success_state
 from utils.site_discovery import ensure_runtime_site_overrides, update_runtime_site_override
 
 load_dotenv(override=True)
@@ -37,11 +39,14 @@ elif skipped_from_accounts:
     print(f"ℹ️ Prewarmed storage states already exist locally, skipped {len(skipped_from_accounts)} file(s)")
 
 BALANCE_HASH_FILE = "balance_hash.txt"
+RECENT_SUCCESS_STATE_FILE = os.getenv("RECENT_SUCCESS_STATE_FILE", "storage-states/checkin-success-state.json")
+RECENT_SUCCESS_SKIP_TTL_SECONDS = max(0, int(os.getenv("RECENT_SUCCESS_SKIP_HOURS", "24"))) * 60 * 60
+RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS = {"anyrouter", "x666"}
 
 # 并行处理配置
-MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "1")))  # 最大并发账号数
-MAX_CONCURRENT_RUNTIME_DISCOVERY = max(1, int(os.getenv("MAX_CONCURRENT_RUNTIME_DISCOVERY", "1")))  # 运行时自动发现最大并发数
-MAX_CONCURRENT_LINUXDO_PRELOGIN = max(1, int(os.getenv("MAX_CONCURRENT_LINUXDO_PRELOGIN", "1")))  # LinuxDo 预登录最大并发数
+MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "10")))  # 最大并发账号数
+MAX_CONCURRENT_RUNTIME_DISCOVERY = max(1, int(os.getenv("MAX_CONCURRENT_RUNTIME_DISCOVERY", "10")))  # 运行时自动发现最大并发数
+MAX_CONCURRENT_LINUXDO_PRELOGIN = max(1, int(os.getenv("MAX_CONCURRENT_LINUXDO_PRELOGIN", "2")))  # LinuxDo 预登录最大并发数
 MAX_FAILED_RETRY_ROUNDS = 1  # 全量执行后的失败补跑轮次
 LINUXDO_BACKOFF_RETRY_DELAYS = tuple(
     int(item.strip())
@@ -68,6 +73,182 @@ def generate_balance_hash(balances: dict) -> str:
 
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(balance_json.encode("utf-8")).hexdigest()[:16]
+
+
+def build_account_runtime_identity(account_config, account_index: int) -> str:
+    """构造跨运行稳定的账号标识"""
+    provider_name = account_config.provider or "unknown"
+
+    if account_config.linux_do:
+        username = account_config.linux_do.get("username", "")
+        if username:
+            return f"{provider_name}|linux.do|{username}"
+
+    if account_config.github:
+        username = account_config.github.get("username", "")
+        if username:
+            return f"{provider_name}|github|{username}"
+
+    if account_config.cookies:
+        api_user = str(account_config.api_user or "")
+        if api_user:
+            return f"{provider_name}|cookies|{api_user}"
+
+    access_token = account_config.get("access_token")
+    if access_token:
+        token_hash = hashlib.sha256(str(access_token).encode("utf-8")).hexdigest()[:12]
+        return f"{provider_name}|access_token|{token_hash}"
+
+    return f"{provider_name}|name|{account_config.get_display_name(account_index)}"
+
+
+def should_skip_recent_success(provider_name: str, recent_success_state: dict, identity: str, now_ts: int) -> bool:
+    """判断账号是否应因最近成功而跳过"""
+    if RECENT_SUCCESS_SKIP_TTL_SECONDS <= 0:
+        return False
+    if provider_name in RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS:
+        return False
+
+    accounts_state = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
+    state_entry = accounts_state.get(identity)
+    if not isinstance(state_entry, dict):
+        return False
+
+    last_success_at = int(state_entry.get("last_success_at", 0) or 0)
+    if last_success_at <= 0:
+        return False
+
+    return now_ts - last_success_at < RECENT_SUCCESS_SKIP_TTL_SECONDS
+
+
+def should_track_recent_success(account_config, app_config: AppConfig) -> bool:
+    """判断账号是否应参与最近成功跳过逻辑"""
+    provider_name = account_config.provider
+    if provider_name in RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS:
+        return False
+
+    site_definition = app_config.site_definitions.get(provider_name)
+    if not site_definition:
+        return False
+
+    return site_definition.mode not in {"special", "signed"}
+
+
+def build_recent_success_skip_result(
+    account_index: int,
+    account_config,
+    app_config: AppConfig,
+    state_entry: dict,
+) -> dict:
+    """为 24 小时内已成功的账号构造跳过结果"""
+    account_key = f"account_{account_index + 1}"
+    account_name = account_config.get_display_name(account_index)
+    provider_name = account_config.provider
+    provider_config = app_config.get_provider(provider_name)
+    balances = state_entry.get("balances", {})
+    if not isinstance(balances, dict):
+        balances = {}
+
+    return {
+        "account_key": account_key,
+        "account_name": account_name,
+        "account_index": account_index,
+        "provider": provider_name,
+        "site_origin": provider_config.origin if provider_config else "",
+        "success": True,
+        "status": "skipped_recent_success",
+        "results": [],
+        "balances": copy.deepcopy(balances),
+        "notification": f"⏭️ {account_name}: 24 小时内已成功，跳过本轮",
+        "need_notify": False,
+        "successful_methods": [],
+        "failed_methods": [],
+        "error_summary": None,
+        "success_detail": "24 小时内已成功，跳过本轮",
+        "error_type": None,
+        "error_label": None,
+        "error_detail": None,
+        "error": None,
+    }
+
+
+def collect_recent_success_skip_results(app_config: AppConfig, recent_success_state: dict, now_ts: int) -> dict[int, dict]:
+    """收集应跳过的最近成功账号结果"""
+    skip_results = {}
+    accounts_state = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
+
+    for index, account_config in enumerate(app_config.accounts):
+        if not should_track_recent_success(account_config, app_config):
+            continue
+
+        identity = build_account_runtime_identity(account_config, index)
+        if not should_skip_recent_success(account_config.provider, recent_success_state, identity, now_ts):
+            continue
+
+        state_entry = accounts_state.get(identity, {})
+        skip_results[index] = build_recent_success_skip_result(index, account_config, app_config, state_entry)
+
+    return skip_results
+
+
+def update_recent_success_state_from_results(
+    recent_success_state: dict,
+    account_results: list,
+    app_config: AppConfig,
+    now_ts: int,
+) -> dict:
+    """根据本轮结果刷新最近成功状态"""
+    existing_accounts = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
+    next_accounts = {}
+
+    for index, account_config in enumerate(app_config.accounts):
+        if not should_track_recent_success(account_config, app_config):
+            continue
+
+        identity = build_account_runtime_identity(account_config, index)
+        existing_entry = existing_accounts.get(identity)
+        result = account_results[index] if index < len(account_results) else None
+
+        if isinstance(result, dict) and result.get("success") and result.get("status") != "skipped_recent_success":
+            next_accounts[identity] = {
+                "provider": account_config.provider,
+                "account_name": account_config.get_display_name(index),
+                "site_origin": result.get("site_origin", ""),
+                "last_success_at": now_ts,
+                "balances": copy.deepcopy(result.get("balances", {})),
+                "success_detail": result.get("success_detail"),
+            }
+            continue
+
+        if isinstance(result, dict) and not result.get("success"):
+            continue
+
+        if isinstance(result, dict) and result.get("status") == "skipped_recent_success" and isinstance(existing_entry, dict):
+            carried_entry = copy.deepcopy(existing_entry)
+            carried_entry["provider"] = account_config.provider
+            carried_entry["account_name"] = account_config.get_display_name(index)
+            if result.get("site_origin"):
+                carried_entry["site_origin"] = result.get("site_origin")
+            if result.get("balances"):
+                carried_entry["balances"] = copy.deepcopy(result.get("balances", {}))
+            next_accounts[identity] = carried_entry
+            continue
+
+        if not isinstance(existing_entry, dict):
+            continue
+
+        last_success_at = int(existing_entry.get("last_success_at", 0) or 0)
+        if last_success_at <= 0:
+            continue
+        if now_ts - last_success_at >= RECENT_SUCCESS_SKIP_TTL_SECONDS:
+            continue
+
+        next_accounts[identity] = copy.deepcopy(existing_entry)
+
+    return {
+        "version": 1,
+        "accounts": next_accounts,
+    }
 
 
 def get_error_label(
@@ -531,12 +712,18 @@ def collect_linuxdo_backoff_retry_indices_for_candidates(account_results: list, 
     return retry_indices
 
 
-def build_execution_batches(accounts: list) -> list[dict]:
+def build_execution_batches(accounts: list, account_indices: list[int] | None = None) -> list[dict]:
     """按 Linux.do 用户分批执行账号，优先执行后展开的 Linux.do 账号批次"""
     batches_by_key = {}
     ordered_keys = []
+    selected_indices = list(range(len(accounts))) if account_indices is None else [
+        index
+        for index in account_indices
+        if 0 <= index < len(accounts)
+    ]
 
-    for index, account_config in enumerate(accounts):
+    for index in selected_indices:
+        account_config = accounts[index]
         linuxdo_username = ""
         if account_config.linux_do:
             linuxdo_username = account_config.linux_do.get("username", "")
@@ -783,19 +970,25 @@ async def prewarm_linuxdo_sessions(
     reason: str = "Pre-logging in",
 ) -> dict:
     """预热指定账号范围内的 Linux.do 会话"""
-    selected_indices = list(range(len(app_config.accounts))) if account_indices is None else [
+    accounts = app_config.accounts if hasattr(app_config, "accounts") else list(app_config)
+    global_proxy = getattr(app_config, "global_proxy", None)
+
+    selected_indices = list(range(len(accounts))) if account_indices is None else [
         index
         for index in account_indices
-        if 0 <= index < len(app_config.accounts)
+        if 0 <= index < len(accounts)
     ]
     selected_accounts = [
-        app_config.accounts[index]
+        accounts[index]
         for index in selected_indices
-        if 0 <= index < len(app_config.accounts)
+        if 0 <= index < len(accounts)
     ]
 
     linuxdo_credentials = {}
-    oauth_probes_by_username = collect_linuxdo_oauth_probes_for_indices(app_config, selected_indices)
+    if hasattr(app_config, "accounts"):
+        oauth_probes_by_username = collect_linuxdo_oauth_probes_for_indices(app_config, selected_indices)
+    else:
+        oauth_probes_by_username = {}
 
     for account_config in selected_accounts:
         if not account_config.linux_do:
@@ -808,7 +1001,7 @@ async def prewarm_linuxdo_sessions(
 
         linuxdo_credentials[username] = {
             "password": password,
-            "proxy": account_config.proxy or app_config.global_proxy,
+            "proxy": account_config.proxy or global_proxy,
             "oauth_probes": oauth_probes_by_username.get(username, []),
         }
 
@@ -822,12 +1015,17 @@ async def prewarm_linuxdo_sessions(
     async def prelogin_one(username: str, password: str, proxy, oauth_probes: list[dict]):
         async with prelogin_semaphore:
             try:
+                session_kwargs = {
+                    "proxy": proxy,
+                    "auto_login": True,
+                }
+                if oauth_probes:
+                    session_kwargs["oauth_probes"] = oauth_probes
+
                 session = await LinuxDoSessionManager.get_session(
                     username,
                     password,
-                    proxy=proxy,
-                    auto_login=True,
-                    oauth_probes=oauth_probes,
+                    **session_kwargs,
                 )
                 if getattr(session, "is_logged_in", False):
                     return username, True, None, None
@@ -1202,8 +1400,25 @@ async def main():
 
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
+    now_ts = int(datetime.now().timestamp())
+    recent_success_state = load_recent_success_state(RECENT_SUCCESS_STATE_FILE)
+    recent_success_skip_results = collect_recent_success_skip_results(app_config, recent_success_state, now_ts)
+    runnable_indices = [
+        index
+        for index in range(len(app_config.accounts))
+        if index not in recent_success_skip_results
+    ]
 
-    execution_batches = build_execution_batches(app_config.accounts)
+    if recent_success_skip_results:
+        print(
+            f"⏭️ Skipping {len(recent_success_skip_results)} account(s) that succeeded within "
+            f"the last {RECENT_SUCCESS_SKIP_TTL_SECONDS // 3600} hour(s)"
+        )
+        for index in sorted(recent_success_skip_results):
+            account_name = app_config.accounts[index].get_display_name(index)
+            print(f"  • {account_name}")
+
+    execution_batches = build_execution_batches(app_config.accounts, runnable_indices)
     print(f"⚙️ Built {len(execution_batches)} execution batch(es)")
     for batch_index, batch in enumerate(execution_batches, start=1):
         print(
@@ -1215,6 +1430,8 @@ async def main():
     print(f"\n🚀 Starting batched processing with max {MAX_CONCURRENT_ACCOUNTS} concurrent accounts...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ACCOUNTS)
     account_results: list = [None] * len(app_config.accounts)
+    for index, skip_result in recent_success_skip_results.items():
+        account_results[index] = skip_result
     prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
 
     for batch_index, batch in enumerate(execution_batches, start=1):
@@ -1293,6 +1510,14 @@ async def main():
 
         if batch_index < len(execution_batches):
             clear_linuxdo_runtime_state(f"after batch {batch_index}/{len(execution_batches)} [{batch_label}]")
+
+    recent_success_state = update_recent_success_state_from_results(
+        recent_success_state,
+        account_results,
+        app_config,
+        now_ts,
+    )
+    save_recent_success_state(RECENT_SUCCESS_STATE_FILE, recent_success_state)
 
     # 汇总结果
     current_balances = {}
