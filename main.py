@@ -1207,6 +1207,8 @@ def should_enable_bypass_toggle_retry(result: dict, app_config: AppConfig) -> bo
     site_definition = app_config.site_definitions.get(provider_name)
     if not provider or not site_definition:
         return False
+    if provider_name == "anyrouter":
+        return False
     if site_definition.mode in {"turnstile", "special", "signed"}:
         return False
 
@@ -1247,8 +1249,10 @@ def should_enable_bypass_toggle_retry(result: dict, app_config: AppConfig) -> bo
     return any(indicator in error_text for indicator in bypass_indicators)
 
 
-def get_toggled_bypass_method(provider) -> str | None:
+def get_toggled_bypass_method(provider, site_definition) -> str | None:
     """基于当前 provider 返回切换后的 bypass 配置"""
+    if provider.needs_waf_cookies() and site_definition and site_definition.mode in {"newapi-waf", "manual-waf", "auto-waf"}:
+        return provider.bypass_method
     return None if provider.needs_waf_cookies() else "waf_cookies"
 
 
@@ -1278,10 +1282,13 @@ def apply_bypass_runtime_overrides_for_failed_accounts(account_results: list, ap
             continue
 
         provider = app_config.get_provider(provider_name)
+        site_definition = app_config.site_definitions.get(provider_name)
         if not provider:
             continue
 
-        next_bypass_method = get_toggled_bypass_method(provider)
+        next_bypass_method = get_toggled_bypass_method(provider, site_definition)
+        if next_bypass_method == provider.bypass_method:
+            continue
         overrides = {"bypass_method": next_bypass_method}
         update_runtime_site_override(app_config.runtime_sites_file, provider_name, overrides)
         app_config.update_provider(provider_name, provider.apply_overrides(overrides))

@@ -201,6 +201,46 @@ def should_retry_newapi_checkin_in_browser(error_msg: str) -> bool:
     return any(indicator in normalized for indicator in retry_indicators)
 
 
+def get_linuxdo_frontend_callback_url(provider_config: ProviderConfig, params: dict) -> str:
+    """构造前端 LinuxDo OAuth 回调地址，优先使用 /oauth/linuxdo"""
+    auth_path = provider_config.linuxdo_auth_path or "/api/oauth/linuxdo"
+    if auth_path.startswith("/api/"):
+        frontend_path = auth_path[4:]
+    elif auth_path.startswith("/api"):
+        frontend_path = auth_path[4:] or "/oauth/linuxdo"
+    else:
+        frontend_path = auth_path
+    return str(httpx.URL(f"{provider_config.origin}{frontend_path}").copy_with(params=params))
+
+
+def should_retry_linuxdo_auth_state_failure(error_msg: str) -> bool:
+    """判断 auth state 失败后是否值得再重试一轮完整 OAuth"""
+    normalized = (error_msg or "").lower()
+    non_retry_indicators = [
+        "ns_error_net_timeout",
+        "ns_error_net_interrupt",
+        "unexpected_eof_while_reading",
+        "connection reset",
+        "tlsv1 alert",
+        "certificate verify failed",
+        "name or service not known",
+        "temporary failure in name resolution",
+    ]
+    return not any(indicator in normalized for indicator in non_retry_indicators)
+
+
+def should_try_browser_callback_fallback(original_error_msg: str, frontend_http_error_msg: str | None = None) -> bool:
+    """判断 HTTP callback 失败后是否值得再起浏览器前端 callback 兜底"""
+    merged = " ".join(item for item in [original_error_msg, frontend_http_error_msg] if item).lower()
+    non_retry_indicators = [
+        "无法连接至 linux do 服务器",
+        "state parameter is empty or mismatched",
+        "frontend-first api callback returned no user id",
+        "frontend-first api callback http 403",
+    ]
+    return not any(indicator in merged for indicator in non_retry_indicators)
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -1105,8 +1145,15 @@ class CheckIn:
 
                         print(f"ℹ️ {self.account_name}: Got {len(response.cookies)} cookies from auth state request")
                         for cookie in response.cookies.jar:
-                            http_only = cookie.httponly if cookie.has_nonstandard_attr("httponly") else False
-                            same_site = cookie.samesite if cookie.has_nonstandard_attr("samesite") else "Lax"
+                            http_only = (
+                                cookie.has_nonstandard_attr("HttpOnly")
+                                or cookie.has_nonstandard_attr("httponly")
+                            )
+                            same_site = (
+                                cookie.get_nonstandard_attr("SameSite")
+                                or cookie.get_nonstandard_attr("samesite")
+                                or "Lax"
+                            )
                             print(
                                 f"  📚 Cookie: {cookie.name} (Domain: {cookie.domain}, "
                                 f"Path: {cookie.path}, Expires: {cookie.expires}, "
@@ -1169,6 +1216,40 @@ class CheckIn:
                     except Exception:
                         pass
 
+                response_json = None
+                try:
+                    response_json = await page.evaluate(
+                        """() => {
+                            try {
+                                const text = document.body ? (document.body.innerText || '').trim() : '';
+                                if (!text) return null;
+                                return JSON.parse(text);
+                            } catch (e) {
+                                return null;
+                            }
+                        }"""
+                    )
+                except Exception as e:
+                    print(f"⚠️ {self.account_name}: Browser callback fallback failed to parse JSON body: {e}")
+
+                if isinstance(response_json, dict):
+                    if response_json.get("success") and isinstance(response_json.get("data"), dict):
+                        api_user = response_json.get("data", {}).get("id")
+                        if api_user:
+                            restore_cookies = await page.context.cookies()
+                            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+                            print(f"✅ {self.account_name}: Browser callback fallback got api_user from JSON body: {api_user}")
+                            return {
+                                "success": True,
+                                "api_user": api_user,
+                                "cookies": user_cookies,
+                            }
+
+                    error_msg = response_json.get("message") or response_json.get("error")
+                    if error_msg:
+                        print(f"⚠️ {self.account_name}: Browser callback fallback returned structured error: {error_msg}")
+                        return {"success": False, "error": error_msg}
+
                 api_user = None
                 try:
                     user_data = await page.evaluate("() => localStorage.getItem('user')")
@@ -1194,6 +1275,55 @@ class CheckIn:
             finally:
                 await page.close()
                 await context.close()
+
+    async def complete_linuxdo_callback_with_http_frontend(
+        self,
+        frontend_callback_url: str,
+        api_callback_url: str,
+        headers: dict,
+        auth_cookies: list[dict] | None = None,
+    ) -> dict:
+        """先以纯 HTTP 访问前端 callback，再调用 API callback，兼容依赖前端落 provider session 的站点"""
+        print(f"ℹ️ {self.account_name}: Trying frontend-first HTTP callback flow")
+        client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config, follow_redirects=True)
+        try:
+            if auth_cookies:
+                for cookie_dict in auth_cookies:
+                    cookie_name = cookie_dict.get("name")
+                    cookie_value = cookie_dict.get("value")
+                    cookie_domain = cookie_dict.get("domain") or urlparse(self.provider_config.origin).netloc
+                    cookie_path = cookie_dict.get("path") or "/"
+                    if cookie_name and cookie_value is not None:
+                        client.cookies.set(cookie_name, cookie_value, domain=cookie_domain, path=cookie_path)
+
+            frontend_response = client.get(frontend_callback_url, headers=headers, timeout=30)
+            print(f"ℹ️ {self.account_name}: Frontend callback HTTP {frontend_response.status_code}")
+            api_response = client.get(api_callback_url, headers=headers, timeout=30)
+            if api_response.status_code != 200:
+                return {"success": False, "error": f"Frontend-first API callback HTTP {api_response.status_code}"}
+
+            json_data = response_resolve(api_response, "linuxdo_oauth_callback_frontend_first", self.account_name)
+            if not json_data or not json_data.get("success"):
+                error_msg = json_data.get("message", "Unknown error") if json_data else "Invalid response"
+                return {"success": False, "error": f"Frontend-first API callback failed: {error_msg}"}
+
+            user_data = json_data.get("data", {})
+            api_user = user_data.get("id")
+            if not api_user:
+                return {"success": False, "error": "Frontend-first API callback returned no user ID"}
+
+            user_cookies = {cookie.name: cookie.value for cookie in api_response.cookies.jar}
+            if not user_cookies:
+                user_cookies = {cookie.name: cookie.value for cookie in client.cookies.jar if urlparse(self.provider_config.origin).netloc in cookie.domain}
+
+            print(f"✅ {self.account_name}: Frontend-first HTTP callback got api_user: {api_user}")
+            return {
+                "success": True,
+                "api_user": api_user,
+                "cookies": user_cookies,
+            }
+        finally:
+            client.close()
 
     async def get_user_info_with_browser(
         self, auth_cookies: list[dict], api_user: str | int, do_checkin: bool = False
@@ -2353,8 +2483,8 @@ class CheckIn:
                 print(f"ℹ️ {self.account_name}: Reset provider-side cookies before OAuth attempt {oauth_attempt}")
 
                 # 获取 OAuth 认证状态
-                # 如果需要绕过 WAF，使用浏览器获取 auth state
-                if self.provider_config.needs_waf_cookies():
+                # 除 anyrouter 外，WAF 站点也先尝试 HTTP /api/oauth/state，命中 403/HTML 后再回退浏览器
+                if self.provider_config.needs_waf_cookies() and self.provider_config.name == "anyrouter":
                     print(f"ℹ️ {self.account_name}: Using browser to get auth state (WAF bypass)")
                     auth_state_result = await self.get_auth_state_with_browser(force_ui_click=force_browser_ui_click)
                 else:
@@ -2375,7 +2505,7 @@ class CheckIn:
                         "error_detail": error_msg,
                         "error": f"Failed to get Linux.do auth state: {error_msg}",
                     }
-                    if oauth_attempt < max_oauth_attempts:
+                    if oauth_attempt < max_oauth_attempts and should_retry_linuxdo_auth_state_failure(error_msg):
                         continue
                     return False, result_data
 
@@ -2448,6 +2578,7 @@ class CheckIn:
                 print(f"ℹ️ {self.account_name}: Received OAuth code, calling callback API")
 
                 callback_url = httpx.URL(self.provider_config.get_linuxdo_auth_url()).copy_with(params=result_data)
+                frontend_callback_url = get_linuxdo_frontend_callback_url(self.provider_config, result_data)
                 print(f"ℹ️ {self.account_name}: Callback URL: {callback_url}")
                 try:
                     # 将 Camoufox 格式的 cookies 转换为 httpx 格式
@@ -2491,8 +2622,25 @@ class CheckIn:
                         else:
                             error_msg = json_data.get("message", "Unknown error") if json_data else "Invalid response"
                             print(f"❌ {self.account_name}: OAuth callback failed: {error_msg}")
-                            fallback_result = await self.complete_linuxdo_callback_with_browser(
+                            http_frontend_result = await self.complete_linuxdo_callback_with_http_frontend(
+                                frontend_callback_url,
                                 str(callback_url),
+                                headers,
+                                auth_cookies_list,
+                            )
+                            if http_frontend_result.get("success"):
+                                merged_cookies = {**bootstrap_cookies, **http_frontend_result["cookies"]}
+                                api_user = http_frontend_result["api_user"]
+                                _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
+                                print(f"✅ {self.account_name}: Frontend-first HTTP callback succeeded")
+                                if login_only:
+                                    return True, {"cookies": merged_cookies, "api_user": api_user}
+                                return await self.check_in_with_cookies(merged_cookies, api_user)
+                            frontend_http_error = http_frontend_result.get("error", "")
+                            if not should_try_browser_callback_fallback(error_msg, frontend_http_error):
+                                return False, {"error": f"OAuth callback failed: {error_msg}"}
+                            fallback_result = await self.complete_linuxdo_callback_with_browser(
+                                frontend_callback_url,
                                 auth_state_result.get("cookies", []),
                             )
                             if fallback_result.get("success"):
@@ -2506,8 +2654,28 @@ class CheckIn:
                             return False, {"error": f"OAuth callback failed: {error_msg}"}
                     else:
                         print(f"❌ {self.account_name}: OAuth callback HTTP {response.status_code}")
-                        fallback_result = await self.complete_linuxdo_callback_with_browser(
+                        http_frontend_result = await self.complete_linuxdo_callback_with_http_frontend(
+                            frontend_callback_url,
                             str(callback_url),
+                            headers,
+                            auth_cookies_list,
+                        )
+                        if http_frontend_result.get("success"):
+                            merged_cookies = {**bootstrap_cookies, **http_frontend_result["cookies"]}
+                            api_user = http_frontend_result["api_user"]
+                            _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
+                            print(f"✅ {self.account_name}: Frontend-first HTTP callback succeeded")
+                            if login_only:
+                                return True, {"cookies": merged_cookies, "api_user": api_user}
+                            return await self.check_in_with_cookies(merged_cookies, api_user)
+                        frontend_http_error = http_frontend_result.get("error", "")
+                        if not should_try_browser_callback_fallback(
+                            f"OAuth callback HTTP {response.status_code}",
+                            frontend_http_error,
+                        ):
+                            return False, {"error": f"OAuth callback HTTP {response.status_code}"}
+                        fallback_result = await self.complete_linuxdo_callback_with_browser(
+                            frontend_callback_url,
                             auth_state_result.get("cookies", []),
                         )
                         if fallback_result.get("success"):
@@ -2521,8 +2689,25 @@ class CheckIn:
                         return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: Error calling OAuth callback: {callback_err}")
-                    fallback_result = await self.complete_linuxdo_callback_with_browser(
+                    http_frontend_result = await self.complete_linuxdo_callback_with_http_frontend(
+                        frontend_callback_url,
                         str(callback_url),
+                        headers,
+                        auth_state_result.get("cookies", []),
+                    )
+                    if http_frontend_result.get("success"):
+                        merged_cookies = {**bootstrap_cookies, **http_frontend_result["cookies"]}
+                        api_user = http_frontend_result["api_user"]
+                        _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
+                        print(f"✅ {self.account_name}: Frontend-first HTTP callback succeeded")
+                        if login_only:
+                            return True, {"cookies": merged_cookies, "api_user": api_user}
+                        return await self.check_in_with_cookies(merged_cookies, api_user)
+                    frontend_http_error = http_frontend_result.get("error", "")
+                    if not should_try_browser_callback_fallback(str(callback_err), frontend_http_error):
+                        return False, {"error": f"OAuth callback error: {callback_err}"}
+                    fallback_result = await self.complete_linuxdo_callback_with_browser(
+                        frontend_callback_url,
                         auth_state_result.get("cookies", []),
                     )
                     if fallback_result.get("success"):

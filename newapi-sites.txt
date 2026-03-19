@@ -92,15 +92,14 @@ lsAPI | https://callxyq.xyz | newapi
 Restrain | https://api.925214.xyz |newapi
 Apikey | https://welfare.apikey.cc|newapi
 Embedding | https://router.tumuer.me|newapi
-深夜小站| https://user.dd999.uk|newapi
+深夜小站 | https://user.dd999.uk | newapi
 Lcodex | https://lc.zenscaleai.com|newapi
 高登 | https://huxiaonb.top|newapi
 有名字了| https://api.190269.xyz|newapi
 3w | https://aiapi.3w.cx|newapi
 Compute | https://computetoken.ai|newapi
-Ouuapi | https://api.ouu.ch|newapi
+Ouuapi | https://api.ouu.ch | newapi
 代码花园 | https://api.missblog.net|newapi
 蒸蚌 | https://laoxi.ethan010203.online|newapi
-
 
 
