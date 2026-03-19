@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from html import unescape
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -25,6 +26,11 @@ from utils.browser_utils import (
 )
 from utils.config import ProviderConfig
 from utils.debug_flags import linuxdo_auth_debug_enabled
+from utils.linuxdo_connect_executor import (
+	LinuxDoConnectExecutorManager,
+	linuxdo_connect_executor_enabled,
+	linuxdo_signin_check_html_enabled,
+)
 
 if TYPE_CHECKING:
     from utils.linuxdo_session import LinuxDoSession
@@ -34,6 +40,10 @@ TIMEOUT_PAGE_LOAD = 60000  # 页面加载超时
 TIMEOUT_ELEMENT_WAIT = 45000  # 元素等待超时
 TIMEOUT_CLOUDFLARE = 90000  # Cloudflare 验证超时
 TIMEOUT_NAVIGATION = 45000  # 导航超时
+TIMEOUT_CONNECT_EXECUTOR_PAGE_LOAD = max(1000, int(os.getenv('TIMEOUT_CONNECT_EXECUTOR_PAGE_LOAD', '20000')))
+TIMEOUT_CONNECT_EXECUTOR_CHALLENGE = max(1000, int(os.getenv('TIMEOUT_CONNECT_EXECUTOR_CHALLENGE', '60000')))
+TIMEOUT_CONNECT_EXECUTOR_CAPTURE = max(1000, int(os.getenv('TIMEOUT_CONNECT_EXECUTOR_CAPTURE', '10000')))
+TIMEOUT_CONNECT_EXECUTOR_APPROVE_WAIT = max(1000, int(os.getenv('TIMEOUT_CONNECT_EXECUTOR_APPROVE_WAIT', '15000')))
 
 # 重试配置
 MAX_RETRIES = 2  # 最大重试次数
@@ -59,6 +69,7 @@ META_REFRESH_RE = re.compile(
 )
 HREF_ACTION_RE = re.compile(r"""(?:href|action)=['"]([^'"]+)['"]""", re.IGNORECASE)
 ABS_URL_RE = re.compile(r"""https?://[^\s"'<>]+""", re.IGNORECASE)
+APPROVE_HREF_RE = re.compile(r"""href=["']([^"']*/oauth2/approve/[^"']+)["']""", re.IGNORECASE)
 
 
 def get_linuxdo_signin_semaphore() -> asyncio.Semaphore:
@@ -123,6 +134,27 @@ def _build_linuxdo_error(error_type: str, error_summary: str, error_detail: str 
         if value is not None:
             payload[key] = value
     return payload
+
+
+def _extract_provider_callback_query(url: str, provider_origin: str) -> dict | None:
+    """从 provider 回调 URL 中提取 code/state"""
+    parsed_provider = urlparse(provider_origin)
+    parsed_url = urlparse(url or '')
+    if not parsed_provider.netloc or parsed_url.netloc != parsed_provider.netloc:
+        return None
+
+    query_params = parse_qs(parsed_url.query)
+    if 'code' not in query_params:
+        return None
+    return query_params
+
+
+def _extract_approve_url(current_url: str, html: str) -> str | None:
+    """从授权页 HTML 中提取允许链接"""
+    match = APPROVE_HREF_RE.search(html or '')
+    if not match:
+        return None
+    return urljoin(current_url, match.group(1))
 
 
 def _extract_sso_provider_redirect_candidates(html: str, current_url: str, provider_origin: str) -> list[str]:
@@ -428,6 +460,269 @@ class LinuxDoSignIn:
             self.shared_session._storage_state = current_state
         return current_state
 
+    async def _register_provider_callback_capture(self, context):
+        """注册 provider 回调请求拦截，尽量在页面真正加载前截获 code/state"""
+        provider_pattern = f"**://{urlparse(self.provider_config.origin).netloc}/**"
+        callback_future = asyncio.get_running_loop().create_future()
+
+        async def handler(route, request):
+            callback_query = _extract_provider_callback_query(request.url, self.provider_config.origin)
+            if callback_query:
+                if not callback_future.done():
+                    callback_future.set_result(callback_query)
+                try:
+                    await route.abort()
+                except Exception:
+                    try:
+                        await route.fulfill(status=204, body='')
+                    except Exception:
+                        pass
+                return
+
+            if callback_future.done():
+                try:
+                    await route.abort()
+                    return
+                except Exception:
+                    pass
+
+            await route.continue_()
+
+        await context.route(provider_pattern, handler)
+        return provider_pattern, handler, callback_future
+
+    async def _authorize_via_connect_executor(
+        self,
+        storage_state,
+        client_id: str,
+        auth_state: str,
+        auth_cookies: list,
+    ) -> tuple[bool, dict] | None:
+        """使用长生命周期 connect 执行器完成最小授权链路"""
+        if not linuxdo_connect_executor_enabled():
+            return None
+        if not storage_state:
+            return None
+
+        executor = await LinuxDoConnectExecutorManager.get_executor(self.username)
+        async with executor._lock:
+            LinuxDoConnectExecutorManager.record_metric('fast_path_attempts')
+            authorize_started_at = time.perf_counter()
+            page = await executor.acquire_page(storage_state, extra_cookies=auth_cookies)
+            context = page.context
+            callback_route_pattern = None
+            callback_route_handler = None
+            callback_query_future = None
+            challenge_wait_ms = 0.0
+
+            try:
+                callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
+                    context
+                )
+            except Exception as route_err:
+                print(f"⚠️ {self.account_name}: Failed to register provider callback capture route in executor: {route_err}")
+
+            try:
+                oauth_url = (
+                    f"https://connect.linux.do/oauth2/authorize?"
+                    f"response_type=code&client_id={client_id}&state={auth_state}"
+                )
+                print(f"ℹ️ {self.account_name}: Trying connect executor fast path")
+                try:
+                    response = await page.goto(
+                        oauth_url,
+                        wait_until='domcontentloaded',
+                        timeout=TIMEOUT_CONNECT_EXECUTOR_PAGE_LOAD,
+                    )
+                except Exception:
+                    response = await page.goto(
+                        oauth_url,
+                        wait_until='load',
+                        timeout=TIMEOUT_CONNECT_EXECUTOR_PAGE_LOAD,
+                    )
+                print(f"ℹ️ {self.account_name}: Connect executor landed on {response.url if response else page.url}")
+
+                page_title = await page.title()
+                if 'Just a moment' in page_title or 'challenge' in page.url.lower():
+                    print(f"ℹ️ {self.account_name}: Waiting for connect challenge to clear in executor")
+                    challenge_started_at = time.perf_counter()
+                    try:
+                        await page.wait_for_function(
+                            "document.title !== 'Just a moment...'",
+                            timeout=TIMEOUT_CONNECT_EXECUTOR_CHALLENGE,
+                        )
+                    except Exception as cf_err:
+                        print(f"⚠️ {self.account_name}: Connect executor challenge wait timed out: {cf_err}")
+                    challenge_wait_ms = (time.perf_counter() - challenge_started_at) * 1000
+
+                current_url = page.url
+                if linuxdo_signin_check_html_enabled():
+                    await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
+
+                callback_started_at = time.perf_counter()
+                callback_query = await self._wait_for_provider_callback_query(
+                    page,
+                    callback_query_future,
+                    timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+                )
+                if callback_query:
+                    LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                    LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'callback_capture_ms',
+                        (time.perf_counter() - callback_started_at) * 1000,
+                    )
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'authorize_total_ms',
+                        (time.perf_counter() - authorize_started_at) * 1000,
+                    )
+                    if challenge_wait_ms > 0:
+                        LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                    return True, callback_query
+
+                if "linux.do/session/sso_provider" in current_url:
+                    current_url = await self._handle_sso_provider_page(page)
+                    callback_started_at = time.perf_counter()
+                    callback_query = await self._wait_for_provider_callback_query(
+                        page,
+                        callback_query_future,
+                        timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+                    )
+                    if callback_query:
+                        LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                        LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
+                        LinuxDoConnectExecutorManager.record_duration(
+                            'callback_capture_ms',
+                            (time.perf_counter() - callback_started_at) * 1000,
+                        )
+                        LinuxDoConnectExecutorManager.record_duration(
+                            'authorize_total_ms',
+                            (time.perf_counter() - authorize_started_at) * 1000,
+                        )
+                        if challenge_wait_ms > 0:
+                            LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                        return True, callback_query
+
+                if "linux.do/login" in current_url:
+                    LinuxDoConnectExecutorManager.record_metric('fast_path_fallback')
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'authorize_total_ms',
+                        (time.perf_counter() - authorize_started_at) * 1000,
+                    )
+                    return False, _build_linuxdo_error(
+                        "linuxdo_redirect_login",
+                        "Linux.do 授权前被重定向回登录页",
+                        f"LinuxDo authorization redirected back to login page: {current_url}",
+                    )
+
+                approve_url = _extract_approve_url(current_url, await page.content())
+                if approve_url:
+                    print(f"ℹ️ {self.account_name}: Jumping to approve URL directly in connect executor")
+                    LinuxDoConnectExecutorManager.record_metric('approve_direct_jump')
+                    try:
+                        await page.goto(approve_url, wait_until='commit', timeout=TIMEOUT_CONNECT_EXECUTOR_APPROVE_WAIT)
+                    except Exception:
+                        pass
+                    callback_started_at = time.perf_counter()
+                    callback_query = await self._wait_for_provider_callback_query(
+                        page,
+                        callback_query_future,
+                        timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+                    )
+                    if callback_query:
+                        LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                        LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
+                        LinuxDoConnectExecutorManager.record_duration(
+                            'callback_capture_ms',
+                            (time.perf_counter() - callback_started_at) * 1000,
+                        )
+                        LinuxDoConnectExecutorManager.record_duration(
+                            'authorize_total_ms',
+                            (time.perf_counter() - authorize_started_at) * 1000,
+                        )
+                        if challenge_wait_ms > 0:
+                            LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                        return True, callback_query
+
+                print(f"ℹ️ {self.account_name}: Waiting for authorization button in connect executor...")
+                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=TIMEOUT_CONNECT_EXECUTOR_APPROVE_WAIT)
+                allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
+                if not allow_btn_ele:
+                    LinuxDoConnectExecutorManager.record_metric('fast_path_fallback')
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'authorize_total_ms',
+                        (time.perf_counter() - authorize_started_at) * 1000,
+                    )
+                    return False, _build_linuxdo_error(
+                        "linuxdo_allow_button_not_found",
+                        "Linux.do 授权页未找到允许按钮",
+                        "Linux.do allow button not found in connect executor",
+                    )
+
+                await allow_btn_ele.click(no_wait_after=True)
+                callback_started_at = time.perf_counter()
+                callback_query = await self._wait_for_provider_callback_query(
+                    page,
+                    callback_query_future,
+                    timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+                )
+                if callback_query:
+                    LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                    LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'callback_capture_ms',
+                        (time.perf_counter() - callback_started_at) * 1000,
+                    )
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'authorize_total_ms',
+                        (time.perf_counter() - authorize_started_at) * 1000,
+                    )
+                    if challenge_wait_ms > 0:
+                        LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                    return True, callback_query
+
+                LinuxDoConnectExecutorManager.record_metric('fast_path_fallback')
+                LinuxDoConnectExecutorManager.record_duration(
+                    'authorize_total_ms',
+                    (time.perf_counter() - authorize_started_at) * 1000,
+                )
+                result = await self._extract_authorized_result(page)
+                if result[0]:
+                    LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                    if challenge_wait_ms > 0:
+                        LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                return result
+            finally:
+                await executor.release_page()
+                if callback_route_pattern and callback_route_handler:
+                    try:
+                        await context.unroute(callback_route_pattern, callback_route_handler)
+                    except Exception:
+                        pass
+
+    async def _wait_for_provider_callback_query(
+        self,
+        page,
+        callback_query_future=None,
+        timeout_ms: int = TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+    ) -> dict | None:
+        """等待 provider 回调 URL 出现 code/state，尽量在前端加载前切回 HTTP"""
+        parsed = urlparse(self.provider_config.origin)
+        max_checks = max(1, timeout_ms // 250)
+        for _ in range(max_checks):
+            if callback_query_future and callback_query_future.done():
+                callback_query = callback_query_future.result()
+                print(f"✅ {self.account_name}: Captured provider callback request early")
+                return callback_query
+            current_url = page.url
+            if parsed.netloc in current_url:
+                query_params = _extract_provider_callback_query(current_url, self.provider_config.origin)
+                if query_params:
+                    print(f"✅ {self.account_name}: Captured provider callback URL early: {current_url}")
+                    return query_params
+            await page.wait_for_timeout(250)
+        return None
+
     async def _extract_authorized_result(self, page) -> tuple[bool, dict]:
         """从授权完成后的页面中提取 cookies 和 api_user/code"""
         parsed = urlparse(self.provider_config.origin)
@@ -439,6 +734,12 @@ class LinuxDoSignIn:
                 print(f"ℹ️ {self.account_name}: Already on provider domain: {current_url}")
             else:
                 raise
+
+        parsed_url = urlparse(page.url)
+        query_params = parse_qs(parsed_url.query)
+        if "code" in query_params:
+            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+            return True, query_params
 
         api_user = None
         try:
@@ -468,8 +769,6 @@ class LinuxDoSignIn:
 
         print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
         await take_screenshot(page, "oauth_failed_no_user_id_bypass", self.account_name)
-        parsed_url = urlparse(page.url)
-        query_params = parse_qs(parsed_url.query)
         if "code" in query_params:
             print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
             return True, query_params
@@ -717,6 +1016,22 @@ class LinuxDoSignIn:
                 'No prewarmed LinuxDo storage state is available for this account',
             )
 
+        fast_path_result = await self._authorize_via_connect_executor(
+            storage_state,
+            client_id,
+            auth_state,
+            auth_cookies,
+        )
+        if fast_path_result is not None:
+            success, payload = fast_path_result
+            if success:
+                return success, payload
+            print(
+                f"⚠️ {self.account_name}: Connect executor fast path failed with "
+                f"{payload.get('error_type', 'unknown_error')}, falling back to legacy browser flow"
+            )
+            await LinuxDoConnectExecutorManager.close_executor(self.username)
+
         # 使用 Camoufox 启动浏览器
         async with AsyncCamoufox(
             # persistent_context=True,
@@ -727,6 +1042,15 @@ class LinuxDoSignIn:
         ) as browser:
 
             context = await browser.new_context(storage_state=storage_state)
+            callback_route_pattern = None
+            callback_route_handler = None
+            callback_query_future = None
+            try:
+                callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
+                    context
+                )
+            except Exception as route_err:
+                print(f"⚠️ {self.account_name}: Failed to register provider callback capture route: {route_err}")
 
             # 设置从参数获取的 auth cookies 到页面上下文
             if auth_cookies:
@@ -755,10 +1079,9 @@ class LinuxDoSignIn:
                         try:
                             print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
                             try:
-                                response = await page.goto(oauth_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
-                            except Exception:
                                 response = await page.goto(oauth_url, wait_until="domcontentloaded", timeout=TIMEOUT_PAGE_LOAD)
-                                await page.wait_for_timeout(3000)
+                            except Exception:
+                                response = await page.goto(oauth_url, wait_until="load", timeout=TIMEOUT_PAGE_LOAD)
                             print(f"ℹ️ {self.account_name}: redirected to app page {response.url if response else 'N/A'}")
 
                             page_title = await page.title()
@@ -777,7 +1100,8 @@ class LinuxDoSignIn:
                                 except Exception as cf_err:
                                     print(f"⚠️ {self.account_name}: Cloudflare challenge timeout: {cf_err}")
 
-                            await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
+                            if linuxdo_signin_check_html_enabled():
+                                await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
 
                             current_url = page.url
                             if "linux.do/session/sso_provider" in current_url:
@@ -925,7 +1249,10 @@ class LinuxDoSignIn:
 
                         if allow_btn_ele:
                             print(f"ℹ️ {self.account_name}: Clicking authorization button...")
-                            await allow_btn_ele.click()
+                            await allow_btn_ele.click(no_wait_after=True)
+                            callback_query = await self._wait_for_provider_callback_query(page, callback_query_future)
+                            if callback_query:
+                                return True, callback_query
                             parsed = urlparse(self.provider_config.origin)
                             try:
                                 await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
@@ -997,4 +1324,9 @@ class LinuxDoSignIn:
                 )
             finally:
                 await page.close()
+                if callback_route_pattern and callback_route_handler:
+                    try:
+                        await context.unroute(callback_route_pattern, callback_route_handler)
+                    except Exception:
+                        pass
                 await context.close()

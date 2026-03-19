@@ -21,6 +21,11 @@ from bootstrap_storage_states import bootstrap_storage_states_from_accounts_env
 from checkin import CheckIn
 from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
+from utils.linuxdo_connect_executor import (
+    LinuxDoConnectExecutorManager,
+    get_linuxdo_connect_metrics_file,
+    linuxdo_connect_metrics_enabled,
+)
 from utils.linuxdo_session import LinuxDoSessionManager
 from utils.notify import notify
 from utils.recent_success_state import load_recent_success_state, save_recent_success_state
@@ -39,9 +44,8 @@ elif skipped_from_accounts:
     print(f"ℹ️ Prewarmed storage states already exist locally, skipped {len(skipped_from_accounts)} file(s)")
 
 BALANCE_HASH_FILE = "balance_hash.txt"
-RECENT_SUCCESS_STATE_FILE = os.getenv("RECENT_SUCCESS_STATE_FILE", "storage-states/checkin-success-state.json")
-RECENT_SUCCESS_SKIP_TTL_SECONDS = max(0, int(os.getenv("RECENT_SUCCESS_SKIP_HOURS", "24"))) * 60 * 60
-RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS = {"anyrouter", "x666"}
+FAILURE_WINDOW_STATE_FILE = os.getenv("FAILURE_WINDOW_STATE_FILE", "storage-states/checkin-window-state.json")
+FAILURE_WINDOW_TTL_SECONDS = max(0, int(os.getenv("FAILURE_WINDOW_HOURS", "24"))) * 60 * 60
 
 # 并行处理配置
 MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "10")))  # 最大并发账号数
@@ -117,45 +121,38 @@ def build_account_runtime_identity(account_config, account_index: int) -> str:
     return f"{provider_name}|name|{account_config.get_display_name(account_index)}"
 
 
-def should_skip_recent_success(provider_name: str, recent_success_state: dict, identity: str, now_ts: int) -> bool:
-    """判断账号是否应因最近成功而跳过"""
-    if RECENT_SUCCESS_SKIP_TTL_SECONDS <= 0:
-        return False
-    if provider_name in RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS:
-        return False
+def get_failure_window_metadata(window_state: dict, now_ts: int) -> dict:
+    """解析失败窗口元数据"""
+    if not isinstance(window_state, dict):
+        window_state = {}
 
-    accounts_state = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
-    state_entry = accounts_state.get(identity)
-    if not isinstance(state_entry, dict):
-        return False
+    window_started_at = int(window_state.get("window_started_at", 0) or 0)
+    window_age_seconds = max(0, now_ts - window_started_at) if window_started_at > 0 else None
+    window_active = (
+        FAILURE_WINDOW_TTL_SECONDS > 0
+        and window_started_at > 0
+        and window_age_seconds is not None
+        and window_age_seconds < FAILURE_WINDOW_TTL_SECONDS
+    )
+    failed_identities = set(window_state.get("failed_identities", [])) if isinstance(window_state.get("failed_identities"), list) else set()
+    accounts_state = window_state.get("accounts", {}) if isinstance(window_state.get("accounts"), dict) else {}
 
-    last_success_at = int(state_entry.get("last_success_at", 0) or 0)
-    if last_success_at <= 0:
-        return False
-
-    return now_ts - last_success_at < RECENT_SUCCESS_SKIP_TTL_SECONDS
-
-
-def should_track_recent_success(account_config, app_config: AppConfig) -> bool:
-    """判断账号是否应参与最近成功跳过逻辑"""
-    provider_name = account_config.provider
-    if provider_name in RECENT_SUCCESS_SKIP_EXCLUDED_PROVIDERS:
-        return False
-
-    site_definition = app_config.site_definitions.get(provider_name)
-    if not site_definition:
-        return False
-
-    return site_definition.mode not in {"special", "signed"}
+    return {
+        "window_started_at": window_started_at,
+        "window_age_seconds": window_age_seconds,
+        "window_active": window_active,
+        "failed_identities": failed_identities,
+        "accounts_state": accounts_state,
+    }
 
 
-def build_recent_success_skip_result(
+def build_failure_window_skip_result(
     account_index: int,
     account_config,
     app_config: AppConfig,
     state_entry: dict,
 ) -> dict:
-    """为 24 小时内已成功的账号构造跳过结果"""
+    """为当前失败窗口中无需重跑的账号构造跳过结果"""
     account_key = f"account_{account_index + 1}"
     account_name = account_config.get_display_name(account_index)
     provider_name = account_config.provider
@@ -171,15 +168,15 @@ def build_recent_success_skip_result(
         "provider": provider_name,
         "site_origin": provider_config.origin if provider_config else "",
         "success": True,
-        "status": "skipped_recent_success",
+        "status": "skipped_failure_window",
         "results": [],
         "balances": copy.deepcopy(balances),
-        "notification": f"⏭️ {account_name}: 24 小时内已成功，跳过本轮",
+        "notification": f"⏭️ {account_name}: 当前 24 小时窗口内无失败，跳过本轮",
         "need_notify": False,
         "successful_methods": [],
         "failed_methods": [],
         "error_summary": None,
-        "success_detail": "24 小时内已成功，跳过本轮",
+        "success_detail": None,
         "error_type": None,
         "error_label": None,
         "error_detail": None,
@@ -187,58 +184,68 @@ def build_recent_success_skip_result(
     }
 
 
-def collect_recent_success_skip_results(app_config: AppConfig, recent_success_state: dict, now_ts: int) -> dict[int, dict]:
-    """收集应跳过的最近成功账号结果"""
+def collect_failure_window_skip_results(app_config: AppConfig, window_state: dict, now_ts: int) -> tuple[dict[int, dict], dict]:
+    """收集失败窗口内应跳过的账号结果"""
     skip_results = {}
-    accounts_state = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
+    metadata = get_failure_window_metadata(window_state, now_ts)
+    if not metadata["window_active"]:
+        return skip_results, metadata
 
     for index, account_config in enumerate(app_config.accounts):
-        if not should_track_recent_success(account_config, app_config):
-            continue
-
         identity = build_account_runtime_identity(account_config, index)
-        if not should_skip_recent_success(account_config.provider, recent_success_state, identity, now_ts):
+        state_entry = metadata["accounts_state"].get(identity)
+        if not isinstance(state_entry, dict):
             continue
+        if identity in metadata["failed_identities"]:
+            continue
+        skip_results[index] = build_failure_window_skip_result(index, account_config, app_config, state_entry)
 
-        state_entry = accounts_state.get(identity, {})
-        skip_results[index] = build_recent_success_skip_result(index, account_config, app_config, state_entry)
-
-    return skip_results
+    return skip_results, metadata
 
 
-def update_recent_success_state_from_results(
-    recent_success_state: dict,
+def update_failure_window_state_from_results(
+    window_state: dict,
     account_results: list,
     app_config: AppConfig,
     now_ts: int,
+    window_started_at: int,
 ) -> dict:
-    """根据本轮结果刷新最近成功状态"""
-    existing_accounts = recent_success_state.get("accounts", {}) if isinstance(recent_success_state, dict) else {}
+    """根据本轮结果刷新失败窗口状态"""
+    existing_accounts = window_state.get("accounts", {}) if isinstance(window_state, dict) else {}
     next_accounts = {}
+    failed_identities = set()
 
     for index, account_config in enumerate(app_config.accounts):
-        if not should_track_recent_success(account_config, app_config):
-            continue
-
         identity = build_account_runtime_identity(account_config, index)
         existing_entry = existing_accounts.get(identity)
         result = account_results[index] if index < len(account_results) else None
 
-        if isinstance(result, dict) and result.get("success") and result.get("status") != "skipped_recent_success":
+        if isinstance(result, dict) and result.get("success") and result.get("status") != "skipped_failure_window":
             next_accounts[identity] = {
                 "provider": account_config.provider,
                 "account_name": account_config.get_display_name(index),
                 "site_origin": result.get("site_origin", ""),
-                "last_success_at": now_ts,
+                "last_run_at": now_ts,
                 "balances": copy.deepcopy(result.get("balances", {})),
                 "success_detail": result.get("success_detail"),
             }
             continue
 
         if isinstance(result, dict) and not result.get("success"):
+            failed_identities.add(identity)
+            carried_entry = copy.deepcopy(existing_entry) if isinstance(existing_entry, dict) else {}
+            carried_entry["provider"] = account_config.provider
+            carried_entry["account_name"] = account_config.get_display_name(index)
+            if result.get("site_origin"):
+                carried_entry["site_origin"] = result.get("site_origin")
+            if result.get("balances"):
+                carried_entry["balances"] = copy.deepcopy(result.get("balances", {}))
+            carried_entry["last_run_at"] = now_ts
+            carried_entry["last_failure_at"] = now_ts
+            next_accounts[identity] = carried_entry
             continue
 
-        if isinstance(result, dict) and result.get("status") == "skipped_recent_success" and isinstance(existing_entry, dict):
+        if isinstance(result, dict) and result.get("status") == "skipped_failure_window" and isinstance(existing_entry, dict):
             carried_entry = copy.deepcopy(existing_entry)
             carried_entry["provider"] = account_config.provider
             carried_entry["account_name"] = account_config.get_display_name(index)
@@ -252,16 +259,13 @@ def update_recent_success_state_from_results(
         if not isinstance(existing_entry, dict):
             continue
 
-        last_success_at = int(existing_entry.get("last_success_at", 0) or 0)
-        if last_success_at <= 0:
-            continue
-        if now_ts - last_success_at >= RECENT_SUCCESS_SKIP_TTL_SECONDS:
-            continue
-
         next_accounts[identity] = copy.deepcopy(existing_entry)
 
     return {
         "version": 1,
+        "window_started_at": window_started_at,
+        "last_updated_at": now_ts,
+        "failed_identities": sorted(failed_identities),
         "accounts": next_accounts,
     }
 
@@ -873,6 +877,35 @@ def merge_prewarm_summary(overall_summary: dict, batch_summary: dict | None) -> 
     overall_summary["failed"] += batch_summary.get("failed", 0)
     overall_summary["issues"].extend(batch_summary.get("issues", []))
     return overall_summary
+
+
+def print_linuxdo_connect_metrics_summary():
+    """输出 LinuxDo Connect 执行器指标摘要"""
+    if not linuxdo_connect_metrics_enabled():
+        return
+
+    metrics = LinuxDoConnectExecutorManager.get_metrics_snapshot()
+    print(
+        "⚙️ LinuxDo Connect metrics: "
+        f"executor_created={metrics.get('executor_created', 0)}, "
+        f"executor_reused={metrics.get('executor_reused', 0)}, "
+        f"page_created={metrics.get('page_created', 0)}, "
+        f"page_reused={metrics.get('page_reused', 0)}"
+    )
+    print(
+        "⚙️ LinuxDo Connect fast path: "
+        f"attempts={metrics.get('fast_path_attempts', 0)}, "
+        f"success={metrics.get('fast_path_success', 0)}, "
+        f"fallback={metrics.get('fast_path_fallback', 0)}, "
+        f"avg_ms={metrics.get('fast_path_avg_ms', 0.0)}"
+    )
+    print(
+        "⚙️ LinuxDo Connect capture: "
+        f"callback_hits={metrics.get('callback_capture_hits', 0)}, "
+        f"callback_avg_ms={metrics.get('callback_capture_avg_ms', 0.0)}, "
+        f"challenge_wait_ms={round(metrics.get('challenge_wait_ms', 0.0), 2)}"
+    )
+    LinuxDoConnectExecutorManager.save_metrics_snapshot(get_linuxdo_connect_metrics_file())
 
 
 def clear_linuxdo_runtime_state(reason: str):
@@ -1521,20 +1554,42 @@ async def main():
     # 加载余额hash
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
     now_ts = int(datetime.now().timestamp())
-    recent_success_state = load_recent_success_state(RECENT_SUCCESS_STATE_FILE)
-    recent_success_skip_results = collect_recent_success_skip_results(app_config, recent_success_state, now_ts)
+    failure_window_state = load_recent_success_state(FAILURE_WINDOW_STATE_FILE)
+    failure_window_skip_results, failure_window_metadata = collect_failure_window_skip_results(
+        app_config,
+        failure_window_state,
+        now_ts,
+    )
+    window_active = failure_window_metadata["window_active"]
+    current_window_started_at = (
+        failure_window_metadata["window_started_at"]
+        if window_active and failure_window_metadata["window_started_at"] > 0
+        else now_ts
+    )
     runnable_indices = [
         index
         for index in range(len(app_config.accounts))
-        if index not in recent_success_skip_results
+        if index not in failure_window_skip_results
     ]
 
-    if recent_success_skip_results:
+    if window_active:
+        failed_count = len(failure_window_metadata["failed_identities"])
         print(
-            f"⏭️ Skipping {len(recent_success_skip_results)} account(s) that succeeded within "
-            f"the last {RECENT_SUCCESS_SKIP_TTL_SECONDS // 3600} hour(s)"
+            f"⚙️ Failure window active: age={failure_window_metadata['window_age_seconds']}s, "
+            f"tracked_failures={failed_count}, runnable={len(runnable_indices)}"
         )
-        for index in sorted(recent_success_skip_results):
+    else:
+        print(
+            f"⚙️ Failure window reset: running full scan for all {len(app_config.accounts)} account(s); "
+            f"next {FAILURE_WINDOW_TTL_SECONDS // 3600}h will only rerun failures"
+        )
+
+    if failure_window_skip_results:
+        print(
+            f"⏭️ Skipping {len(failure_window_skip_results)} account(s) that have no failures in "
+            f"the current {FAILURE_WINDOW_TTL_SECONDS // 3600}h window"
+        )
+        for index in sorted(failure_window_skip_results):
             account_name = app_config.accounts[index].get_display_name(index)
             print(f"  • {account_name}")
 
@@ -1550,7 +1605,7 @@ async def main():
     print(f"\n🚀 Starting batched processing with max {MAX_CONCURRENT_ACCOUNTS} concurrent accounts...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ACCOUNTS)
     account_results: list = [None] * len(app_config.accounts)
-    for index, skip_result in recent_success_skip_results.items():
+    for index, skip_result in failure_window_skip_results.items():
         account_results[index] = skip_result
     prewarm_summary = {"attempted": 0, "successful": 0, "failed": 0, "issues": []}
     retried_account_indices: set[int] = set()
@@ -1662,13 +1717,14 @@ async def main():
             )
             retried_account_indices.update(deferred_retry_indices)
 
-    recent_success_state = update_recent_success_state_from_results(
-        recent_success_state,
+    failure_window_state = update_failure_window_state_from_results(
+        failure_window_state,
         account_results,
         app_config,
         now_ts,
+        current_window_started_at,
     )
-    save_recent_success_state(RECENT_SUCCESS_STATE_FILE, recent_success_state)
+    save_recent_success_state(FAILURE_WINDOW_STATE_FILE, failure_window_state)
 
     # 汇总结果
     current_balances = {}
@@ -1752,6 +1808,8 @@ async def main():
 
     # 设置退出码
     success_accounts = sum(1 for result in sorted_results if result.get("success"))
+    print_linuxdo_connect_metrics_summary()
+    await LinuxDoConnectExecutorManager.close_all()
     sys.exit(0 if success_accounts > 0 else 1)
 
 
