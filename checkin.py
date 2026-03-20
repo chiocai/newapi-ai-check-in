@@ -1518,6 +1518,10 @@ class CheckIn:
                     await browser.add_cookies(auth_cookies)
 
                 try:
+                    browser_checkin_status = None
+                    browser_checkin_error = None
+                    browser_checkin_message = ""
+
                     # 1. 打开主页（使用 networkidle 等待网络请求完成，包括重定向）
                     print(f"ℹ️ {self.account_name}: Opening main page")
                     await page.goto(self.provider_config.origin, wait_until="networkidle", timeout=60000)
@@ -1576,12 +1580,20 @@ class CheckIn:
                             }}"""
                         )
                         if checkin_response:
+                            browser_checkin_message = checkin_response.get("message", "")
                             if checkin_response.get("success"):
-                                print(f"✅ {self.account_name}: Checkin successful - {checkin_response.get('message', '')}")
-                            elif "已签到" in checkin_response.get("message", ""):
-                                print(f"ℹ️ {self.account_name}: Already checked in - {checkin_response.get('message', '')}")
+                                browser_checkin_status = "success"
+                                print(f"✅ {self.account_name}: Checkin successful - {browser_checkin_message}")
+                            elif "已签到" in browser_checkin_message or "already" in browser_checkin_message.lower():
+                                browser_checkin_status = "already_checked"
+                                print(f"ℹ️ {self.account_name}: Already checked in - {browser_checkin_message}")
                             else:
-                                print(f"⚠️ {self.account_name}: Checkin response - {checkin_response.get('message', '')}")
+                                browser_checkin_status = "failed"
+                                browser_checkin_error = browser_checkin_message or "Browser checkin failed"
+                                print(f"⚠️ {self.account_name}: Checkin response - {browser_checkin_message}")
+                        else:
+                            browser_checkin_status = "failed"
+                            browser_checkin_error = "Browser checkin returned empty response"
 
                     # 获取用户信息
                     response = await page.evaluate(
@@ -1608,13 +1620,19 @@ class CheckIn:
                             f"✅ {self.account_name}: "
                             f"Current balance: ${quota}, Used: ${used_quota}, Bonus: ${bonus_quota}"
                         )
-                        return {
+                        result = {
                             "success": True,
                             "quota": quota,
                             "used_quota": used_quota,
                             "bonus_quota": bonus_quota,
                             "display": f"Current balance: ${quota}, Used: ${used_quota}, Bonus: ${bonus_quota}",
                         }
+                        if do_checkin:
+                            result["checkin_status"] = browser_checkin_status or "failed"
+                            result["checkin_message"] = browser_checkin_message
+                            if browser_checkin_error:
+                                result["checkin_error"] = browser_checkin_error
+                        return result
 
                     return {
                         "success": False,
@@ -2053,6 +2071,11 @@ class CheckIn:
                 self.provider_config.api_user_key: f"{api_user}",
             }
 
+            checkin_required = bool(self.account_config.checkin)
+            checkin_status = None
+            checkin_error = None
+            checkin_message = ""
+
             if self.provider_config.needs_manual_check_in():
                 sign_in_url = self.provider_config.get_sign_in_url(api_user) or ""
                 if self.should_use_browser_manual_check_in(api_user):
@@ -2125,6 +2148,8 @@ class CheckIn:
                             api_user_key=self.provider_config.api_user_key,
                         )
                         if checkin_result.get("success"):
+                            checkin_status = "already_checked" if checkin_result.get("already_checked") else "success"
+                            checkin_message = checkin_result.get("message", "")
                             checkin_reward = checkin_result.get("reward")
                             if checkin_result.get("already_checked"):
                                 checkin_reward = None
@@ -2138,6 +2163,10 @@ class CheckIn:
                                 )
                                 do_browser_checkin = True
                                 dynamic_browser_checkin_reason = error_msg
+                            else:
+                                checkin_status = "failed"
+                                checkin_error = error_msg
+                                checkin_message = error_msg
                     else:
                         print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
                         do_browser_checkin = True
@@ -2155,12 +2184,17 @@ class CheckIn:
                         api_user_key=self.provider_config.api_user_key,
                     )
                     if checkin_result.get("success"):
+                        checkin_status = "already_checked" if checkin_result.get("already_checked") else "success"
+                        checkin_message = checkin_result.get("message", "")
                         checkin_reward = checkin_result.get("reward")
                         if checkin_result.get("already_checked"):
                             checkin_reward = None
                     else:
                         error_msg = checkin_result.get("error", "New-API checkin failed")
                         print(f"❌ {self.account_name}: New-API checkin failed - {error_msg}")
+                        checkin_status = "failed"
+                        checkin_error = error_msg
+                        checkin_message = error_msg
                 else:
                     print(f"ℹ️ {self.account_name}: New-API checkin enabled, executing...")
                     from utils.new_api_checkin import new_api_checkin
@@ -2176,6 +2210,8 @@ class CheckIn:
                     )
                     if checkin_result.get("success"):
                         # 保存签到奖励信息
+                        checkin_status = "already_checked" if checkin_result.get("already_checked") else "success"
+                        checkin_message = checkin_result.get("message", "")
                         checkin_reward = checkin_result.get("reward")
                         if checkin_result.get("already_checked"):
                             checkin_reward = None  # 已签到不显示奖励
@@ -2188,6 +2224,10 @@ class CheckIn:
                                 "will fallback to browser mode in this run"
                             )
                             do_browser_checkin = True
+                        else:
+                            checkin_status = "failed"
+                            checkin_error = error_msg
+                            checkin_message = error_msg
 
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
@@ -2283,6 +2323,16 @@ class CheckIn:
                     if browser_user_info and browser_user_info.get("success"):
                         user_info = browser_user_info
             if user_info and user_info.get("success"):
+                if do_browser_checkin and checkin_required:
+                    browser_checkin_status = user_info.get("checkin_status")
+                    if browser_checkin_status in {"success", "already_checked"}:
+                        checkin_status = browser_checkin_status
+                        checkin_message = user_info.get("checkin_message", "")
+                    else:
+                        checkin_status = "failed"
+                        checkin_error = user_info.get("checkin_error") or user_info.get("checkin_message") or "Browser checkin failed"
+                        checkin_message = user_info.get("checkin_message", checkin_error or "")
+
                 if self.provider_config.needs_waf_cookies() and do_browser_checkin:
                     if dynamic_browser_checkin_reason:
                         print(f"ℹ️ {self.account_name}: Promoting runtime mode to browser-first WAF checkin")
@@ -2291,6 +2341,16 @@ class CheckIn:
                         self._mark_active_browser_first_checkin(
                             runtime_modes.get('checkin_reason', 'browser_first_runtime_refresh')
                         )
+
+                if checkin_required and checkin_status not in {"success", "already_checked"}:
+                    failure_msg = checkin_error or checkin_message or "Check-in did not complete successfully"
+                    print(f"❌ {self.account_name}: Final check-in status is not successful - {failure_msg}")
+                    return False, {
+                        "error_type": "checkin_not_successful",
+                        "error_summary": failure_msg,
+                        "error_detail": failure_msg,
+                        "error": failure_msg,
+                    }
 
                 # 将签到奖励信息添加到 user_info 中
                 if checkin_reward is not None:
