@@ -1267,6 +1267,26 @@ class CheckIn:
                                 }} catch (e) {{}}
                             }}
 
+                            try {{
+                                const sessionResponse = await fetch('{self.provider_config.get_user_info_url()}', {{
+                                    credentials: 'include'
+                                }});
+                                result.userInfoStatus = sessionResponse.status;
+                                const text = await sessionResponse.text();
+                                try {{
+                                    const parsed = JSON.parse(text);
+                                    const sessionUserId = pickId(parsed);
+                                    if (sessionUserId !== null && sessionUserId !== undefined && sessionUserId !== '') {{
+                                        result.apiUser = sessionUserId;
+                                    }}
+                                    if (!result.errorMsg) {{
+                                        result.errorMsg = parsed?.message || parsed?.error || '';
+                                    }}
+                                }} catch (e) {{}}
+                            }} catch (e) {{
+                                result.userInfoError = e.message || String(e);
+                            }}
+
                             if (result.apiUser !== null && result.apiUser !== undefined && result.apiUser !== '') {{
                                 try {{
                                     const response = await fetch('{self.provider_config.get_user_info_url()}', {{
