@@ -667,6 +667,8 @@ def should_skip_failed_retry(result: dict) -> bool:
         for value in [result.get("error_label"), result.get("error_summary"), result.get("error_detail"), result.get("error")]
         if value
     ).lower()
+    if error_type == "linuxdo_client_id_failed" and any(code in error_text for code in ["http 500", "http 502", "http 503", "http 504"]):
+        return True
     skip_indicators = [
         "缺少预热态",
         "预热态失效",
