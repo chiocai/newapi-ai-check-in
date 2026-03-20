@@ -31,6 +31,11 @@ from utils.linuxdo_connect_executor import (
 	linuxdo_connect_executor_enabled,
 	linuxdo_signin_check_html_enabled,
 )
+from utils.linuxdo_runtime_modes import (
+    CALLBACK_MODE_BROWSER_COMPLETE,
+    get_linuxdo_runtime_modes,
+    mark_callback_browser_complete,
+)
 
 if TYPE_CHECKING:
     from utils.linuxdo_session import LinuxDoSession
@@ -93,8 +98,17 @@ def should_serialize_same_linuxdo_oauth() -> bool:
     return os.getenv('SERIALIZE_SAME_LINUXDO_OAUTH', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
-def should_complete_provider_callback_in_browser(provider_origin: str) -> bool:
+def should_complete_provider_callback_in_browser(
+    provider_origin: str,
+    username_hash: str = '',
+    state_file: str = '',
+) -> bool:
     """是否在同一浏览器上下文内完成 provider callback"""
+    if username_hash:
+        runtime_modes = get_linuxdo_runtime_modes(provider_origin, username_hash, state_file)
+        if runtime_modes.get('callback_mode') == CALLBACK_MODE_BROWSER_COMPLETE:
+            return True
+
     raw_hosts = os.getenv(
         'LINUXDO_BROWSER_COMPLETE_CALLBACK_HOSTS',
         'api.chengmo.cc.cd,newapi.linuxdo.edu.rs',
@@ -105,6 +119,14 @@ def should_complete_provider_callback_in_browser(provider_origin: str) -> bool:
         if item.strip()
     }
     return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
+def _get_runtime_modes_state_file(cache_file_path: str = '') -> str:
+    if cache_file_path:
+        cache_dir = os.path.dirname(cache_file_path)
+        if cache_dir:
+            return os.path.join(cache_dir, 'linuxdo_runtime_modes.json')
+    return ''
 
 
 def _get_github_skip_prewarm_slot_labels() -> set[str]:
@@ -287,6 +309,7 @@ class LinuxDoSignIn:
         self.account_name = account_name
         self.provider_config = provider_config
         self.username = username
+        self.username_hash = hashlib.sha256(username.encode('utf-8')).hexdigest()[:8]
         self.password = password
         self.shared_session = shared_session
 
@@ -511,6 +534,7 @@ class LinuxDoSignIn:
         client_id: str,
         auth_state: str,
         auth_cookies: list,
+        cache_file_path: str = '',
     ) -> tuple[bool, dict] | None:
         """使用长生命周期 connect 执行器完成最小授权链路"""
         if not linuxdo_connect_executor_enabled():
@@ -524,7 +548,12 @@ class LinuxDoSignIn:
             authorize_started_at = time.perf_counter()
             page = await executor.acquire_page(storage_state, extra_cookies=auth_cookies)
             context = page.context
-            prefer_provider_browser_callback = should_complete_provider_callback_in_browser(self.provider_config.origin)
+            runtime_modes_state_file = _get_runtime_modes_state_file(cache_file_path)
+            prefer_provider_browser_callback = should_complete_provider_callback_in_browser(
+                self.provider_config.origin,
+                self.username_hash,
+                runtime_modes_state_file,
+            )
             callback_route_pattern = None
             callback_route_handler = None
             callback_query_future = None
@@ -542,7 +571,14 @@ class LinuxDoSignIn:
 
             try:
                 async def finish_provider_callback_in_browser() -> tuple[bool, dict]:
-                    result = await self._extract_authorized_result(page)
+                    result = await self._extract_authorized_result(page, cache_file_path)
+                    if result[0]:
+                        mark_callback_browser_complete(
+                            self.provider_config.origin,
+                            self.username_hash,
+                            'provider_callback_same_context_success',
+                            runtime_modes_state_file,
+                        )
                     LinuxDoConnectExecutorManager.record_duration(
                         'authorize_total_ms',
                         (time.perf_counter() - authorize_started_at) * 1000,
@@ -761,7 +797,7 @@ class LinuxDoSignIn:
             await page.wait_for_timeout(250)
         return None
 
-    async def _extract_authorized_result(self, page) -> tuple[bool, dict]:
+    async def _extract_authorized_result(self, page, cache_file_path: str = '') -> tuple[bool, dict]:
         """从授权完成后的页面中提取 cookies 和 api_user/code"""
         parsed = urlparse(self.provider_config.origin)
 
@@ -805,7 +841,11 @@ class LinuxDoSignIn:
 
         parsed_url = urlparse(page.url)
         query_params = parse_qs(parsed_url.query)
-        prefer_final_session = should_complete_provider_callback_in_browser(self.provider_config.origin)
+        prefer_final_session = should_complete_provider_callback_in_browser(
+            self.provider_config.origin,
+            self.username_hash,
+            _get_runtime_modes_state_file(cache_file_path),
+        )
 
         if prefer_final_session:
             print(f"ℹ️ {self.account_name}: Preferring full provider browser callback completion")
@@ -1085,7 +1125,12 @@ class LinuxDoSignIn:
         )
 
         github_reference_fallback_allowed = os.getenv('GITHUB_ACTIONS', '').lower() == 'true'
-        prefer_provider_browser_callback = should_complete_provider_callback_in_browser(self.provider_config.origin)
+        runtime_modes_state_file = _get_runtime_modes_state_file(cache_file_path)
+        prefer_provider_browser_callback = should_complete_provider_callback_in_browser(
+            self.provider_config.origin,
+            self.username_hash,
+            runtime_modes_state_file,
+        )
 
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = await self._resolve_storage_state(cache_file_path)
@@ -1102,6 +1147,7 @@ class LinuxDoSignIn:
             client_id,
             auth_state,
             auth_cookies,
+            cache_file_path,
         )
         if fast_path_result is not None:
             success, payload = fast_path_result
@@ -1348,7 +1394,15 @@ class LinuxDoSignIn:
                                 else:
                                     raise
 
-                            return await self._extract_authorized_result(page)
+                            result = await self._extract_authorized_result(page, cache_file_path)
+                            if prefer_provider_browser_callback and result[0]:
+                                mark_callback_browser_complete(
+                                    self.provider_config.origin,
+                                    self.username_hash,
+                                    'provider_callback_same_context_success',
+                                    runtime_modes_state_file,
+                                )
+                            return result
 
                         print(f"❌ {self.account_name}: Approve button not found")
                         await take_screenshot(page, "approve_button_not_found_bypass", self.account_name)

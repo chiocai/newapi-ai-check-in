@@ -26,6 +26,13 @@ from utils.browser_utils import (
 from utils.config import AccountConfig, ProviderConfig
 from utils.debug_flags import linuxdo_auth_debug_enabled
 from utils.http_utils import proxy_resolve, response_resolve
+from utils.linuxdo_runtime_modes import (
+    CHECKIN_MODE_BROWSER_FIRST,
+    clear_checkin_browser_first,
+    get_linuxdo_runtime_modes,
+    mark_callback_browser_complete,
+    mark_checkin_browser_first,
+)
 from utils.topup import topup
 
 if TYPE_CHECKING:
@@ -284,8 +291,50 @@ class CheckIn:
 
         # storage-states 目录
         self.storage_state_dir = storage_state_dir
+        self._active_linuxdo_username_hash: str | None = None
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
+
+    def _get_linuxdo_runtime_modes_state_file(self) -> str:
+        return os.path.join(self.storage_state_dir, 'linuxdo_runtime_modes.json')
+
+    def _get_active_linuxdo_runtime_modes(self) -> dict:
+        if not self._active_linuxdo_username_hash:
+            return {}
+        return get_linuxdo_runtime_modes(
+            self.provider_config.origin,
+            self._active_linuxdo_username_hash,
+            self._get_linuxdo_runtime_modes_state_file(),
+        )
+
+    def _mark_active_callback_browser_complete(self, reason: str) -> None:
+        if not self._active_linuxdo_username_hash:
+            return
+        mark_callback_browser_complete(
+            self.provider_config.origin,
+            self._active_linuxdo_username_hash,
+            reason,
+            self._get_linuxdo_runtime_modes_state_file(),
+        )
+
+    def _mark_active_browser_first_checkin(self, reason: str) -> None:
+        if not self._active_linuxdo_username_hash:
+            return
+        mark_checkin_browser_first(
+            self.provider_config.origin,
+            self._active_linuxdo_username_hash,
+            reason,
+            self._get_linuxdo_runtime_modes_state_file(),
+        )
+
+    def _clear_active_browser_first_checkin(self) -> None:
+        if not self._active_linuxdo_username_hash:
+            return
+        clear_checkin_browser_first(
+            self.provider_config.origin,
+            self._active_linuxdo_username_hash,
+            self._get_linuxdo_runtime_modes_state_file(),
+        )
 
     async def get_waf_cookies_with_browser(self) -> dict | None:
         """使用 Camoufox 获取 WAF cookies（隐私模式）"""
@@ -1983,6 +2032,12 @@ class CheckIn:
         client = httpx.Client(http2=True, timeout=30.0, proxy=self.http_proxy_config)
         try:
             client.cookies.update(cookies)
+            runtime_modes = self._get_active_linuxdo_runtime_modes()
+            prefer_browser_first_checkin = (
+                self.provider_config.needs_waf_cookies()
+                and runtime_modes.get('checkin_mode') == CHECKIN_MODE_BROWSER_FIRST
+            )
+            dynamic_browser_checkin_reason = ''
 
             headers = {
                 "User-Agent": get_random_user_agent(),
@@ -2050,7 +2105,13 @@ class CheckIn:
             checkin_reward = None  # 保存签到奖励信息
             if self.account_config.checkin:
                 if self.provider_config.needs_waf_cookies():
-                    if has_provider_bypass_cookies(cookies):
+                    if prefer_browser_first_checkin:
+                        print(
+                            f"ℹ️ {self.account_name}: Runtime mode prefers browser-first New-API checkin "
+                            f"({runtime_modes.get('checkin_reason', 'dynamic runtime')})"
+                        )
+                        do_browser_checkin = True
+                    elif has_provider_bypass_cookies(cookies):
                         print(f"ℹ️ {self.account_name}: Reusable WAF cookies detected, trying HTTP New-API checkin first")
                         from utils.new_api_checkin import new_api_checkin
 
@@ -2076,6 +2137,7 @@ class CheckIn:
                                     "will fallback to browser mode in this run"
                                 )
                                 do_browser_checkin = True
+                                dynamic_browser_checkin_reason = error_msg
                     else:
                         print(f"ℹ️ {self.account_name}: New-API checkin will be executed via browser (WAF bypass)")
                         do_browser_checkin = True
@@ -2221,6 +2283,15 @@ class CheckIn:
                     if browser_user_info and browser_user_info.get("success"):
                         user_info = browser_user_info
             if user_info and user_info.get("success"):
+                if self.provider_config.needs_waf_cookies() and do_browser_checkin:
+                    if dynamic_browser_checkin_reason:
+                        print(f"ℹ️ {self.account_name}: Promoting runtime mode to browser-first WAF checkin")
+                        self._mark_active_browser_first_checkin(dynamic_browser_checkin_reason)
+                    elif prefer_browser_first_checkin:
+                        self._mark_active_browser_first_checkin(
+                            runtime_modes.get('checkin_reason', 'browser_first_runtime_refresh')
+                        )
+
                 # 将签到奖励信息添加到 user_info 中
                 if checkin_reward is not None:
                     user_info["checkin_reward"] = checkin_reward
@@ -2242,6 +2313,7 @@ class CheckIn:
 
     async def check_in_with_github(self, username: str, password: str, waf_cookies: dict) -> tuple[bool, dict]:
         """使用 GitHub 账号执行签到操作"""
+        self._active_linuxdo_username_hash = None
         print(
             f"ℹ️ {self.account_name}: Executing check-in with GitHub account (using proxy: {'true' if self.http_proxy_config else 'false'})"
         )
@@ -2401,6 +2473,7 @@ class CheckIn:
 
         # 生成缓存文件路径
         username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        self._active_linuxdo_username_hash = username_hash
         provider_cache_path = _get_provider_session_cache_path(
             self.storage_state_dir, self.provider_config.name, username_hash
         )
@@ -2750,6 +2823,11 @@ class CheckIn:
                                 or should_force_browser_callback_fallback_for_provider(self.provider_config.origin)
                             )
                             if not should_browser_fallback:
+                                if 'state parameter is empty or mismatched' in (
+                                    f'{error_msg} {frontend_http_error}'.lower()
+                                ):
+                                    print(f"ℹ️ {self.account_name}: Promoting runtime mode to same-context callback due to state mismatch")
+                                    self._mark_active_callback_browser_complete('callback_state_mismatch')
                                 return False, {"error": f"OAuth callback failed: {error_msg}"}
                             fallback_result = await self.complete_linuxdo_callback_with_browser(
                                 frontend_callback_url,
@@ -2760,9 +2838,12 @@ class CheckIn:
                                 api_user = fallback_result["api_user"]
                                 _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                                 print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                                self._mark_active_callback_browser_complete('browser_callback_fallback_succeeded')
                                 if login_only:
                                     return True, {"cookies": merged_cookies, "api_user": api_user}
                                 return await self.check_in_with_cookies(merged_cookies, api_user)
+                            print(f"ℹ️ {self.account_name}: Promoting runtime mode to same-context callback after browser fallback failure")
+                            self._mark_active_callback_browser_complete('browser_callback_fallback_failed')
                             return False, {"error": f"OAuth callback failed: {error_msg}"}
                     else:
                         print(f"❌ {self.account_name}: OAuth callback HTTP {response.status_code}")
@@ -2799,9 +2880,12 @@ class CheckIn:
                             api_user = fallback_result["api_user"]
                             _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                             print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                            self._mark_active_callback_browser_complete('browser_callback_fallback_succeeded')
                             if login_only:
                                 return True, {"cookies": merged_cookies, "api_user": api_user}
                             return await self.check_in_with_cookies(merged_cookies, api_user)
+                        print(f"ℹ️ {self.account_name}: Promoting runtime mode to same-context callback after browser fallback failure")
+                        self._mark_active_callback_browser_complete('browser_callback_fallback_failed')
                         return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: Error calling OAuth callback: {callback_err}")
@@ -2835,9 +2919,12 @@ class CheckIn:
                         api_user = fallback_result["api_user"]
                         _save_provider_session_cache(provider_cache_path, merged_cookies, api_user)
                         print(f"✅ {self.account_name}: Browser callback fallback succeeded")
+                        self._mark_active_callback_browser_complete('browser_callback_fallback_succeeded')
                         if login_only:
                             return True, {"cookies": merged_cookies, "api_user": api_user}
                         return await self.check_in_with_cookies(merged_cookies, api_user)
+                    print(f"ℹ️ {self.account_name}: Promoting runtime mode to same-context callback after browser fallback failure")
+                    self._mark_active_callback_browser_complete('browser_callback_fallback_failed')
                     return False, {"error": f"OAuth callback error: {callback_err}"}
             else:
                 # 返回错误信息
