@@ -241,6 +241,17 @@ def should_try_browser_callback_fallback(original_error_msg: str, frontend_http_
     return not any(indicator in merged for indicator in non_retry_indicators)
 
 
+def should_force_browser_callback_fallback_for_provider(provider_origin: str) -> bool:
+    """判断当前站点是否应在 callback 403 后保留浏览器前端回调兜底"""
+    raw_hosts = os.getenv('LINUXDO_BROWSER_CALLBACK_FALLBACK_HOSTS', 'api.einzieg.site')
+    allowed_hosts = {
+        item.strip().lower()
+        for item in raw_hosts.split(',')
+        if item.strip()
+    }
+    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -903,9 +914,7 @@ class CheckIn:
 
     def _should_force_ui_click_for_auth_state(self, force_ui_click: bool) -> bool:
         """判断当前站点是否应始终保留页面 LinuxDO 授权链路"""
-        # anyrouter 已验证依赖前端按钮点击来初始化 provider 侧会话，
-        # 这里保留历史行为，避免被通用 fetch state 逻辑改变。
-        return force_ui_click or self.provider_config.name == "anyrouter"
+        return force_ui_click
 
     def _should_retry_linuxdo_oauth_once(self, error_payload: dict | None) -> bool:
         """判断是否应重新获取 state 并再走一次 Linux.do OAuth"""
@@ -2637,7 +2646,11 @@ class CheckIn:
                                     return True, {"cookies": merged_cookies, "api_user": api_user}
                                 return await self.check_in_with_cookies(merged_cookies, api_user)
                             frontend_http_error = http_frontend_result.get("error", "")
-                            if not should_try_browser_callback_fallback(error_msg, frontend_http_error):
+                            should_browser_fallback = (
+                                should_try_browser_callback_fallback(error_msg, frontend_http_error)
+                                or should_force_browser_callback_fallback_for_provider(self.provider_config.origin)
+                            )
+                            if not should_browser_fallback:
                                 return False, {"error": f"OAuth callback failed: {error_msg}"}
                             fallback_result = await self.complete_linuxdo_callback_with_browser(
                                 frontend_callback_url,
@@ -2669,10 +2682,14 @@ class CheckIn:
                                 return True, {"cookies": merged_cookies, "api_user": api_user}
                             return await self.check_in_with_cookies(merged_cookies, api_user)
                         frontend_http_error = http_frontend_result.get("error", "")
-                        if not should_try_browser_callback_fallback(
-                            f"OAuth callback HTTP {response.status_code}",
-                            frontend_http_error,
-                        ):
+                        should_browser_fallback = (
+                            should_try_browser_callback_fallback(
+                                f"OAuth callback HTTP {response.status_code}",
+                                frontend_http_error,
+                            )
+                            or should_force_browser_callback_fallback_for_provider(self.provider_config.origin)
+                        )
+                        if not should_browser_fallback:
                             return False, {"error": f"OAuth callback HTTP {response.status_code}"}
                         fallback_result = await self.complete_linuxdo_callback_with_browser(
                             frontend_callback_url,
@@ -2704,7 +2721,11 @@ class CheckIn:
                             return True, {"cookies": merged_cookies, "api_user": api_user}
                         return await self.check_in_with_cookies(merged_cookies, api_user)
                     frontend_http_error = http_frontend_result.get("error", "")
-                    if not should_try_browser_callback_fallback(str(callback_err), frontend_http_error):
+                    should_browser_fallback = (
+                        should_try_browser_callback_fallback(str(callback_err), frontend_http_error)
+                        or should_force_browser_callback_fallback_for_provider(self.provider_config.origin)
+                    )
+                    if not should_browser_fallback:
                         return False, {"error": f"OAuth callback error: {callback_err}"}
                     fallback_result = await self.complete_linuxdo_callback_with_browser(
                         frontend_callback_url,

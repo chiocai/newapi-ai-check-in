@@ -463,9 +463,14 @@ class AppConfig:
 			if not site_definition or not isinstance(overrides, dict):
 				continue
 
+			# 显式 `*-waf` 基线应以站点文件为准，避免旧 runtime 覆盖把站点误切回非 WAF。
+			effective_overrides = dict(overrides)
+			if site_definition.mode in {'newapi-waf', 'manual-waf', 'auto-waf'}:
+				effective_overrides.pop('bypass_method', None)
+
 			merged[site_name] = SiteDefinition(
 				name=site_definition.name,
-				provider=site_definition.provider.apply_overrides(overrides),
+				provider=site_definition.provider.apply_overrides(effective_overrides),
 				checkin=site_definition.checkin,
 				mode=site_definition.mode,
 			)
