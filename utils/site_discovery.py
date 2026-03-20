@@ -163,7 +163,7 @@ async def discover_status_runtime_overrides(provider_config: ProviderConfig, req
 		'User-Agent': get_random_user_agent(),
 		'Accept': 'application/json, text/plain, */*',
 		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Accept-Encoding': 'gzip, deflate, br, zstd',
+		'Accept-Encoding': 'gzip, deflate',
 		'Referer': provider_config.get_login_url(),
 		'Origin': provider_config.origin,
 	}

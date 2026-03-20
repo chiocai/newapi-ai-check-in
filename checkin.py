@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 PROVIDER_SESSION_CACHE_TTL = 23 * 60 * 60
 TIMEOUT_PAGE_LOAD = 60000
 TIMEOUT_NAVIGATION = 45000
+SAFE_HTTP_ACCEPT_ENCODING = "gzip, deflate"
 
 
 def _get_provider_session_cache_path(storage_dir: str, provider_name: str, username_hash: str) -> str:
@@ -236,7 +237,6 @@ def should_try_browser_callback_fallback(original_error_msg: str, frontend_http_
         "无法连接至 linux do 服务器",
         "state parameter is empty or mismatched",
         "frontend-first api callback returned no user id",
-        "frontend-first api callback http 403",
     ]
     return not any(indicator in merged for indicator in non_retry_indicators)
 
@@ -1211,6 +1211,112 @@ class CheckIn:
             context = await browser.new_context()
             page = await context.new_page()
             try:
+                async def extract_callback_state() -> dict:
+                    return await page.evaluate(
+                        f"""async () => {{
+                            const result = {{
+                                apiUser: null,
+                                responseJson: null,
+                                errorMsg: '',
+                                storageKeys: [],
+                                userInfoStatus: null,
+                                userInfoError: '',
+                            }};
+
+                            const pickId = (value) => {{
+                                if (!value || typeof value !== 'object') return null;
+                                if (value.id !== undefined && value.id !== null && value.id !== '') return value.id;
+                                for (const key of ['data', 'user', 'profile', 'currentUser']) {{
+                                    const nested = value[key];
+                                    if (nested && typeof nested === 'object') {{
+                                        const nestedId = pickId(nested);
+                                        if (nestedId !== null && nestedId !== undefined && nestedId !== '') {{
+                                            return nestedId;
+                                        }}
+                                    }}
+                                }}
+                                return null;
+                            }};
+
+                            try {{
+                                const text = document.body ? (document.body.innerText || '').trim() : '';
+                                if (text) {{
+                                    try {{
+                                        const parsed = JSON.parse(text);
+                                        result.responseJson = parsed;
+                                        result.errorMsg = parsed?.message || parsed?.error || '';
+                                        const parsedId = pickId(parsed);
+                                        if (parsedId !== null && parsedId !== undefined && parsedId !== '') {{
+                                            result.apiUser = parsedId;
+                                        }}
+                                    }} catch (e) {{}}
+                                }}
+                            }} catch (e) {{}}
+
+                            for (const key of ['user', 'status', 'userInfo', 'userinfo']) {{
+                                try {{
+                                    const raw = localStorage.getItem(key);
+                                    if (!raw) continue;
+                                    result.storageKeys.push(key);
+                                    const parsed = JSON.parse(raw);
+                                    const storageId = pickId(parsed);
+                                    if (storageId !== null && storageId !== undefined && storageId !== '') {{
+                                        result.apiUser = storageId;
+                                        break;
+                                    }}
+                                }} catch (e) {{}}
+                            }}
+
+                            if (result.apiUser !== null && result.apiUser !== undefined && result.apiUser !== '') {{
+                                try {{
+                                    const response = await fetch('{self.provider_config.get_user_info_url()}', {{
+                                        headers: {{
+                                            '{self.provider_config.api_user_key}': String(result.apiUser)
+                                        }},
+                                        credentials: 'include'
+                                    }});
+                                    result.userInfoStatus = response.status;
+                                    const text = await response.text();
+                                    try {{
+                                        const parsed = JSON.parse(text);
+                                        const userInfoId = pickId(parsed);
+                                        if (userInfoId !== null && userInfoId !== undefined && userInfoId !== '') {{
+                                            result.apiUser = userInfoId;
+                                        }}
+                                        if (!result.errorMsg) {{
+                                            result.errorMsg = parsed?.message || parsed?.error || '';
+                                        }}
+                                    }} catch (e) {{}}
+                                }} catch (e) {{
+                                    result.userInfoError = e.message || String(e);
+                                }}
+                            }}
+
+                            return result;
+                        }}"""
+                    )
+
+                async def collect_success_result(source: str) -> dict | None:
+                    probe_result = await extract_callback_state()
+                    api_user = probe_result.get("apiUser")
+                    if api_user:
+                        restore_cookies = await page.context.cookies()
+                        user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+                        print(f"✅ {self.account_name}: Browser callback fallback got api_user from {source}: {api_user}")
+                        return {
+                            "success": True,
+                            "api_user": api_user,
+                            "cookies": user_cookies,
+                        }
+
+                    response_json = probe_result.get("responseJson")
+                    error_msg = probe_result.get("errorMsg")
+                    if isinstance(response_json, dict) and error_msg:
+                        print(f"⚠️ {self.account_name}: Browser callback fallback returned structured error: {error_msg}")
+                        return {"success": False, "error": error_msg}
+
+                    return None
+
                 if auth_cookies:
                     await context.add_cookies(auth_cookies)
                     print(f"ℹ️ {self.account_name}: Added {len(auth_cookies)} auth cookies for callback fallback")
@@ -1225,58 +1331,31 @@ class CheckIn:
                     except Exception:
                         pass
 
-                response_json = None
-                try:
-                    response_json = await page.evaluate(
-                        """() => {
-                            try {
-                                const text = document.body ? (document.body.innerText || '').trim() : '';
-                                if (!text) return null;
-                                return JSON.parse(text);
-                            } catch (e) {
-                                return null;
-                            }
-                        }"""
-                    )
-                except Exception as e:
-                    print(f"⚠️ {self.account_name}: Browser callback fallback failed to parse JSON body: {e}")
+                direct_result = await collect_success_result("callback page")
+                if direct_result:
+                    return direct_result
 
-                if isinstance(response_json, dict):
-                    if response_json.get("success") and isinstance(response_json.get("data"), dict):
-                        api_user = response_json.get("data", {}).get("id")
-                        if api_user:
-                            restore_cookies = await page.context.cookies()
-                            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
-                            print(f"✅ {self.account_name}: Browser callback fallback got api_user from JSON body: {api_user}")
-                            return {
-                                "success": True,
-                                "api_user": api_user,
-                                "cookies": user_cookies,
-                            }
+                probe_urls = []
+                for probe_url in [
+                    self.provider_config.origin,
+                    self.provider_config.get_console_personal_url(),
+                    self.provider_config.get_login_url(),
+                ]:
+                    if probe_url and probe_url not in probe_urls:
+                        probe_urls.append(probe_url)
 
-                    error_msg = response_json.get("message") or response_json.get("error")
-                    if error_msg:
-                        print(f"⚠️ {self.account_name}: Browser callback fallback returned structured error: {error_msg}")
-                        return {"success": False, "error": error_msg}
+                for probe_url in probe_urls:
+                    try:
+                        print(f"ℹ️ {self.account_name}: Callback fallback probing page -> {probe_url}")
+                        await page.goto(probe_url, wait_until="networkidle", timeout=TIMEOUT_PAGE_LOAD)
+                        await page.wait_for_timeout(3000)
+                    except Exception as probe_err:
+                        print(f"⚠️ {self.account_name}: Callback fallback probe failed for {probe_url}: {probe_err}")
+                        continue
 
-                api_user = None
-                try:
-                    user_data = await page.evaluate("() => localStorage.getItem('user')")
-                    if user_data:
-                        user_obj = json.loads(user_data)
-                        api_user = user_obj.get("id")
-                except Exception as e:
-                    print(f"⚠️ {self.account_name}: Browser callback fallback failed to read localStorage user: {e}")
-
-                if api_user:
-                    restore_cookies = await page.context.cookies()
-                    user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
-                    print(f"✅ {self.account_name}: Browser callback fallback got api_user: {api_user}")
-                    return {
-                        "success": True,
-                        "api_user": api_user,
-                        "cookies": user_cookies,
-                    }
+                    probe_result = await collect_success_result(probe_url)
+                    if probe_result:
+                        return probe_result
 
                 await save_page_content_to_file(page, "linuxdo_callback_browser_fallback_failed", self.account_name, prefix="linuxdo")
                 await take_screenshot(page, "linuxdo_callback_browser_fallback_failed", self.account_name)
@@ -1823,7 +1902,7 @@ class CheckIn:
                 "User-Agent": get_random_user_agent(),
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Encoding": SAFE_HTTP_ACCEPT_ENCODING,
                 "Referer": self.provider_config.get_login_url(),
                 "Origin": self.provider_config.origin,
                 "Connection": "keep-alive",
@@ -1889,7 +1968,7 @@ class CheckIn:
                 "User-Agent": get_random_user_agent(),
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Encoding": SAFE_HTTP_ACCEPT_ENCODING,
                 "Referer": self.provider_config.get_login_url(),
                 "Origin": self.provider_config.origin,
                 "Connection": "keep-alive",
@@ -2155,7 +2234,7 @@ class CheckIn:
                 "User-Agent": get_random_user_agent(),
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Encoding": SAFE_HTTP_ACCEPT_ENCODING,
                 "Referer": self.provider_config.get_login_url(),
                 "Origin": self.provider_config.origin,
                 "Connection": "keep-alive",
@@ -2426,7 +2505,7 @@ class CheckIn:
                 "User-Agent": get_random_user_agent(),
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Encoding": SAFE_HTTP_ACCEPT_ENCODING,
                 "Referer": self.provider_config.get_login_url(),
                 "Origin": self.provider_config.origin,
                 "Connection": "keep-alive",

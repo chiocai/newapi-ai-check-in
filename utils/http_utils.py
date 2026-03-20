@@ -56,22 +56,42 @@ def response_resolve(
     logs_dir = "logs"
     os.makedirs(logs_dir, exist_ok=True)
 
+    def safe_response_text() -> str:
+        try:
+            return response.text
+        except Exception:
+            content = response.content
+            for encoding in [response.encoding, "utf-8"]:
+                if not encoding:
+                    continue
+                try:
+                    return content.decode(encoding, errors="replace")
+                except Exception:
+                    continue
+            return content.decode("utf-8", errors="replace")
+
     try:
         return response.json()
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        try:
+            return json.loads(response.content.decode("utf-8"))
+        except Exception:
+            pass
+
         print(f"❌ {account_name}: Failed to parse JSON response: {e}")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_context = "".join(c if c.isalnum() else "_" for c in context)
 
         content_type = response.headers.get("content-type", "").lower()
+        response_text = safe_response_text()
 
         if "text/html" in content_type or "text/plain" in content_type:
             filename = f"{safe_account_name}_{timestamp}_{safe_context}.html"
             filepath = os.path.join(logs_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write(response.text)
+                f.write(response_text)
 
             print(f"⚠️ {account_name}: Received HTML response, saved to: {filepath}")
         else:
@@ -79,7 +99,7 @@ def response_resolve(
             filepath = os.path.join(logs_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write(response.text)
+                f.write(response_text)
 
             print(f"⚠️ {account_name}: Invalid response saved to: {filepath}")
         return None

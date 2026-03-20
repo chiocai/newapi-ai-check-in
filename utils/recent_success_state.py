@@ -16,10 +16,10 @@ def load_recent_success_state(state_file: str) -> dict:
                 if isinstance(payload, dict):
                     accounts = payload.get('accounts')
                     if isinstance(accounts, dict):
-                        return {
-                            'version': payload.get('version', 1),
-                            'accounts': accounts,
-                        }
+                        normalized = dict(payload)
+                        normalized['version'] = payload.get('version', 1)
+                        normalized['accounts'] = accounts
+                        return normalized
     except Exception as e:
         print(f'Warning: Failed to load recent success state: {e}')
 
