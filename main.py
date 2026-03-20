@@ -10,7 +10,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from itertools import groupby
 from urllib.parse import urlparse
@@ -45,7 +45,7 @@ elif skipped_from_accounts:
 
 BALANCE_HASH_FILE = "balance_hash.txt"
 FAILURE_WINDOW_STATE_FILE = os.getenv("FAILURE_WINDOW_STATE_FILE", "storage-states/checkin-window-state.json")
-FAILURE_WINDOW_TTL_SECONDS = max(0, int(os.getenv("FAILURE_WINDOW_HOURS", "24"))) * 60 * 60
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 并行处理配置
 MAX_CONCURRENT_ACCOUNTS = max(1, int(os.getenv("MAX_CONCURRENT_ACCOUNTS", "10")))  # 最大并发账号数
@@ -121,24 +121,36 @@ def build_account_runtime_identity(account_config, account_index: int) -> str:
     return f"{provider_name}|name|{account_config.get_display_name(account_index)}"
 
 
+def get_beijing_day_window_start_ts(now_ts: int) -> int:
+    """返回当前时间对应的北京时间自然日窗口起点"""
+    now_dt = datetime.fromtimestamp(now_ts, tz=BEIJING_TZ)
+    day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(day_start.timestamp())
+
+
+def format_beijing_day_window_label(window_started_at: int) -> str:
+    """格式化北京时间窗口日期标签"""
+    if window_started_at <= 0:
+        return "unknown"
+    return datetime.fromtimestamp(window_started_at, tz=BEIJING_TZ).strftime("%Y-%m-%d")
+
+
 def get_failure_window_metadata(window_state: dict, now_ts: int) -> dict:
     """解析失败窗口元数据"""
     if not isinstance(window_state, dict):
         window_state = {}
 
+    current_window_started_at = get_beijing_day_window_start_ts(now_ts)
     window_started_at = int(window_state.get("window_started_at", 0) or 0)
-    window_age_seconds = max(0, now_ts - window_started_at) if window_started_at > 0 else None
-    window_active = (
-        FAILURE_WINDOW_TTL_SECONDS > 0
-        and window_started_at > 0
-        and window_age_seconds is not None
-        and window_age_seconds < FAILURE_WINDOW_TTL_SECONDS
-    )
+    window_age_seconds = max(0, now_ts - current_window_started_at)
+    window_active = window_started_at > 0 and window_started_at == current_window_started_at
     failed_identities = set(window_state.get("failed_identities", [])) if isinstance(window_state.get("failed_identities"), list) else set()
     accounts_state = window_state.get("accounts", {}) if isinstance(window_state.get("accounts"), dict) else {}
 
     return {
         "window_started_at": window_started_at,
+        "current_window_started_at": current_window_started_at,
+        "window_date": format_beijing_day_window_label(current_window_started_at),
         "window_age_seconds": window_age_seconds,
         "window_active": window_active,
         "failed_identities": failed_identities,
@@ -171,7 +183,7 @@ def build_failure_window_skip_result(
         "status": "skipped_failure_window",
         "results": [],
         "balances": copy.deepcopy(balances),
-        "notification": f"⏭️ {account_name}: 当前 24 小时窗口内无失败，跳过本轮",
+        "notification": f"⏭️ {account_name}: 北京时间今日窗口内无失败，跳过本轮",
         "need_notify": False,
         "successful_methods": [],
         "failed_methods": [],
@@ -1571,8 +1583,8 @@ async def main():
     )
     window_active = failure_window_metadata["window_active"]
     current_window_started_at = (
-        failure_window_metadata["window_started_at"]
-        if window_active and failure_window_metadata["window_started_at"] > 0
+        failure_window_metadata["current_window_started_at"]
+        if failure_window_metadata["current_window_started_at"] > 0
         else now_ts
     )
     runnable_indices = [
@@ -1584,19 +1596,21 @@ async def main():
     if window_active:
         failed_count = len(failure_window_metadata["failed_identities"])
         print(
-            f"⚙️ Failure window active: age={failure_window_metadata['window_age_seconds']}s, "
+            f"⚙️ Failure window active (Asia/Shanghai {failure_window_metadata['window_date']}): "
+            f"age={failure_window_metadata['window_age_seconds']}s, "
             f"tracked_failures={failed_count}, runnable={len(runnable_indices)}"
         )
     else:
         print(
             f"⚙️ Failure window reset: running full scan for all {len(app_config.accounts)} account(s); "
-            f"next {FAILURE_WINDOW_TTL_SECONDS // 3600}h will only rerun failures"
+            f"later reruns on Asia/Shanghai {failure_window_metadata['window_date']} "
+            "will only rerun accounts that are still failing"
         )
 
     if failure_window_skip_results:
         print(
             f"⏭️ Skipping {len(failure_window_skip_results)} account(s) that have no failures in "
-            f"the current {FAILURE_WINDOW_TTL_SECONDS // 3600}h window"
+            f"the current Asia/Shanghai {failure_window_metadata['window_date']} window"
         )
         for index in sorted(failure_window_skip_results):
             account_name = app_config.accounts[index].get_display_name(index)
