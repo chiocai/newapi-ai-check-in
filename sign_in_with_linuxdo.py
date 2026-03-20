@@ -93,6 +93,20 @@ def should_serialize_same_linuxdo_oauth() -> bool:
     return os.getenv('SERIALIZE_SAME_LINUXDO_OAUTH', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def should_complete_provider_callback_in_browser(provider_origin: str) -> bool:
+    """是否在同一浏览器上下文内完成 provider callback"""
+    raw_hosts = os.getenv(
+        'LINUXDO_BROWSER_COMPLETE_CALLBACK_HOSTS',
+        'api.chengmo.cc.cd,newapi.linuxdo.edu.rs',
+    )
+    allowed_hosts = {
+        item.strip().lower()
+        for item in raw_hosts.split(',')
+        if item.strip()
+    }
+    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
 def _get_github_skip_prewarm_slot_labels() -> set[str]:
     """获取 GitHub 环境下需要跳过预热态的账号槽位标识"""
     raw_value = os.getenv('LINUXDO_GITHUB_SKIP_PREWARM_SLOT_LABELS')
@@ -510,19 +524,37 @@ class LinuxDoSignIn:
             authorize_started_at = time.perf_counter()
             page = await executor.acquire_page(storage_state, extra_cookies=auth_cookies)
             context = page.context
+            prefer_provider_browser_callback = should_complete_provider_callback_in_browser(self.provider_config.origin)
             callback_route_pattern = None
             callback_route_handler = None
             callback_query_future = None
             challenge_wait_ms = 0.0
 
-            try:
-                callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
-                    context
-                )
-            except Exception as route_err:
-                print(f"⚠️ {self.account_name}: Failed to register provider callback capture route in executor: {route_err}")
+            if prefer_provider_browser_callback:
+                print(f"ℹ️ {self.account_name}: Connect executor will complete provider callback in-browser")
+            else:
+                try:
+                    callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
+                        context
+                    )
+                except Exception as route_err:
+                    print(f"⚠️ {self.account_name}: Failed to register provider callback capture route in executor: {route_err}")
 
             try:
+                async def finish_provider_callback_in_browser() -> tuple[bool, dict]:
+                    result = await self._extract_authorized_result(page)
+                    LinuxDoConnectExecutorManager.record_duration(
+                        'authorize_total_ms',
+                        (time.perf_counter() - authorize_started_at) * 1000,
+                    )
+                    if challenge_wait_ms > 0:
+                        LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                    if result[0]:
+                        LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                    else:
+                        LinuxDoConnectExecutorManager.record_metric('fast_path_fallback')
+                    return result
+
                 oauth_url = (
                     f"https://connect.linux.do/oauth2/authorize?"
                     f"response_type=code&client_id={client_id}&state={auth_state}"
@@ -559,29 +591,7 @@ class LinuxDoSignIn:
                 if linuxdo_signin_check_html_enabled():
                     await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
 
-                callback_started_at = time.perf_counter()
-                callback_query = await self._wait_for_provider_callback_query(
-                    page,
-                    callback_query_future,
-                    timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
-                )
-                if callback_query:
-                    LinuxDoConnectExecutorManager.record_metric('fast_path_success')
-                    LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
-                    LinuxDoConnectExecutorManager.record_duration(
-                        'callback_capture_ms',
-                        (time.perf_counter() - callback_started_at) * 1000,
-                    )
-                    LinuxDoConnectExecutorManager.record_duration(
-                        'authorize_total_ms',
-                        (time.perf_counter() - authorize_started_at) * 1000,
-                    )
-                    if challenge_wait_ms > 0:
-                        LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
-                    return True, callback_query
-
-                if "linux.do/session/sso_provider" in current_url:
-                    current_url = await self._handle_sso_provider_page(page)
+                if not prefer_provider_browser_callback:
                     callback_started_at = time.perf_counter()
                     callback_query = await self._wait_for_provider_callback_query(
                         page,
@@ -603,6 +613,30 @@ class LinuxDoSignIn:
                             LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
                         return True, callback_query
 
+                if "linux.do/session/sso_provider" in current_url:
+                    current_url = await self._handle_sso_provider_page(page)
+                    if not prefer_provider_browser_callback:
+                        callback_started_at = time.perf_counter()
+                        callback_query = await self._wait_for_provider_callback_query(
+                            page,
+                            callback_query_future,
+                            timeout_ms=TIMEOUT_CONNECT_EXECUTOR_CAPTURE,
+                        )
+                        if callback_query:
+                            LinuxDoConnectExecutorManager.record_metric('fast_path_success')
+                            LinuxDoConnectExecutorManager.record_metric('callback_capture_hits')
+                            LinuxDoConnectExecutorManager.record_duration(
+                                'callback_capture_ms',
+                                (time.perf_counter() - callback_started_at) * 1000,
+                            )
+                            LinuxDoConnectExecutorManager.record_duration(
+                                'authorize_total_ms',
+                                (time.perf_counter() - authorize_started_at) * 1000,
+                            )
+                            if challenge_wait_ms > 0:
+                                LinuxDoConnectExecutorManager.record_duration('challenge_wait_ms', challenge_wait_ms)
+                            return True, callback_query
+
                 if "linux.do/login" in current_url:
                     LinuxDoConnectExecutorManager.record_metric('fast_path_fallback')
                     LinuxDoConnectExecutorManager.record_duration(
@@ -623,6 +657,8 @@ class LinuxDoSignIn:
                         await page.goto(approve_url, wait_until='commit', timeout=TIMEOUT_CONNECT_EXECUTOR_APPROVE_WAIT)
                     except Exception:
                         pass
+                    if prefer_provider_browser_callback:
+                        return await finish_provider_callback_in_browser()
                     callback_started_at = time.perf_counter()
                     callback_query = await self._wait_for_provider_callback_query(
                         page,
@@ -660,6 +696,8 @@ class LinuxDoSignIn:
                     )
 
                 await allow_btn_ele.click(no_wait_after=True)
+                if prefer_provider_browser_callback:
+                    return await finish_provider_callback_in_browser()
                 callback_started_at = time.perf_counter()
                 callback_query = await self._wait_for_provider_callback_query(
                     page,
@@ -726,6 +764,36 @@ class LinuxDoSignIn:
     async def _extract_authorized_result(self, page) -> tuple[bool, dict]:
         """从授权完成后的页面中提取 cookies 和 api_user/code"""
         parsed = urlparse(self.provider_config.origin)
+
+        async def read_provider_user() -> tuple[str | int | None, dict]:
+            api_user = None
+            try:
+                try:
+                    await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
+                except Exception:
+                    await page.wait_for_timeout(2000)
+
+                user_data = await page.evaluate("() => localStorage.getItem('user')")
+                if user_data:
+                    user_obj = json.loads(user_data)
+                    api_user = user_obj.get("id")
+                    if api_user:
+                        print(f"✅ {self.account_name}: Got api user: {api_user}")
+                    else:
+                        print(f"⚠️ {self.account_name}: User id not found in localStorage")
+                else:
+                    print(f"⚠️ {self.account_name}: User data not found in localStorage")
+            except Exception as e:
+                print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
+
+            if not api_user:
+                return None, {}
+
+            print(f"✅ {self.account_name}: OAuth authorization successful")
+            restore_cookies = await page.context.cookies()
+            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
+            return api_user, user_cookies
+
         try:
             await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
         except Exception:
@@ -737,34 +805,46 @@ class LinuxDoSignIn:
 
         parsed_url = urlparse(page.url)
         query_params = parse_qs(parsed_url.query)
+        prefer_final_session = should_complete_provider_callback_in_browser(self.provider_config.origin)
+
+        if prefer_final_session:
+            print(f"ℹ️ {self.account_name}: Preferring full provider browser callback completion")
+            api_user, user_cookies = await read_provider_user()
+            if api_user:
+                return True, {"cookies": user_cookies, "api_user": api_user}
+
+            probe_urls = []
+            for probe_url in [
+                self.provider_config.origin,
+                f'{self.provider_config.origin}/console',
+                self.provider_config.get_console_personal_url(),
+                self.provider_config.get_login_url(),
+            ]:
+                if probe_url and probe_url not in probe_urls:
+                    probe_urls.append(probe_url)
+
+            for probe_url in probe_urls:
+                try:
+                    print(f"ℹ️ {self.account_name}: Probing provider session page -> {probe_url}")
+                    await page.goto(probe_url, wait_until='networkidle', timeout=TIMEOUT_PAGE_LOAD)
+                    await page.wait_for_timeout(2000)
+                except Exception as probe_err:
+                    print(f"⚠️ {self.account_name}: Provider session probe failed for {probe_url}: {probe_err}")
+                    continue
+
+                api_user, user_cookies = await read_provider_user()
+                if api_user:
+                    return True, {"cookies": user_cookies, "api_user": api_user}
+
+            parsed_url = urlparse(page.url)
+            query_params = parse_qs(parsed_url.query)
+
         if "code" in query_params:
             print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
             return True, query_params
 
-        api_user = None
-        try:
-            try:
-                await page.wait_for_function('localStorage.getItem("user") !== null', timeout=10000)
-            except Exception:
-                await page.wait_for_timeout(2000)
-
-            user_data = await page.evaluate("() => localStorage.getItem('user')")
-            if user_data:
-                user_obj = json.loads(user_data)
-                api_user = user_obj.get("id")
-                if api_user:
-                    print(f"✅ {self.account_name}: Got api user: {api_user}")
-                else:
-                    print(f"⚠️ {self.account_name}: User id not found in localStorage")
-            else:
-                print(f"⚠️ {self.account_name}: User data not found in localStorage")
-        except Exception as e:
-            print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
-
+        api_user, user_cookies = await read_provider_user()
         if api_user:
-            print(f"✅ {self.account_name}: OAuth authorization successful")
-            restore_cookies = await page.context.cookies()
-            user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
             return True, {"cookies": user_cookies, "api_user": api_user}
 
         print(f"⚠️ {self.account_name}: OAuth callback received but no user ID found")
@@ -1005,6 +1085,7 @@ class LinuxDoSignIn:
         )
 
         github_reference_fallback_allowed = os.getenv('GITHUB_ACTIONS', '').lower() == 'true'
+        prefer_provider_browser_callback = should_complete_provider_callback_in_browser(self.provider_config.origin)
 
         # 确定 storage_state 来源：优先使用共享会话
         storage_state = await self._resolve_storage_state(cache_file_path)
@@ -1045,12 +1126,15 @@ class LinuxDoSignIn:
             callback_route_pattern = None
             callback_route_handler = None
             callback_query_future = None
-            try:
-                callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
-                    context
-                )
-            except Exception as route_err:
-                print(f"⚠️ {self.account_name}: Failed to register provider callback capture route: {route_err}")
+            if prefer_provider_browser_callback:
+                print(f"ℹ️ {self.account_name}: Legacy browser flow will complete provider callback in-browser")
+            else:
+                try:
+                    callback_route_pattern, callback_route_handler, callback_query_future = await self._register_provider_callback_capture(
+                        context
+                    )
+                except Exception as route_err:
+                    print(f"⚠️ {self.account_name}: Failed to register provider callback capture route: {route_err}")
 
             # 设置从参数获取的 auth cookies 到页面上下文
             if auth_cookies:
@@ -1250,9 +1334,10 @@ class LinuxDoSignIn:
                         if allow_btn_ele:
                             print(f"ℹ️ {self.account_name}: Clicking authorization button...")
                             await allow_btn_ele.click(no_wait_after=True)
-                            callback_query = await self._wait_for_provider_callback_query(page, callback_query_future)
-                            if callback_query:
-                                return True, callback_query
+                            if not prefer_provider_browser_callback:
+                                callback_query = await self._wait_for_provider_callback_query(page, callback_query_future)
+                                if callback_query:
+                                    return True, callback_query
                             parsed = urlparse(self.provider_config.origin)
                             try:
                                 await page.wait_for_url(f"**{parsed.netloc}/**", timeout=TIMEOUT_NAVIGATION)
