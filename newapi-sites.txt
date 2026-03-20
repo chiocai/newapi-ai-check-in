@@ -98,8 +98,14 @@ Lcodex | https://lc.zenscaleai.com|newapi
 有名字了| https://api.190269.xyz|newapi
 3w | https://aiapi.3w.cx|newapi
 Compute | https://computetoken.ai|newapi
-Ouuapi | https://api.ouu.ch | newapi
 代码花园 | https://api.missblog.net|newapi
 蒸蚌 | https://laoxi.ethan010203.online|newapi
+逆龙傲 | https://www.nlacloud.shop|newapi
+蕉太狼公益 | https://new.145678.xyz|newapi
+WenRouter | https://new-api.wenhao.site|newapi
+gooodapi | https://goood.my|newapi
+Yaoapi | https://yybbwan.xyz|newapi
+HelloAI | https://hello.xhyun.eu.cc|newapi
+407 | https://napi.666407.xyz|newapi
 
 
