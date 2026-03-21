@@ -96,7 +96,6 @@ Embedding | https://router.tumuer.me|newapi
 深夜小站 | https://user.dd999.uk | newapi | callback_mode=browser-complete | checkin_mode=browser-first
 Lcodex | https://lc.zenscaleai.com|newapi
 高登 | https://huxiaonb.top|newapi
-有名字了| https://api.190269.xyz|newapi
 3w | https://aiapi.3w.cx|newapi
 Compute | https://computetoken.ai|newapi | cache_reuse_mode=validate-before-use
 代码花园 | https://api.missblog.net|newapi
@@ -110,3 +109,5 @@ HelloAI | https://hello.xhyun.eu.cc|newapi
 小呆API | https://api.daiju.live|newapi
 COULSON | https://apitl.de5.net|newapi
 luciferai | https://free.luciferai.cc|newapi
+520china | https://aidrouter.qzz.io|newapi
+Muapk | https://demo.awa1.fun|newapi
