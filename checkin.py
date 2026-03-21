@@ -259,6 +259,52 @@ def should_force_browser_callback_fallback_for_provider(provider_origin: str) ->
     return urlparse(provider_origin).netloc.lower() in allowed_hosts
 
 
+def should_prefer_browser_first_newapi_checkin(provider_origin: str, runtime_modes: dict | None = None) -> bool:
+    """判断当前站点是否应默认浏览器优先执行 New-API 签到"""
+    runtime_modes = runtime_modes or {}
+    if runtime_modes.get('checkin_mode') == CHECKIN_MODE_BROWSER_FIRST:
+        return True
+
+    raw_hosts = os.getenv(
+        'BROWSER_FIRST_CHECKIN_HOSTS',
+        'gyapi.zxiaoruan.cn,newapi.linuxdo.edu.rs,lx.lxsummer.cloud,api.777114.xyz,api.42w.shop,api.chengmo.cc.cd,user.dd999.uk,api.einzieg.site',
+    )
+    allowed_hosts = {
+        item.strip().lower()
+        for item in raw_hosts.split(',')
+        if item.strip()
+    }
+    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
+def should_validate_provider_session_before_reuse(provider_origin: str) -> bool:
+    """判断当前站点是否应在复用 provider session cache 前先验证登录态"""
+    raw_hosts = os.getenv(
+        'VALIDATE_PROVIDER_CACHE_BEFORE_REUSE_HOSTS',
+        'anyrouter.top,openai.api-test.us.ci,computetoken.ai',
+    )
+    allowed_hosts = {
+        item.strip().lower()
+        for item in raw_hosts.split(',')
+        if item.strip()
+    }
+    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
+def should_prefetch_waf_before_cached_session_use(provider_origin: str) -> bool:
+    """判断当前站点是否应在复用 cached session 前先补 WAF cookie"""
+    raw_hosts = os.getenv(
+        'PREFETCH_WAF_BEFORE_CACHE_REUSE_HOSTS',
+        'anyrouter.top',
+    )
+    allowed_hosts = {
+        item.strip().lower()
+        for item in raw_hosts.split(',')
+        if item.strip()
+    }
+    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+
+
 class CheckIn:
     """newapi.ai 签到管理类"""
 
@@ -2051,9 +2097,9 @@ class CheckIn:
         try:
             client.cookies.update(cookies)
             runtime_modes = self._get_active_linuxdo_runtime_modes()
-            prefer_browser_first_checkin = (
-                self.provider_config.needs_waf_cookies()
-                and runtime_modes.get('checkin_mode') == CHECKIN_MODE_BROWSER_FIRST
+            prefer_browser_first_checkin = should_prefer_browser_first_newapi_checkin(
+                self.provider_config.origin,
+                runtime_modes,
             )
             dynamic_browser_checkin_reason = ''
 
@@ -2127,14 +2173,14 @@ class CheckIn:
             do_browser_checkin = False
             checkin_reward = None  # 保存签到奖励信息
             if self.account_config.checkin:
-                if self.provider_config.needs_waf_cookies():
-                    if prefer_browser_first_checkin:
-                        print(
-                            f"ℹ️ {self.account_name}: Runtime mode prefers browser-first New-API checkin "
-                            f"({runtime_modes.get('checkin_reason', 'dynamic runtime')})"
-                        )
-                        do_browser_checkin = True
-                    elif has_provider_bypass_cookies(cookies):
+                if prefer_browser_first_checkin:
+                    print(
+                        f"ℹ️ {self.account_name}: Runtime mode prefers browser-first New-API checkin "
+                        f"({runtime_modes.get('checkin_reason', 'default browser-first')})"
+                    )
+                    do_browser_checkin = True
+                elif self.provider_config.needs_waf_cookies():
+                    if has_provider_bypass_cookies(cookies):
                         print(f"ℹ️ {self.account_name}: Reusable WAF cookies detected, trying HTTP New-API checkin first")
                         from utils.new_api_checkin import new_api_checkin
 
@@ -2224,6 +2270,7 @@ class CheckIn:
                                 "will fallback to browser mode in this run"
                             )
                             do_browser_checkin = True
+                            dynamic_browser_checkin_reason = error_msg
                         else:
                             checkin_status = "failed"
                             checkin_error = error_msg
@@ -2333,9 +2380,9 @@ class CheckIn:
                         checkin_error = user_info.get("checkin_error") or user_info.get("checkin_message") or "Browser checkin failed"
                         checkin_message = user_info.get("checkin_message", checkin_error or "")
 
-                if self.provider_config.needs_waf_cookies() and do_browser_checkin:
+                if do_browser_checkin:
                     if dynamic_browser_checkin_reason:
-                        print(f"ℹ️ {self.account_name}: Promoting runtime mode to browser-first WAF checkin")
+                        print(f"ℹ️ {self.account_name}: Promoting runtime mode to browser-first New-API checkin")
                         self._mark_active_browser_first_checkin(dynamic_browser_checkin_reason)
                     elif prefer_browser_first_checkin:
                         self._mark_active_browser_first_checkin(
@@ -2552,6 +2599,17 @@ class CheckIn:
             # 合并 WAF cookies 和缓存的 cookies
             merged_cookies = {**waf_cookies, **cached_cookies}
 
+            if (
+                should_prefetch_waf_before_cached_session_use(self.provider_config.origin)
+                and not has_provider_bypass_cookies(merged_cookies)
+            ):
+                print(f"ℹ️ {self.account_name}: Prefetching WAF cookies before cached provider session reuse")
+                prefetched_waf_cookies = await self.get_waf_cookies_with_browser() or {}
+                if prefetched_waf_cookies:
+                    merged_cookies = {**prefetched_waf_cookies, **cached_cookies}
+                else:
+                    print(f"⚠️ {self.account_name}: WAF prefetch before cache reuse failed, continue with existing cookies")
+
             if login_only:
                 validation_result = await self.validate_provider_session(merged_cookies, cached_api_user)
                 if validation_result.get("success"):
@@ -2575,6 +2633,25 @@ class CheckIn:
 
             # 使用缓存的 cookies 执行签到
             else:
+                if should_validate_provider_session_before_reuse(self.provider_config.origin):
+                    print(f"ℹ️ {self.account_name}: Validating cached provider session before reuse for this host")
+                    validation_result = await self.validate_provider_session(merged_cookies, cached_api_user)
+                    if not validation_result.get("success"):
+                        error_msg = validation_result.get("error", "Cached provider session validation failed")
+                        if should_rebuild_provider_cache(self.provider_config.name, error_msg):
+                            print(
+                                f"⚠️ {self.account_name}: Cached provider session is invalid before reuse, "
+                                "clearing cache and re-authorizing with LinuxDo prewarmed session"
+                            )
+                            try:
+                                os.remove(provider_cache_path)
+                            except Exception:
+                                pass
+                        else:
+                            return False, {"error": error_msg}
+                    else:
+                        print(f"✅ {self.account_name}: Cached provider session validated before reuse")
+
                 success, result = await self.check_in_with_cookies(merged_cookies, cached_api_user)
 
                 # 如果签到失败（可能是 session 过期或 WAF 挑战），清除缓存并重新登录
