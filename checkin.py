@@ -259,50 +259,23 @@ def should_force_browser_callback_fallback_for_provider(provider_origin: str) ->
     return urlparse(provider_origin).netloc.lower() in allowed_hosts
 
 
-def should_prefer_browser_first_newapi_checkin(provider_origin: str, runtime_modes: dict | None = None) -> bool:
+def should_prefer_browser_first_newapi_checkin(provider_config: ProviderConfig, runtime_modes: dict | None = None) -> bool:
     """判断当前站点是否应默认浏览器优先执行 New-API 签到"""
     runtime_modes = runtime_modes or {}
     if runtime_modes.get('checkin_mode') == CHECKIN_MODE_BROWSER_FIRST:
         return True
 
-    raw_hosts = os.getenv(
-        'BROWSER_FIRST_CHECKIN_HOSTS',
-        'gyapi.zxiaoruan.cn,newapi.linuxdo.edu.rs,lx.lxsummer.cloud,api.777114.xyz,api.42w.shop,api.chengmo.cc.cd,user.dd999.uk,api.einzieg.site',
-    )
-    allowed_hosts = {
-        item.strip().lower()
-        for item in raw_hosts.split(',')
-        if item.strip()
-    }
-    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+    return (provider_config.checkin_mode or '').strip().lower() == 'browser-first'
 
 
-def should_validate_provider_session_before_reuse(provider_origin: str) -> bool:
+def should_validate_provider_session_before_reuse(provider_config: ProviderConfig) -> bool:
     """判断当前站点是否应在复用 provider session cache 前先验证登录态"""
-    raw_hosts = os.getenv(
-        'VALIDATE_PROVIDER_CACHE_BEFORE_REUSE_HOSTS',
-        'anyrouter.top,openai.api-test.us.ci,computetoken.ai',
-    )
-    allowed_hosts = {
-        item.strip().lower()
-        for item in raw_hosts.split(',')
-        if item.strip()
-    }
-    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+    return (provider_config.cache_reuse_mode or '').strip().lower() == 'validate-before-use'
 
 
-def should_prefetch_waf_before_cached_session_use(provider_origin: str) -> bool:
+def should_prefetch_waf_before_cached_session_use(provider_config: ProviderConfig) -> bool:
     """判断当前站点是否应在复用 cached session 前先补 WAF cookie"""
-    raw_hosts = os.getenv(
-        'PREFETCH_WAF_BEFORE_CACHE_REUSE_HOSTS',
-        'anyrouter.top',
-    )
-    allowed_hosts = {
-        item.strip().lower()
-        for item in raw_hosts.split(',')
-        if item.strip()
-    }
-    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+    return (provider_config.cache_waf_mode or '').strip().lower() == 'prefetch-before-reuse'
 
 
 class CheckIn:
@@ -338,6 +311,7 @@ class CheckIn:
         # storage-states 目录
         self.storage_state_dir = storage_state_dir
         self._active_linuxdo_username_hash: str | None = None
+        self._site_mode_suggestions: dict[str, dict] = {}
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
 
@@ -362,6 +336,8 @@ class CheckIn:
             reason,
             self._get_linuxdo_runtime_modes_state_file(),
         )
+        if (self.provider_config.callback_mode or '').strip().lower() != 'browser-complete':
+            self._suggest_site_mode('callback_mode', 'browser-complete', reason)
 
     def _mark_active_browser_first_checkin(self, reason: str) -> None:
         if not self._active_linuxdo_username_hash:
@@ -372,6 +348,8 @@ class CheckIn:
             reason,
             self._get_linuxdo_runtime_modes_state_file(),
         )
+        if (self.provider_config.checkin_mode or '').strip().lower() != 'browser-first':
+            self._suggest_site_mode('checkin_mode', 'browser-first', reason)
 
     def _clear_active_browser_first_checkin(self) -> None:
         if not self._active_linuxdo_username_hash:
@@ -381,6 +359,25 @@ class CheckIn:
             self._active_linuxdo_username_hash,
             self._get_linuxdo_runtime_modes_state_file(),
         )
+
+    def _suggest_site_mode(self, option: str, value: str, reason: str) -> None:
+        existing = self._site_mode_suggestions.get(option)
+        if existing and existing.get('value') == value:
+            return
+        self._site_mode_suggestions[option] = {
+            'option': option,
+            'value': value,
+            'reason': reason,
+            'provider': self.provider_config.name,
+            'site_origin': self.provider_config.origin,
+        }
+        print(
+            f"💡 {self.account_name}: Site mode suggestion -> {option}={value} "
+            f"({reason})"
+        )
+
+    def get_site_mode_suggestions(self) -> list[dict]:
+        return list(self._site_mode_suggestions.values())
 
     async def get_waf_cookies_with_browser(self) -> dict | None:
         """使用 Camoufox 获取 WAF cookies（隐私模式）"""
@@ -2098,7 +2095,7 @@ class CheckIn:
             client.cookies.update(cookies)
             runtime_modes = self._get_active_linuxdo_runtime_modes()
             prefer_browser_first_checkin = should_prefer_browser_first_newapi_checkin(
-                self.provider_config.origin,
+                self.provider_config,
                 runtime_modes,
             )
             dynamic_browser_checkin_reason = ''
@@ -2600,7 +2597,7 @@ class CheckIn:
             merged_cookies = {**waf_cookies, **cached_cookies}
 
             if (
-                should_prefetch_waf_before_cached_session_use(self.provider_config.origin)
+                should_prefetch_waf_before_cached_session_use(self.provider_config)
                 and not has_provider_bypass_cookies(merged_cookies)
             ):
                 print(f"ℹ️ {self.account_name}: Prefetching WAF cookies before cached provider session reuse")
@@ -2633,7 +2630,7 @@ class CheckIn:
 
             # 使用缓存的 cookies 执行签到
             else:
-                if should_validate_provider_session_before_reuse(self.provider_config.origin):
+                if should_validate_provider_session_before_reuse(self.provider_config):
                     print(f"ℹ️ {self.account_name}: Validating cached provider session before reuse for this host")
                     validation_result = await self.validate_provider_session(merged_cookies, cached_api_user)
                     if not validation_result.get("success"):
@@ -2658,6 +2655,26 @@ class CheckIn:
                 if not success and "error" in result:
                     error_msg = result.get("error", "").lower()
                     if should_rebuild_provider_cache(self.provider_config.name, error_msg):
+                        if (
+                            "http 401" in error_msg
+                            or "未登录且未提供 access token" in error_msg
+                            or "failed to get user info: http 401" in error_msg
+                        ) and (self.provider_config.cache_reuse_mode or '').strip().lower() != 'validate-before-use':
+                            self._suggest_site_mode(
+                                'cache_reuse_mode',
+                                'validate-before-use',
+                                'cached session reuse hit 401/unauthorized',
+                            )
+                        if (
+                            self.provider_config.needs_waf_cookies()
+                            and ("invalid response format" in error_msg or "text/html" in error_msg or "html" in error_msg)
+                            and (self.provider_config.cache_waf_mode or '').strip().lower() != 'prefetch-before-reuse'
+                        ):
+                            self._suggest_site_mode(
+                                'cache_waf_mode',
+                                'prefetch-before-reuse',
+                                'cached session reuse hit WAF/HTML response',
+                            )
                         print(
                             f"⚠️ {self.account_name}: Cached provider session may be expired or blocked, "
                             "clearing cache and re-authorizing with LinuxDo prewarmed session"

@@ -99,26 +99,17 @@ def should_serialize_same_linuxdo_oauth() -> bool:
 
 
 def should_complete_provider_callback_in_browser(
-    provider_origin: str,
+    provider_config: ProviderConfig,
     username_hash: str = '',
     state_file: str = '',
 ) -> bool:
     """是否在同一浏览器上下文内完成 provider callback"""
     if username_hash:
-        runtime_modes = get_linuxdo_runtime_modes(provider_origin, username_hash, state_file)
+        runtime_modes = get_linuxdo_runtime_modes(provider_config.origin, username_hash, state_file)
         if runtime_modes.get('callback_mode') == CALLBACK_MODE_BROWSER_COMPLETE:
             return True
 
-    raw_hosts = os.getenv(
-        'LINUXDO_BROWSER_COMPLETE_CALLBACK_HOSTS',
-        'api.chengmo.cc.cd,newapi.linuxdo.edu.rs',
-    )
-    allowed_hosts = {
-        item.strip().lower()
-        for item in raw_hosts.split(',')
-        if item.strip()
-    }
-    return urlparse(provider_origin).netloc.lower() in allowed_hosts
+    return (provider_config.callback_mode or '').strip().lower() == 'browser-complete'
 
 
 def _get_runtime_modes_state_file(cache_file_path: str = '') -> str:
@@ -550,7 +541,7 @@ class LinuxDoSignIn:
             context = page.context
             runtime_modes_state_file = _get_runtime_modes_state_file(cache_file_path)
             prefer_provider_browser_callback = should_complete_provider_callback_in_browser(
-                self.provider_config.origin,
+                self.provider_config,
                 self.username_hash,
                 runtime_modes_state_file,
             )
@@ -842,7 +833,7 @@ class LinuxDoSignIn:
         parsed_url = urlparse(page.url)
         query_params = parse_qs(parsed_url.query)
         prefer_final_session = should_complete_provider_callback_in_browser(
-            self.provider_config.origin,
+            self.provider_config,
             self.username_hash,
             _get_runtime_modes_state_file(cache_file_path),
         )
@@ -1127,7 +1118,7 @@ class LinuxDoSignIn:
         github_reference_fallback_allowed = os.getenv('GITHUB_ACTIONS', '').lower() == 'true'
         runtime_modes_state_file = _get_runtime_modes_state_file(cache_file_path)
         prefer_provider_browser_callback = should_complete_provider_callback_in_browser(
-            self.provider_config.origin,
+            self.provider_config,
             self.username_hash,
             runtime_modes_state_file,
         )

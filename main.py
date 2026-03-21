@@ -469,6 +469,7 @@ async def process_single_account(
             "error_label": None,
             "error_detail": None,
             "error": None,
+            "site_mode_suggestions": [],
         }
 
         try:
@@ -606,6 +607,7 @@ async def process_single_account(
             result["error_type"] = failed_error_type
             result["error_label"] = failed_error_label
             result["error_detail"] = failed_error_detail
+            result["site_mode_suggestions"] = checkin.get_site_mode_suggestions()
             if account_success and failed_methods:
                 result["status"] = "partial"
             elif account_success:
@@ -1536,6 +1538,40 @@ def build_site_notification_groups(sorted_results: list[dict]) -> list[dict]:
     return grouped_results
 
 
+def build_site_mode_suggestion_lines(sorted_results: list[dict]) -> list[str]:
+    """构建站点文件模式建议通知"""
+    suggestion_map: dict[tuple[str, str, str], dict] = {}
+
+    for result in sorted_results:
+        provider = result.get("provider", "")
+        site_origin = result.get("site_origin", "")
+        for suggestion in result.get("site_mode_suggestions") or []:
+            if not isinstance(suggestion, dict):
+                continue
+            option = suggestion.get("option", "")
+            value = suggestion.get("value", "")
+            if not option or not value:
+                continue
+            key = (provider, option, value)
+            if key not in suggestion_map:
+                suggestion_map[key] = {
+                    "provider": provider,
+                    "site_origin": site_origin or suggestion.get("site_origin", ""),
+                    "option": option,
+                    "value": value,
+                    "reason": suggestion.get("reason", ""),
+                }
+
+    lines = []
+    for item in suggestion_map.values():
+        site_label = get_site_label(item["provider"], item["site_origin"])
+        line = f"💡 站点模式建议: {site_label} -> {item['option']}={item['value']}"
+        if item.get("reason"):
+            line = f"{line} | {item['reason']}"
+        lines.append(line)
+    return lines
+
+
 async def main():
     """运行签到流程
 
@@ -1770,6 +1806,11 @@ async def main():
 
     grouped_notifications = build_site_notification_groups(sorted_results)
     notification_lines = [item["line"] for item in grouped_notifications]
+    site_mode_suggestion_lines = build_site_mode_suggestion_lines(sorted_results)
+    if site_mode_suggestion_lines:
+        need_notify = True
+        notification_lines.extend(site_mode_suggestion_lines)
+        print("\n".join(site_mode_suggestion_lines))
     linuxdo_prewarm_alert_lines = build_linuxdo_prewarm_alert_lines(prewarm_summary, sorted_results)
     if linuxdo_prewarm_alert_lines:
         need_notify = True
