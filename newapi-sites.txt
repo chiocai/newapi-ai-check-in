@@ -117,3 +117,4 @@ luciferai | https://free.luciferai.cc|newapi | checkin_mode=browser-first
 Muapk | https://demo.awa1.fun|newapi
 Marybrown | https://marybrown.dpdns.org|newapi
 Liao | https://liao.bot|newapi
+Lemon | https://justdoitme.me|newapi
