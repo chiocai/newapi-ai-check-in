@@ -110,5 +110,7 @@ HelloAI | https://hello.xhyun.eu.cc|newapi
 COULSON | https://apitl.de5.net|newapi
 luciferai | https://free.luciferai.cc|newapi | checkin_mode=browser-first
 520china | https://aidrouter.qzz.io|newapi | callback_mode=browser-complete | checkin_mode=browser-first
+mcplugins | https://ai.mcplugins.cn | turnstile:0x4AAAAAACuPdn8o6zkxqwHc | linuxdo_client_id=1EV8ZL9Zo2AIBN11zfaRi3hZHMP0rpVa
 Muapk | https://demo.awa1.fun|newapi
 Marybrown | https://marybrown.dpdns.org|newapi
+Liao | https://liao.bot|newapi
