@@ -52,6 +52,7 @@ class ProviderConfig:
 	checkin_mode: str | None = None
 	cache_reuse_mode: str | None = None
 	cache_waf_mode: str | None = None
+	failure_window_mode: str | None = None
 
 	@classmethod
 	def from_dict(cls, name: str, data: dict) -> 'ProviderConfig':
@@ -79,6 +80,7 @@ class ProviderConfig:
 			checkin_mode=data.get('checkin_mode'),
 			cache_reuse_mode=data.get('cache_reuse_mode'),
 			cache_waf_mode=data.get('cache_waf_mode'),
+			failure_window_mode=data.get('failure_window_mode'),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -161,6 +163,7 @@ class ProviderConfig:
 			'checkin_mode': self.checkin_mode,
 			'cache_reuse_mode': self.cache_reuse_mode,
 			'cache_waf_mode': self.cache_waf_mode,
+			'failure_window_mode': self.failure_window_mode,
 		}
 
 	def apply_overrides(self, overrides: dict) -> 'ProviderConfig':
@@ -543,6 +546,7 @@ class AppConfig:
 			'checkin_mode': cls._normalize_optional_value(options.get('checkin_mode'), None),
 			'cache_reuse_mode': cls._normalize_optional_value(options.get('cache_reuse_mode'), None),
 			'cache_waf_mode': cls._normalize_optional_value(options.get('cache_waf_mode'), None),
+			'failure_window_mode': cls._normalize_optional_value(options.get('failure_window_mode'), None),
 		}
 
 		sign_in_override = cls._normalize_optional_value(options.get('sign_in_path'), None)
