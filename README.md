@@ -152,6 +152,7 @@ Affs:
 普通 NewAPI 站点不再需要写进 `ACCOUNTS` 或 `PROVIDERS`，直接维护仓库根目录的 `newapi-sites.txt`：
 
 ```txt
+@global | failure_window_mode=always-run
 agentrouter | https://agentrouter.org | newapi
 anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=...
 wong | https://wzw.pp.ua | manual:/api/user/checkin
@@ -171,6 +172,12 @@ lemonapi | https://justdoitme.me | turnstile
   - **必配**：`name | origin | mode`
   - **通常可自动发现**：`linuxdo_client_id`、`github_client_id`、`turnstile_site_key`
   - **特殊站点才常需手工写**：`api_user_key`、`login_path`、`console_personal_path`、`status_path`、`auth_state_path`、`user_info_path`、`topup_path`
+- 支持控制“成功后跳过重跑”行为：
+  - **全局强制重跑**：`@global | failure_window_mode=always-run`
+  - **单站点强制重跑**：`site-name | https://example.com | newapi | failure_window_mode=always-run`
+  - **优先级**：先看 `@global`，有则 `newapi-sites.txt` 内全部站点都强制重跑；没有再看单站点行尾是否配置
+  - **默认仓库已开启全局强制重跑**，即当前 `newapi-sites.txt` 默认会让文件内全部站点每次都重跑
+  - 若全局和单站点都没配，则继续沿用原有“成功后在当前北京时间自然日窗口内跳过”的逻辑
 
 `PROVIDERS` 环境变量仍可用于临时覆盖或追加特殊 provider，但日常新增/删除站点建议只改 `newapi-sites.txt`。
 

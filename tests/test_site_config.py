@@ -129,7 +129,72 @@ def test_runtime_overrides_are_applied_over_txt(tmp_path, monkeypatch):
 	assert app_config.get_provider('turn').linuxdo_client_id == 'runtime-linuxdo'
 	assert app_config.get_provider('turn').turnstile_site_key == 'runtime-site-key'
 	assert app_config.get_provider('std').linuxdo_client_id == 'std-client-id'
-	assert app_config.get_provider('waf').bypass_method is None
+	assert app_config.get_provider('waf').bypass_method == 'waf_cookies'
+
+
+def test_global_failure_window_mode_can_force_all_site_file_sites_to_rerun(tmp_path, monkeypatch):
+	sites_file = tmp_path / 'sites.txt'
+	sites_file.write_text(
+		'\n'.join(
+			[
+				'@global | failure_window_mode=always-run',
+				'std | https://std.example.com | newapi',
+			]
+		),
+		encoding='utf-8',
+	)
+
+	monkeypatch.setenv('NEWAPI_SITES_FILE', str(sites_file))
+	monkeypatch.delenv('PROVIDERS', raising=False)
+	monkeypatch.setenv(
+		'ACCOUNTS',
+		json.dumps(
+			{
+				'linux.do': [{'username': 'user1', 'password': 'pass1'}],
+				'accounts': [{'provider': 'x666', 'linux.do': {'username': 'user2', 'password': 'pass2'}}],
+			}
+		),
+	)
+
+	app_config = AppConfig.load_from_env()
+
+	assert app_config.site_file_options == {'failure_window_mode': 'always-run'}
+	assert app_config.should_force_failure_window_run('std') is True
+	assert app_config.should_force_failure_window_run('x666') is False
+
+
+
+
+def test_site_level_failure_window_mode_can_force_single_site_to_rerun(tmp_path, monkeypatch):
+	sites_file = tmp_path / 'sites.txt'
+	sites_file.write_text(
+		'\n'.join(
+			[
+				'std | https://std.example.com | newapi | failure_window_mode=always-run',
+				'other | https://other.example.com | newapi',
+			]
+		),
+		encoding='utf-8',
+	)
+
+	monkeypatch.setenv('NEWAPI_SITES_FILE', str(sites_file))
+	monkeypatch.delenv('PROVIDERS', raising=False)
+	monkeypatch.setenv(
+		'ACCOUNTS',
+		json.dumps(
+			{
+				'linux.do': [{'username': 'user1', 'password': 'pass1'}],
+				'accounts': [],
+			}
+		),
+	)
+
+	app_config = AppConfig.load_from_env()
+
+	assert app_config.get_provider('std').failure_window_mode == 'always-run'
+	assert app_config.get_provider('other').failure_window_mode is None
+	assert app_config.should_force_failure_window_run('std') is True
+	assert app_config.should_force_failure_window_run('other') is False
 
 
 def test_special_sites_are_not_auto_expanded_from_global_linuxdo(tmp_path, monkeypatch):

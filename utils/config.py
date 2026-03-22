@@ -220,6 +220,14 @@ class SiteDefinition:
 
 
 @dataclass
+class SiteFileConfig:
+	"""站点文件解析结果"""
+
+	site_definitions: Dict[str, SiteDefinition] = field(default_factory=dict)
+	global_options: dict = field(default_factory=dict)
+
+
+@dataclass
 class AccountConfig:
 	"""账号配置"""
 
@@ -279,6 +287,7 @@ class AppConfig:
 	accounts: List['AccountConfig'] = field(default_factory=list)
 	global_proxy: Dict | None = None
 	site_definitions: Dict[str, SiteDefinition] = field(default_factory=dict)
+	site_file_options: dict = field(default_factory=dict)
 	runtime_sites_file: str = DEFAULT_NEWAPI_SITES_RUNTIME_FILE
 
 	@classmethod
@@ -291,7 +300,8 @@ class AppConfig:
 		runtime_sites_file_env: str = NEWAPI_SITES_RUNTIME_FILE_ENV,
 	) -> 'AppConfig':
 		"""从环境变量加载配置"""
-		site_definitions = cls._load_site_definitions(sites_file_env)
+		site_file_config = cls._load_site_file_config(sites_file_env)
+		site_definitions = site_file_config.site_definitions
 		runtime_sites_file, runtime_overrides = cls._load_runtime_site_overrides(runtime_sites_file_env)
 		site_definitions = cls._merge_runtime_site_overrides(site_definitions, runtime_overrides)
 		providers = cls._load_providers(providers_env, site_definitions)
@@ -302,6 +312,7 @@ class AppConfig:
 			accounts=accounts,
 			global_proxy=global_proxy,
 			site_definitions=site_definitions,
+			site_file_options=site_file_config.global_options,
 			runtime_sites_file=str(runtime_sites_file),
 		)
 
@@ -402,27 +413,64 @@ class AppConfig:
 				aliyun_captcha=False,
 				bypass_method=None,
 			),
-		}
+			}
 
 	@classmethod
-	def _load_site_definitions(cls, sites_file_env: str) -> Dict[str, SiteDefinition]:
-		"""从 TXT 文件加载站点配置"""
+	def _get_sites_file_path(cls, sites_file_env: str) -> Path:
+		"""获取站点文件路径"""
 		sites_file = os.getenv(sites_file_env, DEFAULT_NEWAPI_SITES_FILE)
 		sites_path = Path(sites_file).expanduser()
 		if not sites_path.is_absolute():
 			sites_path = Path.cwd() / sites_path
+		return sites_path
+
+	@classmethod
+	def _parse_site_file_global_options_line(cls, line: str) -> dict:
+		"""解析站点文件中的全局配置行"""
+		parts = [part.strip() for part in line.split('|')]
+		directive = parts[0].lower()
+		if directive != '@global':
+			raise ValueError(f'unsupported directive: {parts[0]}')
+		if len(parts) < 2:
+			raise ValueError('must be: @global | key=value')
+
+		options = {}
+		for part in parts[1:]:
+			if not part:
+				continue
+			if '=' not in part:
+				raise ValueError(f'invalid option: {part}')
+			key, value = part.split('=', 1)
+			options[key.strip()] = value.strip()
+
+		unsupported_options = set(options) - {'failure_window_mode'}
+		if unsupported_options:
+			raise ValueError(f'unsupported global option(s): {", ".join(sorted(unsupported_options))}')
+
+		return {
+			'failure_window_mode': cls._normalize_optional_value(options.get('failure_window_mode'), None),
+		}
+
+	@classmethod
+	def _load_site_file_config(cls, sites_file_env: str) -> SiteFileConfig:
+		"""从 TXT 文件加载站点配置与全局选项"""
+		sites_path = cls._get_sites_file_path(sites_file_env)
 
 		if not sites_path.exists():
 			print(f'⚠️ Sites file not found: {sites_path}, skipping TXT site loading')
-			return {}
+			return SiteFileConfig()
 
 		site_definitions = {}
+		global_options = {}
 		for line_number, raw_line in enumerate(sites_path.read_text(encoding='utf-8').splitlines(), start=1):
 			line = raw_line.split('#', 1)[0].strip()
 			if not line:
 				continue
 
 			try:
+				if line.startswith('@'):
+					global_options.update(cls._parse_site_file_global_options_line(line))
+					continue
 				site = cls._parse_site_definition_line(line)
 				site_definitions[site.name] = site
 			except Exception as exc:
@@ -433,7 +481,23 @@ class AppConfig:
 		else:
 			print(f'⚠️ No valid site found in {sites_path}')
 
-		return site_definitions
+		if global_options:
+			configured_options = ', '.join(
+				f'{key}={value}'
+				for key, value in global_options.items()
+				if value not in {None, ''}
+			) or 'none'
+			print(f'⚙️ Loaded site file global options from {sites_path.name}: {configured_options}')
+
+		return SiteFileConfig(
+			site_definitions=site_definitions,
+			global_options=global_options,
+		)
+
+	@classmethod
+	def _load_site_definitions(cls, sites_file_env: str) -> Dict[str, SiteDefinition]:
+		"""兼容旧调用：仅返回站点定义"""
+		return cls._load_site_file_config(sites_file_env).site_definitions
 
 	@classmethod
 	def _get_runtime_sites_file_path(cls, runtime_sites_file_env: str) -> Path:
@@ -878,3 +942,12 @@ class AppConfig:
 				checkin=site_definition.checkin,
 				mode=site_definition.mode,
 			)
+
+	def should_force_failure_window_run(self, provider_name: str) -> bool:
+		"""判断站点是否应跳过 24 小时成功跳过限制，强制重跑"""
+		global_mode = str(self.site_file_options.get('failure_window_mode') or '').strip().lower()
+		if global_mode == 'always-run' and provider_name in self.site_definitions:
+			return True
+
+		provider = self.get_provider(provider_name)
+		return bool(provider and (provider.failure_window_mode or '').strip().lower() == 'always-run')

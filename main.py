@@ -208,8 +208,7 @@ def collect_failure_window_skip_results(app_config: AppConfig, window_state: dic
         state_entry = metadata["accounts_state"].get(identity)
         if not isinstance(state_entry, dict):
             continue
-        provider_config = app_config.get_provider(account_config.provider)
-        if provider_config and (provider_config.failure_window_mode or '').strip().lower() == 'always-run':
+        if app_config.should_force_failure_window_run(account_config.provider):
             continue
         if identity in metadata["failed_identities"]:
             continue

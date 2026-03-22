@@ -11,6 +11,8 @@
 #   turnstile:<site_key>       标准 New-API + Turnstile
 #
 # 说明：
+# - 全站点强制重跑（忽略 24 小时内成功跳过）：
+#   - `@global | failure_window_mode=always-run`
 # - 必配：
 #   - `name`：站点唯一标识
 #   - `origin`：站点根地址
@@ -43,10 +45,12 @@
 #   - `checkin_mode=browser-first`
 #   - `cache_reuse_mode=validate-before-use`
 #   - `cache_waf_mode=prefetch-before-reuse`
+#   - `failure_window_mode=always-run`（仅当前站点强制重跑）
 # - `special:*` 站点默认不会跟随全局 `linux.do` 自动展开；如需启用，请在 `ACCOUNTS.accounts` 中显式配置
 # - 每行一个站点，注释行以 `#` 开头
 # fuli_wheel | https://fuli.hxi.me | special:fuli_wheel
 
+@global | failure_window_mode=always-run
 
 anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=8w2uZtoWH9AUXrZr1qeCEEmvXLafea3c | topup_path=/api/user/topup | cache_waf_mode=prefetch-before-reuse | failure_window_mode=always-run
 aipm | https://emtf.aipm9527.online | newapi
