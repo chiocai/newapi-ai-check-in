@@ -1794,6 +1794,11 @@ async def main():
         [r for r in account_results if isinstance(r, dict)],
         key=lambda x: x.get("account_index", 0)
     )
+    notified_results = [
+        result
+        for result in sorted_results
+        if result.get("status") != "skipped_failure_window"
+    ]
 
     for result in sorted_results:
         # 收集余额信息
@@ -1804,14 +1809,14 @@ async def main():
         if result.get("need_notify"):
             need_notify = True
 
-    grouped_notifications = build_site_notification_groups(sorted_results)
+    grouped_notifications = build_site_notification_groups(notified_results)
     notification_lines = [item["line"] for item in grouped_notifications]
-    site_mode_suggestion_lines = build_site_mode_suggestion_lines(sorted_results)
+    site_mode_suggestion_lines = build_site_mode_suggestion_lines(notified_results)
     if site_mode_suggestion_lines:
         need_notify = True
         notification_lines.extend(site_mode_suggestion_lines)
         print("\n".join(site_mode_suggestion_lines))
-    linuxdo_prewarm_alert_lines = build_linuxdo_prewarm_alert_lines(prewarm_summary, sorted_results)
+    linuxdo_prewarm_alert_lines = build_linuxdo_prewarm_alert_lines(prewarm_summary, notified_results)
     if linuxdo_prewarm_alert_lines:
         need_notify = True
         notification_lines.extend(linuxdo_prewarm_alert_lines)
@@ -1842,8 +1847,8 @@ async def main():
 
     if need_notify and notification_lines:
         # 构建通知内容
-        total_accounts = len(sorted_results)
-        success_accounts = sum(1 for result in sorted_results if result.get("success"))
+        total_accounts = len(notified_results)
+        success_accounts = sum(1 for result in notified_results if result.get("success"))
         total_sites = len(grouped_notifications)
         success_sites = sum(
             1 for item in grouped_notifications if item["success_accounts"] == item["total_accounts"]
