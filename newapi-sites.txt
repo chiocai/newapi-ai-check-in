@@ -50,7 +50,7 @@
 # - 每行一个站点，注释行以 `#` 开头
 # fuli_wheel | https://fuli.hxi.me | special:fuli_wheel
 
-@global | failure_window_mode=always-run
+# @global | failure_window_mode=always-run
 
 anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=8w2uZtoWH9AUXrZr1qeCEEmvXLafea3c | topup_path=/api/user/topup | cache_waf_mode=prefetch-before-reuse | failure_window_mode=always-run
 aipm | https://emtf.aipm9527.online | newapi
@@ -66,7 +66,7 @@ kfcapi | https://kfc-api.sxxe.net | newapi
 linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf | callback_mode=browser-complete | checkin_mode=browser-first
 moyu | https://clove.cc.cd | newapi
 pryapi | https://api.vip.crond.dev | newapi-waf
-sorai | https://newapi.sorai.me | newapi
+sorai | https://newapi.sorai.me | newapi | cache_reuse_mode=validate-before-use
 wong | https://wzw.pp.ua | manual:/api/user/checkin
 dev88 | https://api.dev88.tech | newapi
 dgbmc | https://freeapi.dgbmc.top | newapi
@@ -114,7 +114,6 @@ HelloAI | https://hello.xhyun.eu.cc|newapi
 COULSON | https://apitl.de5.net|newapi
 luciferai | https://free.luciferai.cc|newapi | checkin_mode=browser-first
 520china | https://aidrouter.qzz.io|newapi | callback_mode=browser-complete | checkin_mode=browser-first
-mcplugins | https://ai.mcplugins.cn | turnstile:0x4AAAAAACuPdn8o6zkxqwHc | linuxdo_client_id=1EV8ZL9Zo2AIBN11zfaRi3hZHMP0rpVa
 Muapk | https://demo.awa1.fun|newapi
 Marybrown | https://marybrown.dpdns.org|newapi
 Liao | https://liao.bot|newapi
