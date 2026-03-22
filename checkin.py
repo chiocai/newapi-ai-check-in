@@ -2399,6 +2399,7 @@ class CheckIn:
                 # 将签到奖励信息添加到 user_info 中
                 if checkin_reward is not None:
                     user_info["checkin_reward"] = checkin_reward
+                user_info["failure_window_skip_eligible"] = checkin_required and checkin_status == "success"
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
                 return True, user_info

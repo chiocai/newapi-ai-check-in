@@ -235,7 +235,12 @@ def update_failure_window_state_from_results(
         existing_entry = existing_accounts.get(identity)
         result = account_results[index] if index < len(account_results) else None
 
-        if isinstance(result, dict) and result.get("success") and result.get("status") != "skipped_failure_window":
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and result.get("status") != "skipped_failure_window"
+            and result.get("failure_window_skip_eligible")
+        ):
             next_accounts[identity] = {
                 "provider": account_config.provider,
                 "account_name": account_config.get_display_name(index),
@@ -244,6 +249,14 @@ def update_failure_window_state_from_results(
                 "balances": copy.deepcopy(result.get("balances", {})),
                 "success_detail": result.get("success_detail"),
             }
+            continue
+
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and result.get("status") != "skipped_failure_window"
+            and not result.get("failure_window_skip_eligible")
+        ):
             continue
 
         if isinstance(result, dict) and not result.get("success"):
@@ -473,6 +486,7 @@ async def process_single_account(
             "error_detail": None,
             "error": None,
             "site_mode_suggestions": [],
+            "failure_window_skip_eligible": False,
         }
 
         try:
@@ -518,6 +532,7 @@ async def process_single_account(
             failed_error_label = None
             failed_error_detail = None
             this_account_balances = {}
+            skip_window_eligible = False
 
             # 构建单行结果
             line_parts = []
@@ -525,6 +540,8 @@ async def process_single_account(
                 if success and user_info and user_info.get("success"):
                     account_success = True
                     successful_methods.append(auth_method)
+                    if user_info.get("failure_window_skip_eligible"):
+                        skip_window_eligible = True
                     if "quota" in user_info:
                         current_quota = user_info["quota"]
                         current_used = user_info["used_quota"]
@@ -547,12 +564,15 @@ async def process_single_account(
                                 result_type = cdk_result.get("type", "")
                                 if result_type == "checkin_success":
                                     quota = cdk_result.get("quota", 0)
+                                    if quota and quota > 0:
+                                        skip_window_eligible = True
                                     balance = cdk_result.get("balance", 0)
                                     if balance > 0:
                                         cdk_parts.append(f"🎰 +${quota} | ${balance}")
                                     else:
                                         cdk_parts.append(f"🎰 +${quota}")
                                 elif result_type == "wheel_success":
+                                    skip_window_eligible = True
                                     total_quota = cdk_result.get("total_quota", 0)
                                     spin_count = cdk_result.get("spin_count", 0)
                                     already_done = cdk_result.get("already_done", False)
@@ -611,6 +631,7 @@ async def process_single_account(
             result["error_label"] = failed_error_label
             result["error_detail"] = failed_error_detail
             result["site_mode_suggestions"] = checkin.get_site_mode_suggestions()
+            result["failure_window_skip_eligible"] = skip_window_eligible
             if account_success and failed_methods:
                 result["status"] = "partial"
             elif account_success:
