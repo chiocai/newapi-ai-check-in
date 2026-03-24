@@ -57,7 +57,6 @@ aipm | https://emtf.aipm9527.online | newapi
 api361888 | https://api.361888.xyz | newapi
 apitest | https://openai.api-test.us.ci | newapi-waf | cache_reuse_mode=validate-before-use
 codex661118 | https://codex.661118.xyz | newapi
-freestyle | https://api.freestyle.cc.cd | newapi
 gyapi | https://gyapi.zxiaoruan.cn | newapi-waf | callback_mode=browser-complete | checkin_mode=browser-first
 hotaruapi | https://hotaruapi.com | newapi
 huan666 | https://ai.huan666.de | newapi
@@ -116,5 +115,11 @@ luciferai | https://free.luciferai.cc|newapi | checkin_mode=browser-first
 520china | https://aidrouter.qzz.io|newapi | callback_mode=browser-complete | checkin_mode=browser-first
 Muapk | https://demo.awa1.fun|newapi
 Marybrown | https://marybrown.dpdns.org|newapi
-Liao | https://liao.bot|newapi
-Lemon | https://justdoitme.me|newapi
+Liao | https://liao.bot|newapi|cache_reuse_mode=validate-before-use
+Lemon | https://justdoitme.me|newapi|checkin_mode=browser-first
+Mcplugins | https://ai.mcplugins.cn|newapi|checkin_mode=browser-first
+aabb | https://new.aabb1.pro|newapi
+Ilv | https://api.ilv.cc.cd|newapi
+Suite | https://newapi.suimi.ccwu.cc|newapi
+Dudu | https://wududu.edu.kg|newapi
+
