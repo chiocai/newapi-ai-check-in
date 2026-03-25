@@ -99,7 +99,6 @@ Embedding | https://router.tumuer.me|newapi
 深夜小站 | https://user.dd999.uk | newapi | callback_mode=browser-complete | checkin_mode=browser-first
 Lcodex | https://lc.zenscaleai.com|newapi
 高登 | https://huxiaonb.top|newapi
-3w | https://aiapi.3w.cx|newapi
 Compute | https://computetoken.ai|newapi | cache_reuse_mode=validate-before-use
 代码花园 | https://api.missblog.net|newapi
 蒸蚌 | https://laoxi.ethan010203.online|newapi
@@ -116,8 +115,6 @@ luciferai | https://free.luciferai.cc|newapi | checkin_mode=browser-first
 Muapk | https://demo.awa1.fun|newapi
 Marybrown | https://marybrown.dpdns.org|newapi
 Liao | https://liao.bot|newapi|cache_reuse_mode=validate-before-use
-Lemon | https://justdoitme.me|newapi|checkin_mode=browser-first
-Mcplugins | https://ai.mcplugins.cn|newapi|checkin_mode=browser-first
 aabb | https://new.aabb1.pro|newapi
 Ilv | https://api.ilv.cc.cd|newapi
 Suite | https://newapi.suimi.ccwu.cc|newapi
