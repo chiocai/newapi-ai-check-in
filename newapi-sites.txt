@@ -106,3 +106,4 @@ Zhenhaoji | https://api.zhenhaoji.qzz.io | newapi
 ojbk314 | https://cmgfcmz.ojbk314.org | newapi
 Crworld | https://api.crworld.site | newapi
 赶紧蹬 | https://bus.042999.xyz | newapi
+Magic | https://magic-ai.zeabur.app | newapi
