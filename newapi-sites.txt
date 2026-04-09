@@ -54,7 +54,7 @@
 
 anyrouter | https://anyrouter.top | manual-waf:/api/user/sign_in | linuxdo_client_id=8w2uZtoWH9AUXrZr1qeCEEmvXLafea3c | topup_path=/api/user/topup | cache_waf_mode=prefetch-before-reuse | failure_window_mode=always-run
 aipm | https://emtf.aipm9527.online | newapi
-apitest | https://openai.api-test.us.ci | newapi-waf | cache_reuse_mode=validate-before-use
+apitest | https://new-api.publicvm.com | newapi-waf | cache_reuse_mode=validate-before-use
 codex661118 | https://codex.661118.xyz | newapi
 gyapi | https://gyapi.zxiaoruan.cn | newapi-waf | callback_mode=browser-complete | checkin_mode=browser-first
 hotaruapi | https://hotaruapi.com | newapi
@@ -65,10 +65,8 @@ linuxdoedu | https://newapi.linuxdo.edu.rs | newapi-waf | callback_mode=browser-
 pryapi | https://api.vip.crond.dev | newapi-waf
 sorai | https://newapi.sorai.me | newapi | cache_reuse_mode=validate-before-use
 wong | https://wzw.pp.ua | manual:/api/user/checkin
-dev88 | https://api.dev88.tech | newapi
+dev88 | https://api.dev88.tech | newapi | cache_reuse_mode=validate-before-use
 dgbmc | https://freeapi.dgbmc.top | newapi
-checkin_mode=browser-first
-anthorpic | https://anthorpic.us.ci | newapi
 LogosAPI | https://api.777114.xyz | newapi-waf | callback_mode=browser-complete | checkin_mode=browser-first
 小辣椒 | https://yyds.215.im | newapi
 云端api | https://cloudapi.wdyu.eu.cc | newapi
@@ -76,13 +74,10 @@ LogosAPI | https://api.777114.xyz | newapi-waf | callback_mode=browser-complete 
 溟如池鱼の公益站 | https://yiliya.shikinatsume.xyz | newapi
 Rosmontis | https://ai.rosmontis.de | newapi
 NPCAPI | https://codex.hyw.me | newapi
-明天倒闭 | https://zmjjkk.us.ci | newapi
-Neb公益站 | https://ai.zzhdsgsss.xyz | newapi
 赶紧蹬 | https://bus.042999.xyz | newapi
 42API | https://api.42w.shop | newapi-waf | callback_mode=browser-complete | checkin_mode=browser-first
 431128hys | https://newapi.431128hys.site | newapi-waf
 光速API | https://chat.gsyun.cloud | newapi-waf
-大可乐 | https://bigkele.us.ci | newapi | cache_reuse_mode=validate-before-use
 Mihoyo | https://api.mihoyo.bio | newapi
 lsAPI | https://callxyq.xyz | newapi | cache_reuse_mode=validate-before-use
 Restrain | https://api.925214.xyz |newapi
@@ -91,11 +86,9 @@ Embedding | https://router.tumuer.me|newapi | cache_reuse_mode=validate-before-u
 深夜小站 | https://user.dd999.uk | newapi | callback_mode=browser-complete | checkin_mode=browser-first
 Lcodex | https://lc.zenscaleai.com|newapi
 Compute | https://computetoken.ai|newapi | cache_reuse_mode=validate-before-use
-蒸蚌 | https://laoxi.ethan010203.online|newapi | cache_reuse_mode=validate-before-use
 逆龙傲 | https://www.nlacloud.shop | newapi
 HelloAI | https://hello.xhyun.eu.cc|newapi
 407 | https://napi.666407.xyz|newapi | cache_reuse_mode=valida
-小呆API | https://api.daiju.live|newapi | checkin_mode=browser-first
 COULSON | https://apitl.de5.net | newapi
 Muapk | https://demo.awa1.fun | newapi
 Liao | https://liao.bot | newapi |cache_reuse_mode=validate-before-use
@@ -103,7 +96,5 @@ Dudu | https://wududu.edu.kg | newapi
 Cname | https://c.u.cname.dev | newapi
 Zhenhaoji | https://api.zhenhaoji.qzz.io | newapi
 火星公益站 | https://newapi.murycarry.asia | newapi
-ojbk314 | https://cmgfcmz.ojbk314.org | newapi
-Crworld | https://api.crworld.site | newapi
 赶紧蹬 | https://bus.042999.xyz | newapi
 Magic | https://magic-ai.zeabur.app | newapi
